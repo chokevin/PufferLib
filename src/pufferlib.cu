@@ -297,8 +297,8 @@ typedef struct {
     float prio_alpha;
     float prio_beta0;
     bool anneal_prio_beta;
-    // Curriculum state buffer
-    int state_buffer_size;
+    // Curriculum best-trajectory slots
+    int num_start_states;
     float cl_frac;
     float fresh_frac;
     int state_trajectory_max_len;
@@ -2052,7 +2052,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         (int)(hypers.cl_frac * (float)vec->size), 0, vec->size);
     int initial_num_fresh_envs = clamp_int(
         (int)(hypers.fresh_frac * (float)vec->size), 0, vec->size);
-    pufferl->curriculum_enabled = hypers.state_buffer_size > 0
+    pufferl->curriculum_enabled = hypers.num_start_states > 0
         && initial_num_cl_envs + initial_num_fresh_envs > 0;
     if (pufferl->curriculum_enabled) {
         fixed_agents_per_env(vec);
@@ -2151,7 +2151,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     if (pufferl->curriculum_enabled) {
         register_state_buffer(&pufferl->state_buf,
             vec->size, max_active_envs,
-            hypers.state_buffer_size, hypers.state_trajectory_max_len,
+            hypers.num_start_states, hypers.state_trajectory_max_len,
             hypers.state_checkpoint_interval, hypers.horizon,
             num_buffers, hypers.num_threads, (unsigned int)pufferl->seed);
     }

@@ -110,7 +110,7 @@ static Color tile_colors[17] = {
 void add_log(Game* game);
 
 // --- Required functions for env_binding.h ---
-void c_reset(Game* game);
+void c_reset(Game* game, const State* state);
 void c_step(Game* game);
 void c_render(Game* game);
 void c_close(Game* game);
@@ -199,7 +199,12 @@ void set_scaffolding_curriculum(Game* game) {
     }
 }
 
-void c_reset(Game* game) {
+void c_reset(Game* game, const State* state) {
+    if (state != NULL) {
+        game->state = *state;
+        refresh_state(game);
+        return;
+    }
     memset(game->state.grid, G2048_EMPTY, sizeof(game->state.grid));
     game->state.score = 0;
     game->state.tick = 0;
@@ -417,7 +422,7 @@ void c_step(Game* game) {
 
     if (game->terminals[0]) {
         add_log(game);
-        c_reset(game);
+        c_reset(game, NULL);
     }
 }
 

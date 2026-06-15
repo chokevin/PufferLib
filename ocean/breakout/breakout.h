@@ -454,7 +454,12 @@ void reset_round(Breakout* env) {
     s->ball_vy = 0.0;
 }
 
-void c_reset(Breakout* env) {
+void c_reset(Breakout* env, const State* state) {
+    if (state != NULL) {
+        env->state = *state;
+        compute_observations(env);
+        return;
+    }
     memset(&env->state, 0, sizeof(State));
     env->state.num_balls = 5;
     reset_round(env);
@@ -503,7 +508,7 @@ void step_frame(Breakout* env, float action) {
     if (s->num_balls < 0 || s->score == env->max_score) {
         env->terminals[0] = 1;
         add_log(env);
-        c_reset(env);
+        c_reset(env, NULL);
     }
 }
 

@@ -5,7 +5,7 @@
 #define OBS_TENSOR_T FloatTensor
 
 #define Env Breakout
-static inline void puffer_state_refresh(Breakout* env) { compute_observations(env); }
+#define PUFFER_RESET_WITH_STATE
 #include "vecenv.h"
 
 void my_init(Env* env, Dict* kwargs) {

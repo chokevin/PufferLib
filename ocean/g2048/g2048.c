@@ -21,7 +21,7 @@ void demo() {
     env.rewards = rewards;
     env.terminals = terminals;
 
-    c_reset(&env);
+    c_reset(&env, NULL);
     c_render(&env);
 
     while (!WindowShouldClose()) {

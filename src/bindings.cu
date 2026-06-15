@@ -418,8 +418,8 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     hypers.prio_alpha = get_config(train_kwargs, "prio_alpha");
     hypers.prio_beta0 = get_config(train_kwargs, "prio_beta0");
     hypers.anneal_prio_beta = get_config(train_kwargs, "anneal_prio_beta");
-    // Curriculum state buffer
-    hypers.state_buffer_size = get_config(train_kwargs, "state_buffer_size");
+    // Curriculum best-trajectory slots
+    hypers.num_start_states = get_config(train_kwargs, "num_start_states");
     hypers.cl_frac = get_config(train_kwargs, "cl_frac");
     hypers.fresh_frac = get_config(train_kwargs, "fresh_frac");
     hypers.state_trajectory_max_len = get_config(train_kwargs, "state_trajectory_max_len");
@@ -555,7 +555,7 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("prio_alpha", &HypersT::prio_alpha)
         .def_readwrite("prio_beta0", &HypersT::prio_beta0)
         .def_readwrite("anneal_prio_beta", &HypersT::anneal_prio_beta)
-        .def_readwrite("state_buffer_size", &HypersT::state_buffer_size)
+        .def_readwrite("num_start_states", &HypersT::num_start_states)
         .def_readwrite("cl_frac", &HypersT::cl_frac)
         .def_readwrite("fresh_frac", &HypersT::fresh_frac)
         .def_readwrite("state_trajectory_max_len", &HypersT::state_trajectory_max_len)

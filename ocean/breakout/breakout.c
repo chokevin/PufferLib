@@ -28,7 +28,7 @@ void demo() {
 
     env.client = make_client(&env);
 
-    c_reset(&env);
+    c_reset(&env, NULL);
     int frame = 0;
     SetTargetFPS(60);
     while (!WindowShouldClose()) {

@@ -5,7 +5,7 @@
 #define OBS_TENSOR_T ByteTensor
 
 #define Env Game
-static inline void puffer_state_refresh(Game* env) { refresh_state(env); }
+#define PUFFER_RESET_WITH_STATE
 #include "vecenv.h"
 
 void my_init(Env* env, Dict* kwargs) {
