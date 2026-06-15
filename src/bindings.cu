@@ -368,7 +368,7 @@ std::unique_ptr<VecEnv> create_vec(py::dict args, int gpu) {
 
 void vec_reset(VecEnv& ve) {
     py::gil_scoped_release no_gil;
-    static_vec_reset(ve.vec);
+    static_vec_reset(ve.vec, 0, -1, NULL);
 }
 
 void gpu_vec_step_py(VecEnv& ve, long long actions_ptr) {

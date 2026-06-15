@@ -7,8 +7,8 @@
 
 
 #define Env Boxoban
+#define PUFFER_RESET_WITH_STATE
 #define PUFFER_CURRICULUM_DIAG_SEQUENCE_OUTCOME
-static inline void puffer_state_refresh(Boxoban* env) { refresh_state(env); }
 #include "vecenv.h"
 
 void my_init(Env* env, Dict* kwargs) {

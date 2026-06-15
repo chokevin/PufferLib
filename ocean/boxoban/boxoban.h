@@ -373,8 +373,14 @@ static void load_random_puzzle(Boxoban* env) {
 }
 
 // Required function
-void c_reset(Boxoban* env) {
+void c_reset(Boxoban* env, const State* state) {
     State* s = &env->state;
+    if (state != NULL) {
+        env->state = *state;
+        refresh_state(env);
+        return;
+    }
+
     s->tick = 0;
     s->puzzle_tick = 0;
     s->win = 0;
@@ -501,7 +507,7 @@ void c_step(Boxoban* env) {
         }
         env->terminals[0] = 1;
         add_log(env);
-        c_reset(env);
+        c_reset(env, NULL);
         return;
     }
 
@@ -510,7 +516,7 @@ void c_step(Boxoban* env) {
         //env->rewards[0] -= 1.0f;
         s->episode_return += env->rewards[0];
         add_log(env);
-        c_reset(env);
+        c_reset(env, NULL);
         return;
     }
 

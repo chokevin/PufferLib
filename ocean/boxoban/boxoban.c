@@ -65,7 +65,7 @@ static int setup_demo_env(Boxoban* env, const char* chosen_path) {
     }
 
     init(env);
-    c_reset(env);
+    c_reset(env, NULL);
     return 0;
 }
 

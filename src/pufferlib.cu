@@ -2203,7 +2203,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         net_callback_wrapper,
         pufferl->curriculum_enabled ? post_step_callback_wrapper : NULL,
         thread_init_wrapper);
-    static_vec_reset(vec);
+    static_vec_reset(vec, 0, -1, NULL);
 
     if (hypers.profile) {
         cudaDeviceSynchronize();

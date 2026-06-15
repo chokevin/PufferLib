@@ -129,7 +129,8 @@ enum EvalProfileIdx {
 
 // Functions implemented by env's static library
 StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* vec_kwargs, Dict* env_kwargs);
-void static_vec_reset(StaticVec* vec);
+void static_vec_reset(StaticVec* vec, int env_start, int env_count,
+    const void* states);
 void static_vec_close(StaticVec* vec);
 void static_vec_log(StaticVec* vec, Dict* out);
 void static_vec_eval_log(StaticVec* vec, Dict* out);
@@ -214,6 +215,15 @@ static inline void atomic_store(atomic_int* ptr, int value) {
 // Forward declare env-provided functions (defined in binding.c after this include)
 void my_init(Env* env, Dict* kwargs);
 void my_log(Log* log, Dict* out);
+
+static inline void puffer_env_reset(Env* env, const PufferState* state) {
+#ifdef PUFFER_RESET_WITH_STATE
+    c_reset(env, state);
+#else
+    assert(state == NULL && "env does not support reset from state");
+    c_reset(env);
+#endif
+}
 
 #ifdef MY_USES_PERM
 // Env-provided: populate per-slot pointer arrays on env, given the global slot
@@ -578,25 +588,49 @@ int static_vec_count_aligned(StaticVec* vec, int tag_value, int reset_flags) {
 }
 #endif
 
-void static_vec_reset(StaticVec* vec) {
+void static_vec_reset(StaticVec* vec, int env_start, int env_count,
+        const void* state_ptrs) {
     Env* envs = vec->envs;
-    for (int i = 0; i < vec->size; i++) {
-        c_reset(&envs[i]);
+    if (env_start < 0) {
+        env_start = 0;
     }
+    if (env_start > vec->size) {
+        env_start = vec->size;
+    }
+    if (env_count < 0 || env_start + env_count > vec->size) {
+        env_count = vec->size - env_start;
+    }
+    const PufferState* states = (const PufferState*)state_ptrs;
+
+    int agent_start = 0;
+    for (int i = 0; i < env_start; i++) {
+        agent_start += envs[i].num_agents;
+    }
+    int agent_count = 0;
+    for (int i = 0; i < env_count; i++) {
+        int env_idx = env_start + i;
+        puffer_env_reset(&envs[env_idx], states == NULL ? NULL : &states[i]);
+        agent_count += envs[env_idx].num_agents;
+    }
+
+    memset(vec->rewards + agent_start, 0, (size_t)agent_count * sizeof(float));
+    memset(vec->terminals + agent_start, 0, (size_t)agent_count * sizeof(float));
     if (vec->gpu) {
-        cudaMemcpy(vec->gpu_observations.data, vec->observations.data,
-            vec->total_agents * OBS_SIZE * obs_element_size(), cudaMemcpyHostToDevice);
-        cudaMemset(vec->gpu_rewards,   0, vec->total_agents * sizeof(float));
-        cudaMemset(vec->gpu_terminals, 0, vec->total_agents * sizeof(float));
+        cudaMemcpy(vec->gpu_observations.data + (long)agent_start * OBS_SIZE,
+            vec->observations.data + (long)agent_start * OBS_SIZE,
+            (size_t)agent_count * OBS_SIZE * obs_element_size(),
+            cudaMemcpyHostToDevice);
+        cudaMemset(vec->gpu_rewards + agent_start, 0,
+            (size_t)agent_count * sizeof(float));
+        cudaMemset(vec->gpu_terminals + agent_start, 0,
+            (size_t)agent_count * sizeof(float));
 #ifdef MY_ACTION_MASK
-        cudaMemcpy(vec->gpu_action_mask, vec->action_mask,
-            (size_t)vec->total_agents * MY_ACTION_MASK * sizeof(unsigned char),
+        cudaMemcpy(vec->gpu_action_mask + (long)agent_start * MY_ACTION_MASK,
+            vec->action_mask + (long)agent_start * MY_ACTION_MASK,
+            (size_t)agent_count * MY_ACTION_MASK * sizeof(unsigned char),
             cudaMemcpyHostToDevice);
 #endif
         cudaDeviceSynchronize();
-    } else {
-        memset(vec->rewards, 0, vec->total_agents * sizeof(float));
-        memset(vec->terminals, 0, vec->total_agents * sizeof(float));
     }
 }
 

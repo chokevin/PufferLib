@@ -407,13 +407,15 @@ static inline int curriculum_start_env(PuffeRL* pufferl, int env_idx,
     generation = buf->best_meta[slot].generation;
 
     Env* env = &vec->envs[env_idx];
-    // curriculum_set_env_state
-    env->state = start_state;
-    puffer_state_refresh(env);
-    if (clear_outputs) {
-        for (int a = 0; a < env->num_agents; a++) {
-            env->rewards[a] = 0.0f;
-            env->terminals[a] = 0.0f;
+    if (copy_to_gpu) {
+        static_vec_reset(vec, env_idx, 1, &start_state);
+    } else {
+        puffer_env_reset(env, &start_state);
+        if (clear_outputs) {
+            for (int a = 0; a < env->num_agents; a++) {
+                env->rewards[a] = 0.0f;
+                env->terminals[a] = 0.0f;
+            }
         }
     }
     if (reset_history) {
@@ -434,30 +436,6 @@ static inline int curriculum_start_env(PuffeRL* pufferl, int env_idx,
         active->last_observed_step = -1;
     }
     curriculum_record_state(buf, env_idx, &env->state);
-    // curriculum_copy_env_obs_to_gpu
-    if (copy_to_gpu && vec != NULL && buf != NULL && vec->gpu) {
-        int agent_start = env_idx * buf->agents_per_env;
-        size_t agent_bytes = (size_t)buf->agents_per_env * sizeof(float);
-        cudaMemcpy(vec->gpu_rewards + agent_start,
-            vec->rewards + agent_start, agent_bytes, cudaMemcpyHostToDevice);
-        cudaMemcpy(vec->gpu_terminals + agent_start,
-            vec->terminals + agent_start, agent_bytes,
-            cudaMemcpyHostToDevice);
-        size_t obs_size = (size_t)get_obs_size();
-        size_t obs_bytes = (size_t)buf->agents_per_env * obs_size
-            * get_obs_elem_size();
-        cudaMemcpy(vec->gpu_observations.data + (long)agent_start * obs_size,
-            vec->observations.data + (long)agent_start * obs_size,
-            obs_bytes, cudaMemcpyHostToDevice);
-        if (vec->action_mask_size > 0) {
-            size_t mask_size = (size_t)vec->action_mask_size;
-            size_t mask_bytes = (size_t)buf->agents_per_env * mask_size
-                * sizeof(unsigned char);
-            cudaMemcpy(vec->gpu_action_mask + (long)agent_start * mask_size,
-                vec->action_mask + (long)agent_start * mask_size,
-                mask_bytes, cudaMemcpyHostToDevice);
-        }
-    }
     return 1;
 }
 
