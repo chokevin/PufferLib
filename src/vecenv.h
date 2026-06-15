@@ -115,10 +115,6 @@ typedef struct StaticVec {
     int log_env_limit;
 } StaticVec;
 
-// Callback types
-typedef void (*net_callback_fn)(void* ctx, int buf, int t);
-typedef void (*post_step_callback_fn)(void* ctx, int buf, int t, int env_idx);
-typedef void (*thread_init_fn)(void* ctx, int buf);
 typedef void (*step_fn)(void* env);
 
 enum EvalProfileIdx {
@@ -134,9 +130,7 @@ void static_vec_reset(StaticVec* vec, int env_start, int env_count,
 void static_vec_close(StaticVec* vec);
 void static_vec_log(StaticVec* vec, Dict* out);
 void static_vec_eval_log(StaticVec* vec, Dict* out);
-void create_static_threads(StaticVec* vec, int num_threads, int horizon,
-    void* ctx, net_callback_fn net_callback,
-    post_step_callback_fn post_step_callback, thread_init_fn thread_init);
+void create_static_threads(StaticVec* vec, int num_threads, int horizon);
 void static_vec_omp_step(StaticVec* vec);
 void static_vec_seq_step(StaticVec* vec);
 void static_vec_render(StaticVec* vec, int env_id);
@@ -246,27 +240,15 @@ typedef struct StaticOMPArg {
     StaticVec* vec;
     int buf;
     int horizon;
-    void* ctx;
-    net_callback_fn net_callback;
-    post_step_callback_fn post_step_callback;
-    thread_init_fn thread_init;
 } StaticOMPArg;
 
-// OMP thread manager
+// Env-only OMP thread manager used by standalone env profiling.
 static void* static_omp_threadmanager(void* arg) {
     StaticOMPArg* worker_arg = (StaticOMPArg*)arg;
     StaticVec* vec = worker_arg->vec;
     StaticThreading* threading = vec->threading;
     int buf = worker_arg->buf;
     int horizon = worker_arg->horizon;
-    void* ctx = worker_arg->ctx;
-    net_callback_fn net_callback = worker_arg->net_callback;
-    post_step_callback_fn post_step_callback = worker_arg->post_step_callback;
-    thread_init_fn thread_init = worker_arg->thread_init;
-
-    if (thread_init != NULL) {
-        thread_init(ctx, buf);
-    }
 
     int agents_per_buffer = vec->agents_per_buffer;
     int agent_start = buf * agents_per_buffer;
@@ -292,8 +274,6 @@ static void* static_omp_threadmanager(void* arg) {
 
         for (int t = 0; t < horizon; t++) {
             clock_gettime(CLOCK_MONOTONIC, &t0);
-            net_callback(ctx, buf, t);
-
             cudaMemcpyAsync(
                 &vec->actions[agent_start * NUM_ATNS],
                 &vec->gpu_actions[agent_start * NUM_ATNS],
@@ -309,9 +289,6 @@ static void* static_omp_threadmanager(void* arg) {
             #pragma omp parallel for schedule(static) num_threads(num_workers)
             for (int i = env_start; i < env_start + env_count; i++) {
                 c_step(&envs[i]);
-                if (post_step_callback != NULL) {
-                    post_step_callback(ctx, buf, t, i);
-                }
             }
             clock_gettime(CLOCK_MONOTONIC, &t1);
             my_accum[EVAL_ENV_STEP] += (t1.tv_sec - t0.tv_sec) * 1000.0f + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
@@ -634,9 +611,7 @@ void static_vec_reset(StaticVec* vec, int env_start, int env_count,
     }
 }
 
-void create_static_threads(StaticVec* vec, int num_threads, int horizon,
-        void* ctx, net_callback_fn net_callback,
-        post_step_callback_fn post_step_callback, thread_init_fn thread_init) {
+void create_static_threads(StaticVec* vec, int num_threads, int horizon) {
     vec->threading = (StaticThreading*)calloc(1, sizeof(StaticThreading));
     vec->threading->num_threads = num_threads;
     vec->threading->num_buffers = vec->buffers;
@@ -652,10 +627,6 @@ void create_static_threads(StaticVec* vec, int num_threads, int horizon,
         args[i].vec = vec;
         args[i].buf = i;
         args[i].horizon = horizon;
-        args[i].ctx = ctx;
-        args[i].net_callback = net_callback;
-        args[i].post_step_callback = post_step_callback;
-        args[i].thread_init = thread_init;
         pthread_create(&vec->threading->threads[i], NULL, static_omp_threadmanager, &args[i]);
     }
 }

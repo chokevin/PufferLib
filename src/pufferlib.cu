@@ -412,15 +412,6 @@ inline void profile_end(bool enable) {
     if (enable) nvtxRangePop();
 }
 
-// Thread-local stream for per-buffer threads (set once by thread_init_wrapper)
-static thread_local cudaStream_t tl_stream = 0;
-
-// Thread initialization callback - sets thread-local stream once per thread
-extern "C" void thread_init_wrapper(void* ctx, int buf) {
-    PuffeRL* pufferl = (PuffeRL*)ctx;
-    tl_stream = pufferl->streams[buf];
-}
-
 __global__ void rng_init(curandStatePhilox4_32_10_t* states, uint64_t seed, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
@@ -580,22 +571,14 @@ __global__ void sample_logits(
     rng_states[idx] = state;
 }
 
-extern "C" void post_step_callback_wrapper(void* ctx, int buf, int t, int env_idx) {
-    PuffeRL* pufferl = (PuffeRL*)ctx;
-    if (pufferl->curriculum_enabled) {
-        curriculum_post_step(pufferl, buf, t, env_idx);
-    }
-}
-
 // Single step rollout forward pass. Called by each environment worker in their
 // own buffer thread. This operation is cudagraphed.
-extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
-    PuffeRL* pufferl = (PuffeRL*)ctx;
+static void rollout_forward_step(PuffeRL* pufferl, int buf, int t,
+        cudaStream_t current_stream) {
     HypersT& hypers = pufferl->hypers;
     int graph = t * hypers.num_buffers + buf;
     profile_begin("fused_rollout", hypers.profile);
 
-    cudaStream_t current_stream = tl_stream;
     if (pufferl->rollout_captured) {
         assert(cudaGraphLaunch(pufferl->fused_rollout_cudagraphs[graph], current_stream) == cudaSuccess
                 && "cudaGraphLaunch failed");
@@ -716,6 +699,175 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         cudaDeviceSynchronize();
     }
     profile_end(hypers.profile);
+}
+
+typedef struct PufferRolloutArg {
+    PuffeRL* pufferl;
+    int buf;
+    int horizon;
+} PufferRolloutArg;
+
+static void* pufferl_rollout_threadmanager(void* arg) {
+    PufferRolloutArg* worker_arg = (PufferRolloutArg*)arg;
+    PuffeRL* pufferl = worker_arg->pufferl;
+    StaticVec* vec = pufferl->vec;
+    StaticThreading* threading = vec->threading;
+    int buf = worker_arg->buf;
+    int horizon = worker_arg->horizon;
+
+    int agents_per_buffer = vec->agents_per_buffer;
+    int agent_start = buf * agents_per_buffer;
+    int env_start = vec->buffer_env_starts[buf];
+    int env_count = vec->buffer_env_counts[buf];
+    atomic_int* buffer_states = threading->buffer_states;
+    int num_workers = threading->num_threads / vec->buffers;
+    if (num_workers < 1) num_workers = 1;
+
+    Env* envs = vec->envs;
+
+    printf("Num workers: %d\n", num_workers);
+    while (true) {
+        while (atomic_load(&buffer_states[buf]) != OMP_RUNNING) {
+            if (atomic_load(&threading->shutdown)) {
+                return NULL;
+            }
+        }
+        cudaStream_t stream = pufferl->streams[buf];
+        int curriculum_enabled = pufferl->curriculum_enabled;
+        int vanilla_envs = curriculum_enabled ? pufferl->state_buf.num_vanilla_envs : 0;
+        int fresh_envs = curriculum_enabled ? pufferl->state_buf.num_fresh_envs : 0;
+
+        float* my_accum = &threading->accum[buf * NUM_EVAL_PROF];
+        struct timespec t0, t1;
+
+        for (int t = 0; t < horizon; t++) {
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            rollout_forward_step(pufferl, buf, t, stream);
+
+            cudaMemcpyAsync(
+                &vec->actions[agent_start * NUM_ATNS],
+                &vec->gpu_actions[agent_start * NUM_ATNS],
+                agents_per_buffer * NUM_ATNS * sizeof(float),
+                cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            my_accum[EVAL_GPU] += (t1.tv_sec - t0.tv_sec) * 1000.0f
+                + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
+
+            memset(&vec->rewards[agent_start], 0,
+                agents_per_buffer * sizeof(float));
+            memset(&vec->terminals[agent_start], 0,
+                agents_per_buffer * sizeof(float));
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            #pragma omp parallel for schedule(static) num_threads(num_workers)
+            for (int i = env_start; i < env_start + env_count; i++) {
+                c_step(&envs[i]);
+                if (curriculum_enabled && i >= vanilla_envs) {
+                    int row = i - vanilla_envs;
+                    int is_cl = row >= fresh_envs;
+                    curriculum_post_active_step(pufferl, buf, i, row, is_cl);
+                }
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            my_accum[EVAL_ENV_STEP] += (t1.tv_sec - t0.tv_sec) * 1000.0f
+                + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
+
+            cudaMemcpyAsync(
+                vec->gpu_observations.data + agent_start * OBS_SIZE,
+                vec->observations.data + agent_start * OBS_SIZE,
+                agents_per_buffer * OBS_SIZE * obs_element_size(),
+                cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(
+                &vec->gpu_rewards[agent_start],
+                &vec->rewards[agent_start],
+                agents_per_buffer * sizeof(float),
+                cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(
+                &vec->gpu_terminals[agent_start],
+                &vec->terminals[agent_start],
+                agents_per_buffer * sizeof(float),
+                cudaMemcpyHostToDevice, stream);
+#ifdef MY_ACTION_MASK
+            cudaMemcpyAsync(
+                vec->gpu_action_mask + agent_start * MY_ACTION_MASK,
+                vec->action_mask + agent_start * MY_ACTION_MASK,
+                agents_per_buffer * MY_ACTION_MASK * sizeof(unsigned char),
+                cudaMemcpyHostToDevice, stream);
+#endif
+        }
+        cudaStreamSynchronize(stream);
+        atomic_store(&buffer_states[buf], OMP_WAITING);
+    }
+}
+
+static void create_pufferl_threads(PuffeRL* pufferl, int num_threads, int horizon) {
+    StaticVec* vec = pufferl->vec;
+    vec->threading = (StaticThreading*)calloc(1, sizeof(StaticThreading));
+    vec->threading->num_threads = num_threads;
+    vec->threading->num_buffers = vec->buffers;
+    vec->threading->buffer_states =
+        (atomic_int*)calloc(vec->buffers, sizeof(atomic_int));
+    vec->threading->threads =
+        (pthread_t*)calloc(vec->buffers, sizeof(pthread_t));
+    vec->threading->accum =
+        (float*)calloc(vec->buffers * NUM_EVAL_PROF, sizeof(float));
+
+    PufferRolloutArg* args =
+        (PufferRolloutArg*)calloc(vec->buffers, sizeof(PufferRolloutArg));
+    for (int i = 0; i < vec->buffers; i++) {
+        args[i].pufferl = pufferl;
+        args[i].buf = i;
+        args[i].horizon = horizon;
+        pthread_create(&vec->threading->threads[i], NULL,
+            pufferl_rollout_threadmanager, &args[i]);
+    }
+}
+
+static void pufferl_omp_step(PuffeRL* pufferl) {
+    StaticThreading* threading = pufferl->vec->threading;
+    for (int buf = 0; buf < pufferl->vec->buffers; buf++) {
+        atomic_store(&threading->buffer_states[buf], OMP_RUNNING);
+    }
+    for (int buf = 0; buf < pufferl->vec->buffers; buf++) {
+        while (atomic_load(&threading->buffer_states[buf]) != OMP_WAITING) {}
+    }
+}
+
+static void pufferl_rollout(PuffeRL* pufferl) {
+    double t0 = wall_clock();
+
+    // Zero state buffers (primary + every frozen bank, so all banks see fresh
+    // state symmetrically.
+    if (pufferl->hypers.reset_state) {
+        for (int i = 0; i < pufferl->hypers.num_buffers; i++) {
+            puf_zero(&pufferl->buffer_states[i], pufferl->default_stream);
+        }
+        for (int b = 0; b < pufferl->num_frozen_banks; b++) {
+            for (int i = 0; i < pufferl->hypers.num_buffers; i++) {
+                puf_zero(&pufferl->frozen_banks[b].buffer_states[i],
+                    pufferl->default_stream);
+            }
+        }
+    }
+
+    if (!pufferl->curriculum_enabled) {
+        pufferl->vec->log_env_limit = 0;
+    }
+
+    pufferl_omp_step(pufferl);
+    if (pufferl->curriculum_enabled) {
+        curriculum_rollout_end(pufferl);
+    }
+
+    float sec = (float)(wall_clock() - t0);
+    pufferl->profile.accum[PROF_ROLLOUT] += sec * 1000.0f;
+
+    float eval_prof[NUM_EVAL_PROF];
+    static_vec_read_profile(pufferl->vec, eval_prof);
+    pufferl->profile.accum[PROF_EVAL_GPU] += eval_prof[EVAL_GPU];
+    pufferl->profile.accum[PROF_EVAL_ENV] += eval_prof[EVAL_ENV_STEP];
+    pufferl->global_step +=
+        pufferl->hypers.horizon * pufferl->hypers.total_agents;
 }
 
 
@@ -1896,15 +2048,16 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     assert(hypers.cl_frac <= 1.0f && "cl_frac must be <= 1.0");
     assert(hypers.fresh_frac >= 0.0f && "fresh_frac must be nonnegative");
     assert(hypers.fresh_frac <= 1.0f && "fresh_frac must be <= 1.0");
+    assert(hypers.cl_frac + hypers.fresh_frac <= 1.0f
+        && "cl_frac + fresh_frac must be <= 1.0");
     int initial_num_cl_envs = clamp_int(
         (int)(hypers.cl_frac * (float)vec->size), 0, vec->size);
     int initial_num_fresh_envs = clamp_int(
         (int)(hypers.fresh_frac * (float)vec->size), 0, vec->size);
     pufferl->curriculum_enabled = hypers.state_buffer_size > 0
         && initial_num_cl_envs + initial_num_fresh_envs > 0;
-    int agents_per_env = 0;
     if (pufferl->curriculum_enabled) {
-        agents_per_env = fixed_agents_per_env(vec);
+        fixed_agents_per_env(vec);
         assert(hypers.state_trajectory_max_len > 0
             && "state_trajectory_max_len must be positive");
         assert(hypers.state_checkpoint_interval > 0
@@ -1999,7 +2152,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         acts, hypers.total_agents, minibatch_segments);
     if (pufferl->curriculum_enabled) {
         register_state_buffer(&pufferl->state_buf,
-            vec->size, agents_per_env, max_active_envs,
+            vec->size, max_active_envs,
             hypers.state_buffer_size, hypers.state_trajectory_max_len,
             hypers.state_checkpoint_interval, hypers.horizon,
             num_buffers, hypers.num_threads, (unsigned int)pufferl->seed);
@@ -2039,12 +2192,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     pufferl->grad_puf = {.data = (precision_t*)grads->mem, .shape = {grads->total_elems}};
     pufferl->param_puf = {.data = (precision_t*)params->mem, .shape = {params->total_elems}};
     if (pufferl->curriculum_enabled) {
-        if (!init_state_buffer(&pufferl->state_buf)) {
-            alloc_free(params);
-            alloc_free(grads);
-            alloc_free(acts);
-            return nullptr;
-        }
+        init_state_buffer(&pufferl->state_buf);
     }
 
     ulong init_seed = hypers.seed;
@@ -2135,7 +2283,6 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         }
 
         cudaStream_t saved_default = pufferl->default_stream;
-        cudaStream_t saved_tl = tl_stream;
         cudaStream_t warmup_stream;
         cudaStreamCreate(&warmup_stream);
         pufferl->default_stream = warmup_stream;
@@ -2145,14 +2292,13 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         for (pufferl->epoch = 0; pufferl->epoch <= hypers.cudagraphs; pufferl->epoch++) {
             for (int i = 0; i < num_buffers * horizon; ++i) {
                 int buf = i % num_buffers;
-                tl_stream = pufferl->streams[buf];
-                net_callback_wrapper(pufferl.get(), buf, i / num_buffers);
+                rollout_forward_step(pufferl.get(), buf, i / num_buffers,
+                    pufferl->streams[buf]);
                 cudaDeviceSynchronize();
             }
         }
         pufferl->rollout_captured = true;
 
-        tl_stream = warmup_stream;
         for (int i = 0; i <= hypers.cudagraphs; i++) {
             train_impl(*pufferl);
         }
@@ -2160,7 +2306,6 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         cudaStreamSynchronize(warmup_stream);
         cudaDeviceSynchronize();
         pufferl->default_stream = saved_default;
-        tl_stream = saved_tl;
         pufferl->curriculum_enabled = saved_curriculum_enabled;
         cudaStreamDestroy(warmup_stream);
 
@@ -2199,11 +2344,11 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         }
     }
 
-    create_static_threads(vec, hypers.num_threads, horizon, pufferl.get(),
-        net_callback_wrapper,
-        pufferl->curriculum_enabled ? post_step_callback_wrapper : NULL,
-        thread_init_wrapper);
+    create_pufferl_threads(pufferl.get(), hypers.num_threads, horizon);
     static_vec_reset(vec, 0, -1, NULL);
+    if (pufferl->curriculum_enabled) {
+        curriculum_init_active_envs(pufferl.get());
+    }
 
     if (hypers.profile) {
         cudaDeviceSynchronize();

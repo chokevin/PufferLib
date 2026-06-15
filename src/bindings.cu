@@ -142,40 +142,7 @@ void render(pybind11::object pufferl_obj, int env_id) {
 void rollouts(pybind11::object pufferl_obj) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
     pybind11::gil_scoped_release no_gil;
-    double t0 = wall_clock();
-
-    // Zero state buffers (primary + every frozen bank, so all banks see fresh
-    // state symmetrically — otherwise frozen banks accumulate indefinitely while
-    // primary resets, giving primary an unfair in-distribution advantage).
-    if (pufferl.hypers.reset_state) {
-        for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
-            puf_zero(&pufferl.buffer_states[i], pufferl.default_stream);
-        }
-        for (int b = 0; b < pufferl.num_frozen_banks; b++) {
-            for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
-                puf_zero(&pufferl.frozen_banks[b].buffer_states[i], pufferl.default_stream);
-            }
-        }
-    }
-
-    if (pufferl.curriculum_enabled) {
-        curriculum_rollout_begin(&pufferl);
-    } else {
-        pufferl.vec->log_env_limit = 0;
-    }
-
-    static_vec_omp_step(pufferl.vec);
-    if (pufferl.curriculum_enabled) {
-        curriculum_rollout_end(&pufferl);
-    }
-    float sec = (float)(wall_clock() - t0);
-    pufferl.profile.accum[PROF_ROLLOUT] += sec * 1000.0f;  // store as ms
-
-    float eval_prof[NUM_EVAL_PROF];
-    static_vec_read_profile(pufferl.vec, eval_prof);
-    pufferl.profile.accum[PROF_EVAL_GPU] += eval_prof[EVAL_GPU];
-    pufferl.profile.accum[PROF_EVAL_ENV] += eval_prof[EVAL_ENV_STEP];
-    pufferl.global_step += pufferl.hypers.horizon * pufferl.hypers.total_agents;
+    pufferl_rollout(&pufferl);
 }
 
 pybind11::dict train(pybind11::object pufferl_obj) {

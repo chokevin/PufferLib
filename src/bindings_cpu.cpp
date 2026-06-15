@@ -65,7 +65,8 @@ typedef struct StaticVec {
 } StaticVec;
 
 StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* vec_kwargs, Dict* env_kwargs);
-void static_vec_reset(StaticVec* vec);
+void static_vec_reset(StaticVec* vec, int env_start, int env_count,
+    const void* states);
 void static_vec_close(StaticVec* vec);
 void static_vec_log(StaticVec* vec, Dict* out);
 void static_vec_render(StaticVec* vec, int env_id);
@@ -235,7 +236,7 @@ static std::unique_ptr<VecEnv> create_vec(py::dict args, int gpu = 0) {
 
 static void vec_reset(VecEnv& ve) {
     py::gil_scoped_release no_gil;
-    static_vec_reset(ve.vec);
+    static_vec_reset(ve.vec, 0, -1, NULL);
 }
 
 static void cpu_vec_step_py(VecEnv& ve, long long actions_ptr) {
