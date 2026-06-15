@@ -1298,7 +1298,7 @@ __device__ void puff_advantage_row_scalar(
         float nextnonterminal = 1.0f - to_float(dones[t_next]);
         float imp = to_float(importance[t]);
         float rho_t = fminf(imp, rho_clip);
-        float c_t = fminf(fminf(imp, c_clip), 1.0f);
+        float c_t = fminf(imp, c_clip);
         float r_nxt = to_float(rewards[t_next]);
         float v = to_float(values[t]);
         float v_nxt = to_float(values[t_next]);
@@ -1366,7 +1366,7 @@ __device__ __forceinline__ void puff_advantage_row_vec(
         for (int i = start_idx; i >= 0; i--) {
             float nextnonterminal = 1.0f - next_done;
             float rho_t = fminf(imp[i], rho_clip);
-            float c_t = fminf(fminf(imp[i], c_clip), 1.0f);
+            float c_t = fminf(imp[i], c_clip);
             float delta = rho_t * (next_reward + gamma * next_value * nextnonterminal - v[i]);
             lastpufferlam = delta + gamma * lambda * c_t * lastpufferlam * nextnonterminal;
             adv[i] = lastpufferlam;
@@ -1603,10 +1603,8 @@ void train_impl(PuffeRL& pufferl) {
             rollouts.action_mask.data, src.action_mask.data, T, B, mask_size);
     }
 
-#if PUFFER_SCALE_REWARDS
     clamp_precision_kernel<<<grid_size(numel(rollouts.rewards.shape)), BLOCK_SIZE, 0, train_stream>>>(
         rollouts.rewards.data, -1.0f, 1.0f, numel(rollouts.rewards.shape));
-#endif
 #if PUFFER_SCALE_REWARDS || PUFFER_ADV_LOSS_SCALE
     scale_rewards_by_running_std<<<1, 256, 0, train_stream>>>(
         rollouts.rewards.data, pufferl.reward_stats.data,
