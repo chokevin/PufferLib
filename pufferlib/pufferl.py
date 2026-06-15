@@ -327,26 +327,35 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     # This version has the training perf logs and eval env logs
     all_logs.append(flat_logs)
 
-    # Temporarily save every logged row for curriculum debugging. Keep arrays
-    # rectangular by forward-filling late-appearing keys.
-    metric_keys = sorted({k for log in all_logs for k in log})
-    metrics = {k: [] for k in metric_keys}
-    last_values = {k: 0.0 for k in metric_keys}
+    # Downsample results
+    n = args['sweep']['downsample']
+    metrics = {k: [[]] for k in all_logs[0]}
+    logged_timesteps = all_logs[-1]['agent_steps']
+    next_bin = logged_timesteps / (n - 1) if n > 1 else np.inf
     for log in all_logs:
-        for k in metric_keys:
-            if k in log:
-                last_values[k] = log[k]
-            metrics[k].append(last_values[k])
+        for k, v in log.items():
+            metrics[k][-1].append(v)
+
+        if log['agent_steps'] < next_bin:
+            continue
+
+        next_bin += logged_timesteps / (n - 1)
+        for k in metrics:
+            metrics[k][-1] = np.mean(metrics[k][-1])
+            metrics[k].append([])
+
+    for k in metrics:
+        metrics[k][-1] = all_logs[-1][k]
 
     # Match-mode: single observation at final-training cost. Protein's curve
     # fit collapses to one point — we only trust the match winrate, not any
-    # training-time proxy. Replicate the scalar across all downsample bins so
+    # training-time proxy. Replicate the scalar across downsample bins so
     # the JSON log shape matches every other metric (cache_data.py rejects
     # length-mismatched metrics as "bad data").
     if match_mode:
         metrics['env/match_score'] = [match_score] * len(metrics['agent_steps'])
 
-    # Save own log: config + full row metrics
+    # Save own log: config + downsampled results
     log_dir = os.path.join(args['log_dir'], args['env_name'])
     os.makedirs(log_dir, exist_ok=True)
     with open(os.path.join(log_dir, run_id + '.json'), 'w') as f:
