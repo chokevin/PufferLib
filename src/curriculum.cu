@@ -18,10 +18,38 @@ struct PrioBuffers {
     IntTensor idx, sample_done;
 };
 
-enum CurriculumRole {
-    CURRICULUM_ROLE_VANILLA = 0,
-    CURRICULUM_ROLE_FRESH = 1,
-    CURRICULUM_ROLE_CL = 2,
+struct BestTrajectoryMeta {
+    int valid;
+    int len;
+    int episode_len;
+    float episode_return;
+    long long generation;
+};
+
+struct ActiveTrajectoryRow {
+    int best_slot;
+    int sample_offset;
+    int history_count;
+    int segment_start;
+    float episode_return;
+    float prefix_return;
+    int episode_len;
+    int prefix_step;
+    long last_observed_step;
+    long long best_generation;
+    int segment_count;
+};
+
+struct CompletedSegment {
+    int best_slot;
+    int sample_offset;
+    int start;
+    int count;
+    float episode_return;
+    float prefix_return;
+    int episode_len;
+    int prefix_step;
+    long long best_generation;
 };
 
 struct StateBuffer {
@@ -31,36 +59,17 @@ struct StateBuffer {
     float* active_state_return;
     int* best_state_step;
     int* active_state_step;
-    int* best_valid;
-    int* best_len;
-    int* best_episode_len;
-    float* best_return;
-    int* active_role;
-    int* active_best_slot;
-    int* active_sample_offset;
-    int* active_history_count;
-    int* active_segment_start;
-    float* active_episode_return;
-    float* active_prefix_return;
-    int* active_episode_len;
-    int* active_prefix_step;
-    long* active_last_observed_step;
-    long long* best_generation;
-    long long* active_best_generation;
-    int* row_segment_count;
-    int* segment_role;
-    int* segment_best_slot;
-    int* segment_sample_offset;
-    int* segment_start;
-    int* segment_count;
-    float* segment_return;
-    float* segment_prefix_return;
-    int* segment_episode_len;
-    int* segment_prefix_step;
-    long long* segment_best_generation;
+    BestTrajectoryMeta* best_meta;
+    ActiveTrajectoryRow* active_rows;
+    CompletedSegment* segments;
+    unsigned int* rng_states;
+    unsigned int host_rng_state;
+    unsigned int rng_seed;
     int agents_per_env;
     int max_active_envs;
     int max_segments_per_row;
+    int rng_workers_per_buffer;
+    int rng_state_count;
     int num_start_states;
     int trajectory_max_len;
     int checkpoint_interval;
@@ -75,7 +84,8 @@ void close_state_buffer(StateBuffer* buf);
 void register_state_buffer(StateBuffer* buf,
         int num_envs, int agents_per_env, int max_active_envs,
         int num_start_states, int trajectory_max_len, int checkpoint_interval,
-        int rollout_horizon) {
+        int rollout_horizon, int num_buffers, int num_threads,
+        unsigned int rng_seed) {
     if (num_start_states < 1) {
         num_start_states = 1;
     }
@@ -85,6 +95,13 @@ void register_state_buffer(StateBuffer* buf,
     if (rollout_horizon < 1) {
         rollout_horizon = 1;
     }
+    if (num_buffers < 1) {
+        num_buffers = 1;
+    }
+    int rng_workers_per_buffer = num_threads / num_buffers;
+    if (rng_workers_per_buffer < 1) {
+        rng_workers_per_buffer = 1;
+    }
     // curriculum_clamp_int
     max_active_envs = max_active_envs < 1 ? 1
         : (max_active_envs > num_envs ? num_envs : max_active_envs);
@@ -92,6 +109,10 @@ void register_state_buffer(StateBuffer* buf,
     buf->agents_per_env = agents_per_env;
     buf->max_active_envs = max_active_envs;
     buf->max_segments_per_row = rollout_horizon;
+    buf->rng_workers_per_buffer = rng_workers_per_buffer;
+    buf->rng_state_count = num_buffers * rng_workers_per_buffer;
+    buf->rng_seed = rng_seed;
+    buf->host_rng_state = rng_seed + (unsigned int)buf->rng_state_count;
     buf->num_start_states = num_start_states;
     buf->trajectory_max_len = trajectory_max_len;
     buf->checkpoint_interval = checkpoint_interval;
@@ -108,6 +129,7 @@ int init_state_buffer(StateBuffer* buf) {
     size_t segment_entries = active_rows * (size_t)buf->max_segments_per_row;
     size_t best_entries = best_rows * traj_len;
     size_t active_entries = active_rows * traj_len;
+    size_t rng_entries = (size_t)buf->rng_state_count;
 
     buf->best_states = (PufferState*)calloc(best_entries, sizeof(PufferState));
     buf->active_states = (PufferState*)calloc(active_entries, sizeof(PufferState));
@@ -115,59 +137,20 @@ int init_state_buffer(StateBuffer* buf) {
     buf->active_state_return = (float*)calloc(active_entries, sizeof(float));
     buf->best_state_step = (int*)calloc(best_entries, sizeof(int));
     buf->active_state_step = (int*)calloc(active_entries, sizeof(int));
-    buf->best_valid = (int*)calloc(best_rows, sizeof(int));
-    buf->best_len = (int*)calloc(best_rows, sizeof(int));
-    buf->best_episode_len = (int*)calloc(best_rows, sizeof(int));
-    buf->best_return = (float*)calloc(best_rows, sizeof(float));
-    buf->active_role = (int*)calloc(active_rows, sizeof(int));
-    buf->active_best_slot = (int*)calloc(active_rows, sizeof(int));
-    buf->active_sample_offset = (int*)calloc(active_rows, sizeof(int));
-    buf->active_history_count = (int*)calloc(active_rows, sizeof(int));
-    buf->active_segment_start = (int*)calloc(active_rows, sizeof(int));
-    buf->active_episode_return = (float*)calloc(active_rows, sizeof(float));
-    buf->active_prefix_return = (float*)calloc(active_rows, sizeof(float));
-    buf->active_episode_len = (int*)calloc(active_rows, sizeof(int));
-    buf->active_prefix_step = (int*)calloc(active_rows, sizeof(int));
-    buf->active_last_observed_step = (long*)calloc(active_rows, sizeof(long));
-    buf->best_generation = (long long*)calloc(best_rows, sizeof(long long));
-    buf->active_best_generation = (long long*)calloc(active_rows, sizeof(long long));
-    buf->row_segment_count = (int*)calloc(active_rows, sizeof(int));
-    buf->segment_role = (int*)calloc(segment_entries, sizeof(int));
-    buf->segment_best_slot = (int*)calloc(segment_entries, sizeof(int));
-    buf->segment_sample_offset = (int*)calloc(segment_entries, sizeof(int));
-    buf->segment_start = (int*)calloc(segment_entries, sizeof(int));
-    buf->segment_count = (int*)calloc(segment_entries, sizeof(int));
-    buf->segment_return = (float*)calloc(segment_entries, sizeof(float));
-    buf->segment_prefix_return = (float*)calloc(segment_entries, sizeof(float));
-    buf->segment_episode_len = (int*)calloc(segment_entries, sizeof(int));
-    buf->segment_prefix_step = (int*)calloc(segment_entries, sizeof(int));
-    buf->segment_best_generation = (long long*)calloc(segment_entries, sizeof(long long));
+    buf->best_meta = (BestTrajectoryMeta*)calloc(
+        best_rows, sizeof(BestTrajectoryMeta));
+    buf->active_rows = (ActiveTrajectoryRow*)calloc(
+        active_rows, sizeof(ActiveTrajectoryRow));
+    buf->segments = (CompletedSegment*)calloc(
+        segment_entries, sizeof(CompletedSegment));
+    buf->rng_states = (unsigned int*)calloc(
+        rng_entries, sizeof(unsigned int));
 
     if (buf->best_states == NULL || buf->active_states == NULL
             || buf->best_state_return == NULL || buf->active_state_return == NULL
             || buf->best_state_step == NULL || buf->active_state_step == NULL
-            || buf->best_valid == NULL || buf->best_len == NULL
-            || buf->best_episode_len == NULL || buf->best_return == NULL
-            || buf->active_role == NULL || buf->active_best_slot == NULL
-            || buf->active_sample_offset == NULL
-            || buf->active_history_count == NULL
-            || buf->active_segment_start == NULL
-            || buf->active_episode_return == NULL
-            || buf->active_prefix_return == NULL
-            || buf->active_episode_len == NULL
-            || buf->active_prefix_step == NULL
-            || buf->active_last_observed_step == NULL
-            || buf->best_generation == NULL
-            || buf->active_best_generation == NULL
-            || buf->row_segment_count == NULL
-            || buf->segment_role == NULL || buf->segment_best_slot == NULL
-            || buf->segment_sample_offset == NULL
-            || buf->segment_start == NULL || buf->segment_count == NULL
-            || buf->segment_return == NULL
-            || buf->segment_prefix_return == NULL
-            || buf->segment_episode_len == NULL
-            || buf->segment_prefix_step == NULL
-            || buf->segment_best_generation == NULL) {
+            || buf->best_meta == NULL || buf->active_rows == NULL
+            || buf->segments == NULL || buf->rng_states == NULL) {
         fprintf(stderr,
             "Failed to allocate curriculum trajectory buffer: starts=%d len=%d active=%d state_size=%d\n",
             buf->num_start_states, buf->trajectory_max_len,
@@ -177,13 +160,15 @@ int init_state_buffer(StateBuffer* buf) {
     }
 
     for (int i = 0; i < buf->num_start_states; i++) {
-        buf->best_return[i] = -3.402823466e+38F;
+        buf->best_meta[i].episode_return = -3.402823466e+38F;
+    }
+    for (int i = 0; i < buf->rng_state_count; i++) {
+        buf->rng_states[i] = buf->rng_seed + (unsigned int)i;
     }
     for (int row = 0; row < buf->max_active_envs; row++) {
-        buf->active_role[row] = CURRICULUM_ROLE_VANILLA;
-        buf->active_best_slot[row] = -1;
-        buf->active_last_observed_step[row] = -1;
-        buf->active_best_generation[row] = -1;
+        buf->active_rows[row].best_slot = -1;
+        buf->active_rows[row].last_observed_step = -1;
+        buf->active_rows[row].best_generation = -1;
     }
 
     return 1;
@@ -196,33 +181,10 @@ void close_state_buffer(StateBuffer* buf) {
     free(buf->active_state_return);
     free(buf->best_state_step);
     free(buf->active_state_step);
-    free(buf->best_valid);
-    free(buf->best_len);
-    free(buf->best_episode_len);
-    free(buf->best_return);
-    free(buf->active_role);
-    free(buf->active_best_slot);
-    free(buf->active_sample_offset);
-    free(buf->active_history_count);
-    free(buf->active_segment_start);
-    free(buf->active_episode_return);
-    free(buf->active_prefix_return);
-    free(buf->active_episode_len);
-    free(buf->active_prefix_step);
-    free(buf->active_last_observed_step);
-    free(buf->best_generation);
-    free(buf->active_best_generation);
-    free(buf->row_segment_count);
-    free(buf->segment_role);
-    free(buf->segment_best_slot);
-    free(buf->segment_sample_offset);
-    free(buf->segment_start);
-    free(buf->segment_count);
-    free(buf->segment_return);
-    free(buf->segment_prefix_return);
-    free(buf->segment_episode_len);
-    free(buf->segment_prefix_step);
-    free(buf->segment_best_generation);
+    free(buf->best_meta);
+    free(buf->active_rows);
+    free(buf->segments);
+    free(buf->rng_states);
 }
 
 #endif
@@ -274,15 +236,6 @@ static int fixed_agents_per_env(StaticVec* vec) {
     return agents_per_env;
 }
 
-static inline unsigned int curriculum_mix32(unsigned int x) {
-    x ^= x >> 16;
-    x *= 0x7feb352dU;
-    x ^= x >> 15;
-    x *= 0x846ca68bU;
-    x ^= x >> 16;
-    return x;
-}
-
 static inline int curriculum_best_base(StateBuffer* buf, int slot) {
     return slot * buf->trajectory_max_len;
 }
@@ -291,10 +244,16 @@ static inline int curriculum_segment_base(StateBuffer* buf, int row) {
     return row * buf->max_segments_per_row;
 }
 
+static inline unsigned int* curriculum_worker_rng_state(StateBuffer* buf,
+        int buffer_idx, int worker_idx) {
+    int idx = buffer_idx * buf->rng_workers_per_buffer + worker_idx;
+    return &buf->rng_states[idx];
+}
+
 static inline int curriculum_count_valid(StateBuffer* buf) {
     int count = 0;
     for (int i = 0; i < buf->num_start_states; i++) {
-        count += buf->best_valid[i] ? 1 : 0;
+        count += buf->best_meta[i].valid ? 1 : 0;
     }
     return count;
 }
@@ -310,25 +269,15 @@ static inline void curriculum_seed_best(PuffeRL* pufferl) {
         Env* env = &vec->envs[slot % vec->size];
         PufferState* dst = buf->best_states + curriculum_best_base(buf, slot);
         dst[0] = env->state;
-        buf->best_valid[slot] = 1;
-        buf->best_len[slot] = 1;
-        buf->best_episode_len[slot] = 0;
-        buf->best_return[slot] = 0.0f;
+        buf->best_meta[slot].valid = 1;
+        buf->best_meta[slot].len = 1;
+        buf->best_meta[slot].episode_len = 0;
+        buf->best_meta[slot].episode_return = 0.0f;
         buf->best_state_return[curriculum_best_base(buf, slot)] = 0.0f;
         buf->best_state_step[curriculum_best_base(buf, slot)] = 0;
-        buf->best_generation[slot] = 1;
+        buf->best_meta[slot].generation = 1;
     }
     buf->seeded = 1;
-}
-
-static inline unsigned int curriculum_epoch_start_salt(PuffeRL* pufferl,
-        int env_idx, int role) {
-    if (role == CURRICULUM_ROLE_FRESH) {
-        return (unsigned int)(pufferl->seed
-            + pufferl->epoch * 4099 + env_idx * 31) ^ 0xb5297a4dU;
-    }
-    return (unsigned int)(pufferl->seed
-        + pufferl->epoch * 65537 + env_idx * 131) ^ 0x68e31da4U;
 }
 
 static inline int curriculum_active_row(StateBuffer* buf, int env_idx) {
@@ -339,12 +288,13 @@ static inline int curriculum_active_row(StateBuffer* buf, int env_idx) {
     return row;
 }
 
-static inline int curriculum_env_role(StateBuffer* buf, int env_idx) {
-    int row = curriculum_active_row(buf, env_idx);
-    if (row < 0) {
-        return CURRICULUM_ROLE_VANILLA;
-    }
-    return buf->active_role[row];
+static inline int curriculum_row_is_fresh(StateBuffer* buf, int row) {
+    return row >= 0 && row < buf->num_fresh_envs;
+}
+
+static inline int curriculum_row_is_cl(StateBuffer* buf, int row) {
+    return row >= buf->num_fresh_envs
+        && row < buf->num_fresh_envs + buf->num_cl_envs;
 }
 
 static inline void curriculum_record_state(StateBuffer* buf, int env_idx,
@@ -353,15 +303,16 @@ static inline void curriculum_record_state(StateBuffer* buf, int env_idx,
     if (row < 0 || row >= buf->max_active_envs) {
         return;
     }
-    int count = buf->active_history_count[row];
+    ActiveTrajectoryRow* active = &buf->active_rows[row];
+    int count = active->history_count;
     if (count < 0 || count >= buf->trajectory_max_len) {
         return;
     }
     int base = row * buf->trajectory_max_len + count;
     buf->active_states[base] = *state;
-    buf->active_state_return[base] = buf->active_episode_return[row];
-    buf->active_state_step[base] = buf->active_episode_len[row];
-    buf->active_history_count[row] = count + 1;
+    buf->active_state_return[base] = active->episode_return;
+    buf->active_state_step[base] = active->episode_len;
+    active->history_count = count + 1;
 }
 
 static inline int curriculum_should_record_checkpoint(StateBuffer* buf, int env_idx) {
@@ -373,7 +324,7 @@ static inline int curriculum_should_record_checkpoint(StateBuffer* buf, int env_
     if (interval <= 1) {
         return 1;
     }
-    int len = buf->active_episode_len[row];
+    int len = buf->active_rows[row].episode_len;
     return len > 0 && (len % interval) == 0;
 }
 
@@ -383,14 +334,14 @@ static inline void curriculum_observe_step(StateBuffer* buf, int env_idx,
     if (row < 0) {
         return;
     }
-    int role = buf->active_role[row];
-    if (role != CURRICULUM_ROLE_FRESH && role != CURRICULUM_ROLE_CL) {
+    if (!curriculum_row_is_fresh(buf, row) && !curriculum_row_is_cl(buf, row)) {
         return;
     }
-    if (buf->active_last_observed_step[row] == step_serial) {
+    ActiveTrajectoryRow* active = &buf->active_rows[row];
+    if (active->last_observed_step == step_serial) {
         return;
     }
-    buf->active_last_observed_step[row] = step_serial;
+    active->last_observed_step = step_serial;
     float reward = 0.0f;
     for (int a = 0; a < env->num_agents; a++) {
         float value = env->rewards[a];
@@ -398,12 +349,12 @@ static inline void curriculum_observe_step(StateBuffer* buf, int env_idx,
             reward += value;
         }
     }
-    buf->active_episode_return[row] += reward;
-    buf->active_episode_len[row] += 1;
+    active->episode_return += reward;
+    active->episode_len += 1;
 }
 
 static inline int curriculum_start_env(PuffeRL* pufferl, int env_idx,
-        int role, unsigned int salt, int clear_outputs, int reset_history,
+        int is_cl, unsigned int* rng_state, int clear_outputs, int reset_history,
         int copy_to_gpu) {
     StateBuffer* buf = &pufferl->state_buf;
     StaticVec* vec = pufferl->vec;
@@ -411,6 +362,7 @@ static inline int curriculum_start_env(PuffeRL* pufferl, int env_idx,
     if (active_row < 0) {
         return 0;
     }
+    ActiveTrajectoryRow* active = &buf->active_rows[active_row];
 
     int slot = -1;
     int offset = 0;
@@ -424,9 +376,9 @@ static inline int curriculum_start_env(PuffeRL* pufferl, int env_idx,
     if (valid <= 0) {
         return 0;
     }
-    int pick = (int)(curriculum_mix32(salt) % (unsigned int)valid);
+    int pick = (int)(rand_r(rng_state) % (unsigned int)valid);
     for (int i = 0; i < buf->num_start_states; i++) {
-        if (!buf->best_valid[i]) {
+        if (!buf->best_meta[i].valid) {
             continue;
         }
         if (pick == 0) {
@@ -435,25 +387,24 @@ static inline int curriculum_start_env(PuffeRL* pufferl, int env_idx,
         }
         pick--;
     }
-    if (slot < 0 || !buf->best_valid[slot]) {
+    if (slot < 0 || !buf->best_meta[slot].valid) {
         return 0;
     }
-    if (role == CURRICULUM_ROLE_CL) {
+    if (is_cl) {
         // curriculum_sample_offset
         int len = slot >= 0 && slot < buf->num_start_states
-            ? buf->best_len[slot] : 0;
+            ? buf->best_meta[slot].len : 0;
         offset = len <= 1
             ? 0
-            : (int)(curriculum_mix32(salt ^ 0xa511e9b3U)
-                % (unsigned int)len);
+            : (int)(rand_r(rng_state) % (unsigned int)len);
     }
     int best_base = curriculum_best_base(buf, slot);
     start_state = buf->best_states[best_base + offset];
-    if (role == CURRICULUM_ROLE_CL) {
+    if (is_cl) {
         prefix_return = buf->best_state_return[best_base + offset];
         prefix_step = buf->best_state_step[best_base + offset];
     }
-    generation = buf->best_generation[slot];
+    generation = buf->best_meta[slot].generation;
 
     Env* env = &vec->envs[env_idx];
     // curriculum_set_env_state
@@ -466,23 +417,21 @@ static inline int curriculum_start_env(PuffeRL* pufferl, int env_idx,
         }
     }
     if (reset_history) {
-        buf->active_history_count[active_row] = 0;
-        buf->active_segment_start[active_row] = 0;
-        buf->row_segment_count[active_row] = 0;
+        active->history_count = 0;
+        active->segment_start = 0;
+        active->segment_count = 0;
     } else {
-        buf->active_segment_start[active_row] =
-            buf->active_history_count[active_row];
+        active->segment_start = active->history_count;
     }
-    buf->active_role[active_row] = role;
-    buf->active_best_slot[active_row] = slot;
-    buf->active_sample_offset[active_row] = offset;
-    buf->active_episode_return[active_row] = 0.0f;
-    buf->active_prefix_return[active_row] = prefix_return;
-    buf->active_episode_len[active_row] = 0;
-    buf->active_prefix_step[active_row] = prefix_step;
-    buf->active_best_generation[active_row] = generation;
+    active->best_slot = slot;
+    active->sample_offset = offset;
+    active->episode_return = 0.0f;
+    active->prefix_return = prefix_return;
+    active->episode_len = 0;
+    active->prefix_step = prefix_step;
+    active->best_generation = generation;
     if (clear_outputs) {
-        buf->active_last_observed_step[active_row] = -1;
+        active->last_observed_step = -1;
     }
     curriculum_record_state(buf, env_idx, &env->state);
     // curriculum_copy_env_obs_to_gpu
@@ -513,79 +462,65 @@ static inline int curriculum_start_env(PuffeRL* pufferl, int env_idx,
 }
 
 static inline void curriculum_process_terminal(PuffeRL* pufferl, int env_idx,
-        int buffer_idx, int t, int restart, int copy_to_gpu) {
+        int buffer_idx, int restart, int copy_to_gpu) {
     StateBuffer* buf = &pufferl->state_buf;
     int row = curriculum_active_row(buf, env_idx);
     if (row < 0) {
         return;
     }
-    int role = buf->active_role[row];
-    if (role != CURRICULUM_ROLE_FRESH && role != CURRICULUM_ROLE_CL) {
+    int is_fresh = curriculum_row_is_fresh(buf, row);
+    int is_cl = curriculum_row_is_cl(buf, row);
+    if (!is_fresh && !is_cl) {
         return;
     }
+    ActiveTrajectoryRow* active = &buf->active_rows[row];
     // curriculum_append_completed_segment
-    int slot = buf->active_best_slot[row];
-    int start = buf->active_segment_start[row];
-    int count = buf->active_history_count[row] - start;
-    int seg_count = buf->row_segment_count[row];
-    if ((role == CURRICULUM_ROLE_FRESH || role == CURRICULUM_ROLE_CL)
-            && slot >= 0 && start >= 0 && count > 0
+    int slot = active->best_slot;
+    int start = active->segment_start;
+    int count = active->history_count - start;
+    int seg_count = active->segment_count;
+    if (slot >= 0 && start >= 0 && count > 0
             && seg_count < buf->max_segments_per_row) {
         int seg_idx = curriculum_segment_base(buf, row) + seg_count;
-        buf->row_segment_count[row] = seg_count + 1;
-        buf->segment_role[seg_idx] = role;
-        buf->segment_best_slot[seg_idx] = slot;
-        buf->segment_sample_offset[seg_idx] =
-            buf->active_sample_offset[row];
-        buf->segment_start[seg_idx] = start;
-        buf->segment_count[seg_idx] = count;
-        buf->segment_return[seg_idx] = buf->active_episode_return[row];
-        if (role == CURRICULUM_ROLE_CL) {
-            buf->segment_return[seg_idx] += buf->active_prefix_return[row];
+        CompletedSegment* segment = &buf->segments[seg_idx];
+        active->segment_count = seg_count + 1;
+        segment->best_slot = slot;
+        segment->sample_offset = active->sample_offset;
+        segment->start = start;
+        segment->count = count;
+        segment->episode_return = active->episode_return;
+        if (is_cl) {
+            segment->episode_return += active->prefix_return;
         }
-        if (isnan(buf->segment_return[seg_idx])
-                || isinf(buf->segment_return[seg_idx])) {
-            buf->segment_return[seg_idx] = -3.402823466e+38F;
+        if (isnan(segment->episode_return)
+                || isinf(segment->episode_return)) {
+            segment->episode_return = -3.402823466e+38F;
         }
-        buf->segment_prefix_return[seg_idx] = buf->active_prefix_return[row];
-        buf->segment_episode_len[seg_idx] = buf->active_episode_len[row];
-        if (role == CURRICULUM_ROLE_CL) {
-            buf->segment_episode_len[seg_idx] +=
-                buf->active_prefix_step[row];
+        segment->prefix_return = active->prefix_return;
+        segment->episode_len = active->episode_len;
+        if (is_cl) {
+            segment->episode_len += active->prefix_step;
         }
-        buf->segment_prefix_step[seg_idx] = buf->active_prefix_step[row];
-        buf->segment_best_generation[seg_idx] =
-            buf->active_best_generation[row];
+        segment->prefix_step = active->prefix_step;
+        segment->best_generation = active->best_generation;
     }
     if (!restart) {
-        buf->active_best_slot[row] = -1;
+        active->best_slot = -1;
         return;
     }
-    // curriculum_terminal_salt
-    unsigned int salt = (unsigned int)(pufferl->seed
-        + (uint64_t)pufferl->epoch * 1000003ULL
-        + (uint64_t)buffer_idx * 9176ULL
-        + (uint64_t)t * 101ULL
-        + (uint64_t)env_idx * 17ULL);
-    salt = role == CURRICULUM_ROLE_FRESH
-        ? salt ^ 0x2f1bbcdcU
-        : salt ^ 0x9e3779b9U;
-
-    if (role == CURRICULUM_ROLE_FRESH) {
-        curriculum_start_env(pufferl, env_idx, CURRICULUM_ROLE_FRESH,
-            salt, 0, 0, copy_to_gpu);
-    } else {
-        curriculum_start_env(pufferl, env_idx, CURRICULUM_ROLE_CL,
-            salt, 0, 0, copy_to_gpu);
-    }
+    unsigned int* rng_state = curriculum_worker_rng_state(
+        buf, buffer_idx, omp_get_thread_num());
+    curriculum_start_env(pufferl, env_idx, is_cl,
+        rng_state, 0, 0, copy_to_gpu);
 }
 
 static inline void curriculum_post_step(PuffeRL* pufferl, int buffer_idx,
         int t, int env_idx) {
     StateBuffer* buf = &pufferl->state_buf;
     StaticVec* vec = pufferl->vec;
-    int role = curriculum_env_role(buf, env_idx);
-    if (role != CURRICULUM_ROLE_FRESH && role != CURRICULUM_ROLE_CL) {
+    int row = curriculum_active_row(buf, env_idx);
+    if (!curriculum_row_is_fresh(buf, row)
+            && !curriculum_row_is_cl(buf, row)) {
         return;
     }
     Env* env = &vec->envs[env_idx];
@@ -597,7 +532,7 @@ static inline void curriculum_post_step(PuffeRL* pufferl, int buffer_idx,
     curriculum_observe_step(buf, env_idx, env, step_serial);
     if (env->terminals[0] > 0.5f) {
         curriculum_process_terminal(pufferl, env_idx, buffer_idx,
-            t + 1, 1, 0);
+            1, 0);
         return;
     }
     if (curriculum_should_record_checkpoint(buf, env_idx)) {
@@ -633,29 +568,25 @@ void curriculum_rollout_begin(PuffeRL* pufferl) {
         int env_idx = fresh_start + i;
         int active_row = curriculum_active_row(buf, env_idx);
         if (active_row >= 0
-                && buf->active_role[active_row] == CURRICULUM_ROLE_FRESH
-                && buf->active_best_slot[active_row] >= 0) {
+                && curriculum_row_is_fresh(buf, active_row)
+                && buf->active_rows[active_row].best_slot >= 0) {
             started++;
             continue;
         }
-        unsigned int salt = curriculum_epoch_start_salt(
-            pufferl, env_idx, CURRICULUM_ROLE_FRESH);
         started += curriculum_start_env(pufferl, env_idx,
-            CURRICULUM_ROLE_FRESH, salt, 1, 1, 1);
+            0, &buf->host_rng_state, 1, 1, 1);
     }
     for (int i = 0; i < num_cl_envs; i++) {
         int env_idx = cl_start + i;
         int active_row = curriculum_active_row(buf, env_idx);
         if (active_row >= 0
-                && buf->active_role[active_row] == CURRICULUM_ROLE_CL
-                && buf->active_best_slot[active_row] >= 0) {
+                && curriculum_row_is_cl(buf, active_row)
+                && buf->active_rows[active_row].best_slot >= 0) {
             started++;
             continue;
         }
-        unsigned int salt = curriculum_epoch_start_salt(
-            pufferl, env_idx, CURRICULUM_ROLE_CL);
         started += curriculum_start_env(pufferl, env_idx,
-            CURRICULUM_ROLE_CL, salt, 1, 1, 1);
+            1, &buf->host_rng_state, 1, 1, 1);
     }
     if (started <= 0) {
         buf->num_cl_envs = 0;
@@ -663,8 +594,7 @@ void curriculum_rollout_begin(PuffeRL* pufferl) {
         buf->num_vanilla_envs = total_envs;
         vec->log_env_limit = 0;
         for (int row = 0; row < buf->max_active_envs; row++) {
-            buf->active_role[row] = CURRICULUM_ROLE_VANILLA;
-            buf->active_best_slot[row] = -1;
+            buf->active_rows[row].best_slot = -1;
         }
     }
 
@@ -676,45 +606,48 @@ void curriculum_rollout_end(PuffeRL* pufferl) {
     for (int slot = 0; slot < buf->num_start_states; slot++) {
         int best_row = -1;
         int best_seg = -1;
-        float candidate_return = buf->best_return[slot];
-        int candidate_len = buf->best_episode_len[slot];
-        long long generation = buf->best_generation[slot];
+        BestTrajectoryMeta* meta = &buf->best_meta[slot];
+        float candidate_return = meta->episode_return;
+        int candidate_len = meta->episode_len;
+        long long generation = meta->generation;
         for (int row = 0; row < buf->max_active_envs; row++) {
             int seg_base = curriculum_segment_base(buf, row);
-            int seg_count = buf->row_segment_count[row];
+            int seg_count = buf->active_rows[row].segment_count;
             for (int i = 0; i < seg_count; i++) {
                 int seg_idx = seg_base + i;
-                if (buf->segment_best_slot[seg_idx] != slot
-                        || buf->segment_best_generation[seg_idx] != generation) {
+                CompletedSegment* segment = &buf->segments[seg_idx];
+                if (segment->best_slot != slot
+                        || segment->best_generation != generation) {
                     continue;
                 }
                 // curriculum_segment_beats
-                float terminal_return = buf->segment_return[seg_idx];
+                float terminal_return = segment->episode_return;
                 int segment_beats =
                     terminal_return > candidate_return + 1e-6f
                     || (fabsf(terminal_return - candidate_return) <= 1e-6f
-                        && buf->segment_episode_len[seg_idx] < candidate_len);
+                        && segment->episode_len < candidate_len);
                 if (segment_beats) {
                     best_row = row;
                     best_seg = seg_idx;
-                    candidate_return = buf->segment_return[seg_idx];
-                    candidate_len = buf->segment_episode_len[seg_idx];
+                    candidate_return = segment->episode_return;
+                    candidate_len = segment->episode_len;
                 }
             }
         }
         if (best_seg < 0) {
             continue;
         }
-        if (buf->segment_role[best_seg] == CURRICULUM_ROLE_FRESH) {
+        CompletedSegment* segment = &buf->segments[best_seg];
+        if (curriculum_row_is_fresh(buf, best_row)) {
             // curriculum_apply_full_segment
-            int apply_slot = buf->segment_best_slot[best_seg];
-            int apply_count = buf->segment_count[best_seg];
+            int apply_slot = segment->best_slot;
+            int apply_count = segment->count;
             if (apply_count > buf->trajectory_max_len) {
                 apply_count = buf->trajectory_max_len;
             }
             if (apply_slot >= 0 && apply_count > 0) {
                 int active_base = best_row * buf->trajectory_max_len
-                    + buf->segment_start[best_seg];
+                    + segment->start;
                 int best_base = curriculum_best_base(buf, apply_slot);
                 memcpy(buf->best_states + best_base,
                     buf->active_states + active_base,
@@ -725,24 +658,24 @@ void curriculum_rollout_end(PuffeRL* pufferl) {
                 memcpy(buf->best_state_step + best_base,
                     buf->active_state_step + active_base,
                     (size_t)apply_count * sizeof(int));
-                buf->best_valid[apply_slot] = 1;
-                buf->best_len[apply_slot] = apply_count;
-                buf->best_episode_len[apply_slot] =
-                    buf->segment_episode_len[best_seg];
-                buf->best_return[apply_slot] =
-                    buf->segment_return[best_seg];
-                buf->best_generation[apply_slot]++;
-                if (buf->best_generation[apply_slot] <= 0) {
-                    buf->best_generation[apply_slot] = 1;
+                BestTrajectoryMeta* apply_meta = &buf->best_meta[apply_slot];
+                apply_meta->valid = 1;
+                apply_meta->len = apply_count;
+                apply_meta->episode_len = segment->episode_len;
+                apply_meta->episode_return = segment->episode_return;
+                apply_meta->generation++;
+                if (apply_meta->generation <= 0) {
+                    apply_meta->generation = 1;
                 }
             }
         } else {
             // curriculum_apply_tail_segment
-            int apply_slot = buf->segment_best_slot[best_seg];
-            int offset = buf->segment_sample_offset[best_seg];
-            int apply_count = buf->segment_count[best_seg];
-            if (apply_slot >= 0 && buf->best_valid[apply_slot]
-                    && apply_count > 0) {
+            int apply_slot = segment->best_slot;
+            int offset = segment->sample_offset;
+            int apply_count = segment->count;
+            BestTrajectoryMeta* apply_meta = apply_slot >= 0
+                ? &buf->best_meta[apply_slot] : NULL;
+            if (apply_meta != NULL && apply_meta->valid && apply_count > 0) {
                 if (offset < 0) {
                     offset = 0;
                 }
@@ -754,27 +687,25 @@ void curriculum_rollout_end(PuffeRL* pufferl) {
                 }
                 if (apply_count > 0) {
                     int active_base = best_row * buf->trajectory_max_len
-                        + buf->segment_start[best_seg];
+                        + segment->start;
                     int best_base = curriculum_best_base(buf, apply_slot);
                     memcpy(buf->best_states + best_base + offset,
                         buf->active_states + active_base,
                         (size_t)apply_count * sizeof(PufferState));
                     for (int i = 0; i < apply_count; i++) {
                         buf->best_state_return[best_base + offset + i] =
-                            buf->segment_prefix_return[best_seg]
+                            segment->prefix_return
                             + buf->active_state_return[active_base + i];
                         buf->best_state_step[best_base + offset + i] =
-                            buf->segment_prefix_step[best_seg]
+                            segment->prefix_step
                             + buf->active_state_step[active_base + i];
                     }
-                    buf->best_len[apply_slot] = offset + apply_count;
-                    buf->best_episode_len[apply_slot] =
-                        buf->segment_episode_len[best_seg];
-                    buf->best_return[apply_slot] =
-                        buf->segment_return[best_seg];
-                    buf->best_generation[apply_slot]++;
-                    if (buf->best_generation[apply_slot] <= 0) {
-                        buf->best_generation[apply_slot] = 1;
+                    apply_meta->len = offset + apply_count;
+                    apply_meta->episode_len = segment->episode_len;
+                    apply_meta->episode_return = segment->episode_return;
+                    apply_meta->generation++;
+                    if (apply_meta->generation <= 0) {
+                        apply_meta->generation = 1;
                     }
                 }
             }
@@ -783,10 +714,12 @@ void curriculum_rollout_end(PuffeRL* pufferl) {
 
     // curriculum_compact_active_rows
     for (int row = 0; row < buf->max_active_envs; row++) {
-        int keep = buf->active_role[row] != CURRICULUM_ROLE_VANILLA
-            && buf->active_best_slot[row] >= 0;
-        int start = keep ? buf->active_segment_start[row] : 0;
-        int count = keep ? buf->active_history_count[row] - start : 0;
+        ActiveTrajectoryRow* active = &buf->active_rows[row];
+        int keep = (curriculum_row_is_fresh(buf, row)
+                || curriculum_row_is_cl(buf, row))
+            && active->best_slot >= 0;
+        int start = keep ? active->segment_start : 0;
+        int count = keep ? active->history_count - start : 0;
         if (count < 0) {
             count = 0;
         }
@@ -805,14 +738,13 @@ void curriculum_rollout_end(PuffeRL* pufferl) {
                 buf->active_state_step + base + start,
                 (size_t)count * sizeof(int));
         }
-        buf->active_history_count[row] = count;
-        buf->active_segment_start[row] = 0;
-        buf->row_segment_count[row] = 0;
+        active->history_count = count;
+        active->segment_start = 0;
+        active->segment_count = 0;
         if (!keep) {
-            buf->active_role[row] = CURRICULUM_ROLE_VANILLA;
-            buf->active_best_slot[row] = -1;
-            buf->active_last_observed_step[row] = -1;
-            buf->active_best_generation[row] = -1;
+            active->best_slot = -1;
+            active->last_observed_step = -1;
+            active->best_generation = -1;
         }
     }
 }

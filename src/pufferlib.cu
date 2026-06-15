@@ -2001,7 +2001,8 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         register_state_buffer(&pufferl->state_buf,
             vec->size, agents_per_env, max_active_envs,
             hypers.state_buffer_size, hypers.state_trajectory_max_len,
-            hypers.state_checkpoint_interval, hypers.horizon);
+            hypers.state_checkpoint_interval, hypers.horizon,
+            num_buffers, hypers.num_threads, (unsigned int)pufferl->seed);
     }
 
     // Extra cuda buffers just reuse activ allocator
