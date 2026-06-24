@@ -1849,31 +1849,28 @@ extern "C" int pufferl_add_frozen_bank(PuffeRL* pufferl, int slice_size,
 // not a copy of the data).
 extern "C" void pufferl_load_frozen_bank(PuffeRL* pufferl, int bank_idx, const char* path) {
     if (bank_idx < 0 || bank_idx >= pufferl->num_frozen_banks) {
-        fprintf(stderr, "pufferl_load_frozen_bank: bank_idx %d out of range\n", bank_idx);
-        return;
+        throw std::runtime_error("pufferl_load_frozen_bank: bank_idx out of range");
     }
     WeightBank* bank = &pufferl->frozen_banks[bank_idx];
     int64_t nbytes = numel(bank->master_weights.shape) * sizeof(float);
     FILE* f = fopen(path, "rb");
     if (!f) {
-        fprintf(stderr, "pufferl_load_frozen_bank: failed to open %s\n", path);
-        return;
+        throw std::runtime_error(std::string("pufferl_load_frozen_bank: failed to open ") + path);
     }
     fseek(f, 0, SEEK_END);
     long file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (file_size != nbytes) {
-        fprintf(stderr, "pufferl_load_frozen_bank: size mismatch (expected %lld, got %ld)\n",
-            (long long)nbytes, file_size);
         fclose(f);
-        return;
+        throw std::runtime_error("pufferl_load_frozen_bank: size mismatch for " + std::string(path)
+            + " (expected " + std::to_string((long long)nbytes)
+            + " bytes, got " + std::to_string((long long)file_size) + ")");
     }
     std::vector<char> buf(nbytes);
     size_t nread = fread(buf.data(), 1, nbytes, f);
     fclose(f);
     if ((int64_t)nread != nbytes) {
-        fprintf(stderr, "pufferl_load_frozen_bank: short read on %s\n", path);
-        return;
+        throw std::runtime_error(std::string("pufferl_load_frozen_bank: short read on ") + path);
     }
     cudaMemcpy(bank->master_weights.data, buf.data(), nbytes, cudaMemcpyHostToDevice);
     if (USE_BF16) {
@@ -2221,9 +2218,15 @@ void close_impl(PuffeRL& pufferl) {
         cudaProfilerStop();
     }
 
-    cudaGraphExecDestroy(pufferl.train_cudagraph);
-    for (int i = 0; i < pufferl.hypers.horizon * pufferl.hypers.num_buffers; i++) {
-        cudaGraphExecDestroy(pufferl.fused_rollout_cudagraphs[i]);
+    if (pufferl.train_cudagraph) {
+        cudaGraphExecDestroy(pufferl.train_cudagraph);
+    }
+    if (pufferl.fused_rollout_cudagraphs) {
+        for (int i = 0; i < pufferl.hypers.horizon * pufferl.hypers.num_buffers; i++) {
+            if (pufferl.fused_rollout_cudagraphs[i]) {
+                cudaGraphExecDestroy(pufferl.fused_rollout_cudagraphs[i]);
+            }
+        }
     }
 
     policy_weights_free(&pufferl.policy, &pufferl.weights);

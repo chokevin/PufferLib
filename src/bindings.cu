@@ -3,6 +3,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
+#include <cstring>
 #include "pufferlib.cu"
 
 #define _PUFFER_STRINGIFY(x) #x
@@ -215,6 +216,124 @@ void load_weights(pybind11::object pufferl_obj, const std::string& path) {
         cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl.default_stream>>>(
             pufferl.param_puf.data, pufferl.master_weights.data, n);
     }
+}
+
+
+void checked_write(FILE* f, const void* data, size_t bytes, const std::string& path, const char* label) {
+    if (bytes == 0) return;
+    if (fwrite(data, 1, bytes, f) != bytes) {
+        throw std::runtime_error("Failed to write " + std::string(label) + " to " + path);
+    }
+}
+
+void checked_read(FILE* f, void* data, size_t bytes, const std::string& path, const char* label) {
+    if (bytes == 0) return;
+    if (fread(data, 1, bytes, f) != bytes) {
+        throw std::runtime_error("Failed to read " + std::string(label) + " from " + path);
+    }
+}
+
+void save_state(pybind11::object pufferl_obj, const std::string& path) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    const char magic[8] = {'P', 'U', 'F', 'S', 'T', 'A', '1', 0};
+    int64_t version = 1;
+    int64_t epoch = pufferl.epoch;
+    int64_t global_step = pufferl.global_step;
+    int64_t nweights = numel(pufferl.master_weights.shape);
+    int64_t nmomentum = numel(pufferl.muon.mb_puf.shape);
+    int64_t nrng = numel(pufferl.rng_offset_puf.shape);
+    float lr = 0.0f;
+
+    std::vector<float> weights(nweights);
+    std::vector<float> momentum(nmomentum);
+    std::vector<long> rng_offset(nrng);
+    cudaMemcpy(weights.data(), pufferl.master_weights.data,
+        nweights * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(momentum.data(), pufferl.muon.mb_puf.data,
+        nmomentum * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&lr, pufferl.muon.lr_ptr, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(rng_offset.data(), pufferl.rng_offset_puf.data,
+        nrng * sizeof(long), cudaMemcpyDeviceToHost);
+
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) throw std::runtime_error("Failed to open " + path + " for writing");
+    checked_write(f, magic, sizeof(magic), path, "magic");
+    checked_write(f, &version, sizeof(version), path, "version");
+    checked_write(f, &epoch, sizeof(epoch), path, "epoch");
+    checked_write(f, &global_step, sizeof(global_step), path, "global_step");
+    checked_write(f, &nweights, sizeof(nweights), path, "nweights");
+    checked_write(f, &nmomentum, sizeof(nmomentum), path, "nmomentum");
+    checked_write(f, &nrng, sizeof(nrng), path, "nrng");
+    checked_write(f, &lr, sizeof(lr), path, "lr");
+    checked_write(f, weights.data(), nweights * sizeof(float), path, "weights");
+    checked_write(f, momentum.data(), nmomentum * sizeof(float), path, "momentum");
+    checked_write(f, rng_offset.data(), nrng * sizeof(long), path, "rng_offset");
+    fclose(f);
+}
+
+void load_state(pybind11::object pufferl_obj, const std::string& path) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    char magic[8];
+    const char expected_magic[8] = {'P', 'U', 'F', 'S', 'T', 'A', '1', 0};
+    int64_t version = 0;
+    int64_t epoch = 0;
+    int64_t global_step = 0;
+    int64_t nweights = 0;
+    int64_t nmomentum = 0;
+    int64_t nrng = 0;
+    float lr = 0.0f;
+
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) throw std::runtime_error("Failed to open " + path + " for reading");
+    checked_read(f, magic, sizeof(magic), path, "magic");
+    if (memcmp(magic, expected_magic, sizeof(magic)) != 0) {
+        fclose(f);
+        throw std::runtime_error("State file magic mismatch: " + path);
+    }
+    checked_read(f, &version, sizeof(version), path, "version");
+    if (version != 1) {
+        fclose(f);
+        throw std::runtime_error("Unsupported state file version: " + std::to_string(version));
+    }
+    checked_read(f, &epoch, sizeof(epoch), path, "epoch");
+    checked_read(f, &global_step, sizeof(global_step), path, "global_step");
+    checked_read(f, &nweights, sizeof(nweights), path, "nweights");
+    checked_read(f, &nmomentum, sizeof(nmomentum), path, "nmomentum");
+    checked_read(f, &nrng, sizeof(nrng), path, "nrng");
+    checked_read(f, &lr, sizeof(lr), path, "lr");
+
+    int64_t expected_weights = numel(pufferl.master_weights.shape);
+    int64_t expected_momentum = numel(pufferl.muon.mb_puf.shape);
+    int64_t expected_rng = numel(pufferl.rng_offset_puf.shape);
+    if (nweights != expected_weights || nmomentum != expected_momentum || nrng != expected_rng) {
+        fclose(f);
+        throw std::runtime_error("State file size mismatch for " + path);
+    }
+
+    std::vector<float> weights(nweights);
+    std::vector<float> momentum(nmomentum);
+    std::vector<long> rng_offset(nrng);
+    checked_read(f, weights.data(), nweights * sizeof(float), path, "weights");
+    checked_read(f, momentum.data(), nmomentum * sizeof(float), path, "momentum");
+    checked_read(f, rng_offset.data(), nrng * sizeof(long), path, "rng_offset");
+    fclose(f);
+
+    cudaMemcpy(pufferl.master_weights.data, weights.data(),
+        nweights * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(pufferl.muon.mb_puf.data, momentum.data(),
+        nmomentum * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(pufferl.muon.lr_ptr, &lr, sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(pufferl.rng_offset_puf.data, rng_offset.data(),
+        nrng * sizeof(long), cudaMemcpyHostToDevice);
+    if (USE_BF16) {
+        int n = numel(pufferl.param_puf.shape);
+        cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl.default_stream>>>(
+            pufferl.param_puf.data, pufferl.master_weights.data, n);
+    }
+    pufferl.epoch = epoch;
+    pufferl.global_step = global_step;
+    pufferl.last_log_step = global_step;
+    pufferl.last_log_time = wall_clock();
 }
 
 int py_add_frozen_bank(py::object pufferl_obj, int slice_size,
@@ -521,6 +640,8 @@ PYBIND11_MODULE(_C, m) {
     m.def("close", &puf_close);
     m.def("save_weights", &save_weights);
     m.def("load_weights", &load_weights);
+    m.def("save_state", &save_state);
+    m.def("load_state", &load_state);
     m.def("add_frozen_bank", &py_add_frozen_bank);
     m.def("load_frozen_bank", &py_load_frozen_bank);
     m.def("set_agent_perm", &py_set_agent_perm);

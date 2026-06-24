@@ -25,7 +25,7 @@ try:
 except ImportError:
     raise ImportError('Failed to import PufferLib C++ backend. If you have non-default PyTorch, try installing with --no-build-isolation')
 
-from pufferlib import selfplay
+from pufferlib import selfplay, exploiters
 
 import rich
 import rich.traceback
@@ -187,6 +187,235 @@ def _train_worker(args):
 
     backend.close(pufferl)
 
+
+def _agent_steps(pufferl, args):
+    return int(pufferl.global_step) * max(1, int(args.get('world_size', 1)))
+
+
+def _downsample_logs(args, all_logs):
+    if not all_logs:
+        return {}
+    n = args['sweep']['downsample']
+    if n <= 1:
+        return {k: [v] for k, v in all_logs[-1].items()}
+
+    def _reduce(values):
+        if not values:
+            return None
+        try:
+            return float(np.mean(values))
+        except (TypeError, ValueError):
+            return values[-1]
+
+    metrics = {k: [[]] for k in all_logs[0]}
+    logged_timesteps = all_logs[-1]['agent_steps']
+    next_bin = logged_timesteps / (n - 1)
+    for log in all_logs:
+        for k, v in log.items():
+            if k not in metrics:
+                prior_bins = max(len(metrics.get('agent_steps', [])) - 1, 0)
+                metrics[k] = [v] * prior_bins + [[]]
+            metrics[k][-1].append(v)
+
+        if log['agent_steps'] < next_bin:
+            continue
+
+        next_bin += logged_timesteps / (n - 1)
+        for k in list(metrics):
+            reduced = _reduce(metrics[k][-1])
+            if reduced is None and len(metrics[k]) > 1:
+                reduced = metrics[k][-2]
+            metrics[k][-1] = reduced
+            metrics[k].append([])
+
+    for k in list(metrics):
+        if k in all_logs[-1]:
+            metrics[k][-1] = all_logs[-1][k]
+        else:
+            reduced = _reduce(metrics[k][-1])
+            if reduced is None and len(metrics[k]) > 1:
+                reduced = metrics[k][-2]
+            metrics[k][-1] = reduced
+    return metrics
+
+
+def _train_with_exploiters(env_name, args, backend, run_id, checkpoint_dir,
+        artifact_owner, result_queue=None, verbose=False):
+    if result_queue is not None:
+        raise RuntimeError('exploiter training is not supported in sweeps yet')
+    if backend is not _C:
+        raise RuntimeError('exploiter training requires the native CUDA backend')
+
+    cfg = args.get('exploiters', {})
+    world_size = max(1, int(args.get('world_size', 1)))
+    rank = int(args.get('rank', 0))
+    total_main_steps = int(args['train']['total_timesteps']) * world_size
+    warmup_steps = int(cfg.get('warmup_steps', 1_000_000_000))
+    phase_steps = int(cfg.get('phase_steps', warmup_steps))
+    exploiter_steps = int(cfg.get('exploiter_steps', warmup_steps))
+    env_frac = float(cfg.get('env_frac', 0.2))
+    seed_base = int(cfg.get('seed', args.get('seed', 0)))
+    train_new_exploiters = bool(int(cfg.get('train_new', 1)))
+    initial_pool_dir = str(cfg.get('initial_pool_dir', '') or '')
+
+    if env_frac <= 0.0 or env_frac >= 1.0:
+        raise RuntimeError('exploiters.env_frac must be in (0, 1)')
+    if warmup_steps <= 0 or phase_steps <= 0 or exploiter_steps <= 0:
+        raise RuntimeError('exploiters warmup/phase/exploiter steps must be positive')
+
+    state_dir = os.path.join(checkpoint_dir, 'state')
+    exploiter_dir = os.path.join(checkpoint_dir, 'exploiters')
+    if artifact_owner:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        os.makedirs(state_dir, exist_ok=True)
+        os.makedirs(exploiter_dir, exist_ok=True)
+
+    all_logs = []
+    exploiter_logs = []
+    model_path = ''
+    main_state_path = ''
+    exploiter_paths = []
+    if initial_pool_dir:
+        initial_pool_dir = os.path.expanduser(initial_pool_dir)
+        exploiter_paths = sorted(glob.glob(os.path.join(initial_pool_dir, '*.bin')))
+        if not exploiter_paths:
+            raise RuntimeError(f'exploiters.initial_pool_dir has no .bin files: {initial_pool_dir}')
+    if not train_new_exploiters and not exploiter_paths:
+        raise RuntimeError('exploiters.train_new=0 requires exploiters.initial_pool_dir')
+    flat_logs = {}
+
+    def fresh_nccl_id(label):
+        if world_size <= 1:
+            return args.get('nccl_id', b'')
+        path = os.path.join(state_dir, f'nccl_{label}.bin')
+        if artifact_owner:
+            raw = _C.get_nccl_id()
+            tmp = f'{path}.tmp.{os.getpid()}'
+            with open(tmp, 'wb') as f:
+                f.write(raw)
+            os.replace(tmp, path)
+            return raw
+        exploiters.wait_for_path(path)
+        with open(path, 'rb') as f:
+            return f.read()
+
+    def make_main(paths, phase_idx):
+        mode = 'main' if paths else 'pure_main'
+        main_args = exploiters.configure_args(args, mode, env_frac=env_frac)
+        main_args['nccl_id'] = fresh_nccl_id(f'main_{phase_idx:03d}')
+        pufferl = backend.create_pufferl(main_args)
+        if main_state_path:
+            exploiters.wait_for_path(main_state_path)
+            backend.load_state(pufferl, main_state_path)
+        rng = np.random.default_rng(seed_base + rank + 1009 * phase_idx + 37 * len(paths))
+        exp_state = exploiters.setup_main(pufferl, backend, main_args, paths, rng) if paths else None
+        return pufferl, main_args, exp_state
+
+    def log_training(pufferl, train_args, exp_state, phase_idx, kind, logs_out):
+        logs = backend.log(pufferl)
+        flat = dict(unroll_nested_dict(logs))
+        exploiters.log_state(flat, exp_state)
+        flat['phase/index'] = phase_idx
+        flat['phase/is_exploiter'] = 1 if kind == 'exploiter' else 0
+        flat['phase/main_agent_steps'] = _agent_steps(pufferl, train_args)
+        logs_out.append(flat)
+        if verbose:
+            print_dashboard(train_args, pufferl.num_params(), flat)
+        if args['wandb'] and artifact_owner and kind == 'main':
+            import wandb
+            wandb.log(flat, step=flat['agent_steps'])
+        return flat
+
+    def train_until(pufferl, train_args, exp_state, target_steps, phase_idx, kind, logs_out):
+        nonlocal model_path, flat_logs
+        if verbose:
+            flat = dict(unroll_nested_dict(backend.log(pufferl)))
+            exploiters.log_state(flat, exp_state)
+            print_dashboard(train_args, pufferl.num_params(), flat, clear=True)
+        while _agent_steps(pufferl, train_args) < target_steps:
+            backend.rollouts(pufferl)
+            backend.train(pufferl)
+            done = _agent_steps(pufferl, train_args) >= target_steps
+            if kind == 'main' and artifact_owner:
+                should_save = (pufferl.epoch % args['checkpoint_interval'] == 0) or done
+                if should_save:
+                    model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
+                    backend.save_weights(pufferl, model_path)
+            if time.time() >= pufferl.last_log_time + 0.6 or done:
+                flat_logs = log_training(pufferl, train_args, exp_state, phase_idx, kind, logs_out)
+        return flat_logs
+
+    def save_main_state(pufferl, phase_idx):
+        state_path = os.path.join(state_dir, f'main_phase_{phase_idx:03d}.state')
+        weights_path = os.path.join(state_dir, f'main_phase_{phase_idx:03d}.bin')
+        if artifact_owner:
+            backend.save_state(pufferl, state_path)
+            backend.save_weights(pufferl, weights_path)
+        else:
+            exploiters.wait_for_path(state_path)
+            exploiters.wait_for_path(weights_path)
+        return state_path, weights_path
+
+    def train_exploiter(phase_idx, main_weights_path):
+        exploiter_path = os.path.join(exploiter_dir, f'exploiter_{phase_idx:03d}.bin')
+        exp_seed = seed_base + 10_000 + phase_idx * 997
+        ex_args = exploiters.configure_args(args, 'exploiter', env_frac=env_frac, global_timesteps=exploiter_steps, seed=exp_seed)
+        ex_args['nccl_id'] = fresh_nccl_id(f'exploiter_{phase_idx:03d}')
+        pufferl = backend.create_pufferl(ex_args)
+        exp_state = exploiters.setup_exploiter(pufferl, backend, ex_args, main_weights_path)
+        train_until(pufferl, ex_args, exp_state, exploiter_steps, phase_idx, 'exploiter', exploiter_logs)
+        if artifact_owner:
+            backend.save_weights(pufferl, exploiter_path)
+        else:
+            exploiters.wait_for_path(exploiter_path)
+        backend.close(pufferl)
+        return exploiter_path
+
+    phase_idx = 0
+    pufferl, main_args, exp_state = make_main(exploiter_paths, phase_idx)
+    try:
+        next_target = min(total_main_steps, warmup_steps)
+        while _agent_steps(pufferl, main_args) < total_main_steps:
+            train_until(pufferl, main_args, exp_state, next_target, phase_idx, 'main', all_logs)
+            if _agent_steps(pufferl, main_args) >= total_main_steps:
+                break
+
+            main_state_path, main_weights_path = save_main_state(pufferl, phase_idx)
+            backend.close(pufferl)
+            if train_new_exploiters:
+                exploiter_paths.append(train_exploiter(phase_idx + 1, main_weights_path))
+            phase_idx += 1
+            pufferl, main_args, exp_state = make_main(exploiter_paths, phase_idx)
+            next_target = min(total_main_steps, _agent_steps(pufferl, main_args) + phase_steps)
+    finally:
+        try:
+            backend.close(pufferl)
+        except Exception:
+            pass
+
+    metrics = _downsample_logs(args, all_logs)
+    if artifact_owner:
+        log_dir = os.path.join(args['log_dir'], args['env_name'])
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, run_id + '.json'), 'w') as f:
+            json_args = deepcopy(args)
+            json_args.pop('nccl_id', None)
+            json.dump({**json_args, 'metrics': metrics}, f)
+        with open(os.path.join(log_dir, run_id + '_exploiters.json'), 'w') as f:
+            json.dump({
+                'run_id': run_id,
+                'exploiter_paths': exploiter_paths,
+                'metrics': _downsample_logs(args, exploiter_logs) if exploiter_logs else {},
+            }, f)
+
+    if args['wandb'] and artifact_owner:
+        import wandb
+        if model_path:
+            artifact = wandb.Artifact(run_id, type='model')
+            artifact.add_file(model_path)
+            wandb.run.log_artifact(artifact)
+        wandb.run.finish()
+
 def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     '''Single-GPU training worker. Process target for both DDP ranks and sweep trials.'''
     backend = _resolve_backend(args)
@@ -228,6 +457,11 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     log_dir = os.path.join(args['log_dir'], args['env_name'])
     if artifact_owner:
         os.makedirs(log_dir, exist_ok=True)
+
+    if bool(args.get('exploiters', {}).get('enabled', 0)):
+        args.setdefault('selfplay', {})['enabled'] = 0
+        return _train_with_exploiters(env_name, args, backend, run_id, checkpoint_dir,
+            artifact_owner, result_queue=result_queue, verbose=verbose)
 
     try:
         pufferl = backend.create_pufferl(args)
