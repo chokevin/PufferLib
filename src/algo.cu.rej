@@ -1,0 +1,8 @@
+--- src/algo.cu
++++ src/algo.cu
+@@ -1968,4 +1972,4 @@
+         int* act_sizes, float* losses_acc,
+         float clip_coef, float vf_clip_coef, float vf_coef, const float* ent_coef,
+         PPOBufs& bufs, bool is_continuous, bool normalize_advantage,
+-        cudaStream_t stream) {
++        bool clip_auxiliary, cudaStream_t stream) {

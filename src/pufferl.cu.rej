@@ -1,0 +1,5 @@
+--- src/pufferl.cu
++++ src/pufferl.cu
+@@ -1669 +1669 @@
+-            if (hypers->offpol_mom) {
++            if (false && hypers->offpol_mom) {

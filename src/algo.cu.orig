@@ -907,42 +907,12 @@ __global__ void muon_sum_sq_reduce(float* __restrict__ out,
     block_reduce_sum(sdata, out, tid, blockDim.x, 1);
 }
 
-// TODO(offpolicy-cleanup): Temporary exact optimizer-leak diagnostics.
-__global__ void muon_f32_sum_sq_partials(float* __restrict__ partials,
-        const float* __restrict__ src, int n) {
-    __shared__ float sdata[256];
-    int tid = threadIdx.x;
-    float sum = 0.0f;
-    for (int i = blockIdx.x * blockDim.x + tid; i < n;
-            i += blockDim.x * gridDim.x) {
-        float v = src[i];
-        sum += v * v;
-    }
-    sdata[tid] = sum;
-    block_reduce_sum(sdata, &partials[blockIdx.x], tid, blockDim.x, 1);
-}
-
-__global__ void muon_f32_diff_sum_sq_partials(float* __restrict__ partials,
-        const float* __restrict__ after, const float* __restrict__ before,
-        int n) {
-    __shared__ float sdata[256];
-    int tid = threadIdx.x;
-    float sum = 0.0f;
-    for (int i = blockIdx.x * blockDim.x + tid; i < n;
-            i += blockDim.x * gridDim.x) {
-        float d = after[i] - before[i];
-        sum += d * d;
-    }
-    sdata[tid] = sum;
-    block_reduce_sum(sdata, &partials[blockIdx.x], tid, blockDim.x, 1);
-}
-
 // Global grad clip by L2, then Nesterov into the f32 momentum buffer.
 // TODO(offpolicy-cleanup): Remove use_momentum after validation; the runtime
 // branch is retained only to preserve the current frozen CUDA numerics.
 // Keep use_momentum as a runtime branch even though PPO currently passes 1:
 // specializing it changes CUDA codegen enough to perturb replay numerics.
-// *trust_ptr ∈[0,1] (null=1): acceptance weight for this optimizer step.
+// *trust_ptr ∈[0,1] (null=1): effective fixed-data × policy-overlap trust.
 // This controls optimizer-state time independently of raw-gradient scaling.
 __global__ void muon_clip_nesterov(float* __restrict__ mb,
         precision_t* __restrict__ gc, const float* __restrict__ sum_sq_ptr,
@@ -952,12 +922,6 @@ __global__ void muon_clip_nesterov(float* __restrict__ mb,
     float trust = trust_ptr ? fminf(fmaxf(*trust_ptr, 0.0f), 1.0f) : 1.0f;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        // Avoid 0 * NaN below: rejected steps are exactly inert even if the
-        // rejected gradient has already become non-finite.
-        if (!(trust > 0.0f)) {
-            gc[idx] = from_float(0.0f);
-            return;
-        }
         float g = to_float(gc[idx]) * clip_coef;
         if (!use_momentum) {
             gc[idx] = from_float(g);
@@ -979,10 +943,6 @@ __global__ void muon_prepare_step_scale(float* out, const float* sum_sq_ptr,
         const float* external_ptr) {
     float external = external_ptr
         ? fminf(fmaxf(*external_ptr, 0.0f), 1.0f) : 1.0f;
-    if (!(external > 0.0f)) {
-        *out = 0.0f;
-        return;
-    }
     float grad_norm = sqrtf(fmaxf(*sum_sq_ptr, 0.0f));
     // Fixed absolute reference: no dependence on replay position or history.
     float grad_scale = preserve_grad_scale
@@ -1015,197 +975,6 @@ __global__ void mean_data_trust(
     }
     if (tid == 0) atomicAdd(trust_out, trust_data[0] / (float)n);
 }
-
-// Standard PPO clipfrac complement on the current minibatch. This is
-// memoryless: the gate sees only the current behavior ratio and clip range.
-__global__ void mean_unclipped_trust(float* __restrict__ out,
-        const precision_t* __restrict__ ratio, float clip_coef, int n) {
-    __shared__ float sdata[256];
-    int tid = threadIdx.x;
-    float sum = 0.0f;
-    for (int i = blockIdx.x * blockDim.x + tid; i < n;
-            i += blockDim.x * gridDim.x) {
-        float r = to_float(ratio[i]);
-        sum += isfinite(r) && fabsf(r - 1.0f) <= clip_coef ? 1.0f : 0.0f;
-    }
-    sdata[tid] = sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
-    }
-    if (tid == 0) atomicAdd(out, sdata[0] / (float)n);
-}
-
-
-// Diagnostic-only summary for the policy/behavior ratio invariant. A forward
-// pass through the exact behavior snapshot should produce ref_ratio ~= 1 for
-// every stored action. One block is enough for the temporary trace and avoids
-// atomics or another persistent reduction buffer.
-struct RatioDebugValues {
-    float current_unclipped;
-    float current_mean_abs;
-    float current_min;
-    float current_max;
-    float behavior_unclipped;
-    float behavior_mean_abs;
-    float behavior_min;
-    float behavior_max;
-    float policy_active;
-    float active_outside;
-};
-
-__global__ void ratio_debug_kernel(float* out,
-        const precision_t* current_ratio,
-        const precision_t* behavior_ratio,
-        const precision_t* advantages, const float* adv_mean,
-        float clip_coef, bool normalize_advantage, int n) {
-    __shared__ float cur_in[256], cur_abs[256], cur_min[256], cur_max[256];
-    __shared__ float ref_in[256], ref_abs[256], ref_min[256], ref_max[256];
-    __shared__ float active[256], active_out[256];
-    int tid = threadIdx.x;
-    float ci = 0.0f, ca = 0.0f, cmin = INFINITY, cmax = -INFINITY;
-    float ri = 0.0f, ra = 0.0f, rmin = INFINITY, rmax = -INFINITY;
-    float pa = 0.0f, po = 0.0f;
-    for (int i = tid; i < n; i += blockDim.x) {
-        float c = to_float(current_ratio[i]);
-        float r = to_float(behavior_ratio[i]);
-        if (isfinite(c)) {
-            ci += fabsf(c - 1.0f) <= clip_coef ? 1.0f : 0.0f;
-            ca += fabsf(c - 1.0f);
-            cmin = fminf(cmin, c);
-            cmax = fmaxf(cmax, c);
-        }
-        float adv = to_float(advantages[i]);
-        if (normalize_advantage) adv -= *adv_mean;
-        bool outside = fabsf(c - 1.0f) > clip_coef;
-        bool clipped = (adv > 0.0f && c >= 1.0f + clip_coef)
-            || (adv < 0.0f && c <= 1.0f - clip_coef);
-        if (isfinite(c) && !clipped) {
-            pa += 1.0f;
-            po += outside ? 1.0f : 0.0f;
-        }
-        if (isfinite(r)) {
-            ri += fabsf(r - 1.0f) <= clip_coef ? 1.0f : 0.0f;
-            ra += fabsf(r - 1.0f);
-            rmin = fminf(rmin, r);
-            rmax = fmaxf(rmax, r);
-        }
-    }
-    cur_in[tid] = ci; cur_abs[tid] = ca;
-    cur_min[tid] = cmin; cur_max[tid] = cmax;
-    ref_in[tid] = ri; ref_abs[tid] = ra;
-    ref_min[tid] = rmin; ref_max[tid] = rmax;
-    active[tid] = pa; active_out[tid] = po;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            cur_in[tid] += cur_in[tid + s];
-            cur_abs[tid] += cur_abs[tid + s];
-            cur_min[tid] = fminf(cur_min[tid], cur_min[tid + s]);
-            cur_max[tid] = fmaxf(cur_max[tid], cur_max[tid + s]);
-            ref_in[tid] += ref_in[tid + s];
-            ref_abs[tid] += ref_abs[tid + s];
-            ref_min[tid] = fminf(ref_min[tid], ref_min[tid + s]);
-            ref_max[tid] = fmaxf(ref_max[tid], ref_max[tid + s]);
-            active[tid] += active[tid + s];
-            active_out[tid] += active_out[tid + s];
-        }
-        __syncthreads();
-    }
-    if (tid == 0) {
-        float inv_n = 1.0f / (float)n;
-        out[0] = cur_in[0] * inv_n;
-        out[1] = cur_abs[0] * inv_n;
-        out[2] = cur_min[0];
-        out[3] = cur_max[0];
-        out[4] = ref_in[0] * inv_n;
-        out[5] = ref_abs[0] * inv_n;
-        out[6] = ref_min[0];
-        out[7] = ref_max[0];
-        out[8] = active[0] * inv_n;
-        out[9] = active_out[0] * inv_n;
-    }
-}
-
-RatioDebugValues ratio_debug_measure(float* scratch,
-        Prec current_ratio, Prec behavior_ratio,
-        Prec advantages, const float* adv_mean,
-        float clip_coef, bool normalize_advantage, cudaStream_t stream) {
-    int n = (int)numel(current_ratio.shape);
-    ratio_debug_kernel<<<1, 256, 0, stream>>>(scratch,
-        current_ratio.data, behavior_ratio.data, advantages.data, adv_mean,
-        clip_coef, normalize_advantage, n);
-    RatioDebugValues out = {};
-    cudaMemcpyAsync(&out, scratch, sizeof(out), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-    return out;
-}
-
-struct ValueDebugValues {
-    float in_band;
-    float mean_abs_delta;
-    float gradient_active;
-};
-
-__global__ void value_debug_kernel(float* out,
-        const precision_t* newvalue, const precision_t* oldvalue,
-        const precision_t* returns, float vf_clip_coef, int n) {
-    __shared__ float in_band[256], abs_delta[256], active[256];
-    int tid = threadIdx.x;
-    float bi = 0.0f, ad = 0.0f, ac = 0.0f;
-    for (int i = tid; i < n; i += blockDim.x) {
-        float pred = to_float(newvalue[i]);
-        float old = to_float(oldvalue[i]);
-        float ret = to_float(returns[i]);
-        float delta = pred - old;
-        bi += isfinite(delta) && fabsf(delta) <= vf_clip_coef ? 1.0f : 0.0f;
-        ad += isfinite(delta) ? fabsf(delta) : 0.0f;
-        float clipped = old + fmaxf(-vf_clip_coef, fminf(vf_clip_coef, delta));
-        float loss = (pred - ret) * (pred - ret);
-        float clipped_loss = (clipped - ret) * (clipped - ret);
-        ac += isfinite(loss) && clipped_loss <= loss ? 1.0f : 0.0f;
-    }
-    in_band[tid] = bi;
-    abs_delta[tid] = ad;
-    active[tid] = ac;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            in_band[tid] += in_band[tid + s];
-            abs_delta[tid] += abs_delta[tid + s];
-            active[tid] += active[tid + s];
-        }
-        __syncthreads();
-    }
-    if (tid == 0) {
-        float inv_n = 1.0f / (float)n;
-        out[0] = in_band[0] * inv_n;
-        out[1] = abs_delta[0] * inv_n;
-        out[2] = active[0] * inv_n;
-    }
-}
-
-ValueDebugValues value_debug_measure(float* scratch,
-        Prec newvalue, Prec oldvalue, Prec returns,
-        float vf_clip_coef, cudaStream_t stream) {
-    int n = (int)numel(newvalue.shape);
-    value_debug_kernel<<<1, 256, 0, stream>>>(scratch, newvalue.data,
-        oldvalue.data, returns.data, vf_clip_coef, n);
-    ValueDebugValues out = {};
-    cudaMemcpyAsync(&out, scratch, sizeof(out), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-    return out;
-}
-
-// Memoryless dead zone on the current minibatch's absolute usable fraction.
-// Unlike replay-index or cumulative-KL decay, this can reopen on later data.
-__global__ void threshold_trust(float* trust, float min_trust) {
-    float t = *trust;
-    *trust = isfinite(t) && t >= min_trust
-        ? fminf(fmaxf(t, 0.0f), 1.0f) : 0.0f;
-}
-
 
 // Absolute action overlap on behavior-policy states:
 // E_mu[min(pi/mu,pi_0/mu)] = 1-E_{s~d_mu}[TV(pi(.|s),pi_0(.|s))].
@@ -1259,9 +1028,7 @@ __global__ void muon_scale_by_trust(precision_t* __restrict__ x,
     float t = trust_ptr ? fminf(fmaxf(*trust_ptr, 0.0f), 1.0f) : 1.0f;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        // Avoid 0 * NaN: zero trust must produce an exact zero update.
-        x[idx] = t > 0.0f ? from_float(to_float(x[idx]) * t)
-                          : from_float(0.0f);
+        x[idx] = from_float(to_float(x[idx]) * t);
     }
 }
 
@@ -1316,12 +1083,7 @@ struct Muon {
     float* step_trust;     // same trust applied after orthogonalization
     float* policy_overlap; // absolute fixed-reference/current policy overlap
     float* norm_partials;  // 256
-    float* debug_weight_delta_sq;
-    float* debug_weight_norm_sq;
-    float* debug_momentum_delta_sq;
-    float* debug_momentum_norm_sq;
     Float mb;              // flat momentum buffer (param-sized)
-    Float debug_weights_before, debug_momentum_before;
     float* step_scale;     // external trust × optional raw-gradient scale
     Prec gram, gram_buf, x_buf;
     Allocator* param_alloc;
@@ -1337,21 +1099,13 @@ void muon_init(Muon* m, Allocator* param_alloc, double momentum, Allocator* allo
     cudaMalloc((void**)&m->step_trust, sizeof(float));
     cudaMalloc((void**)&m->policy_overlap, sizeof(float));
     cudaMalloc((void**)&m->norm_partials, 256 * sizeof(float));
-    cudaMalloc((void**)&m->debug_weight_delta_sq, sizeof(float));
-    cudaMalloc((void**)&m->debug_weight_norm_sq, sizeof(float));
-    cudaMalloc((void**)&m->debug_momentum_delta_sq, sizeof(float));
-    cudaMalloc((void**)&m->debug_momentum_norm_sq, sizeof(float));
     float one = 1.0f;
     cudaMalloc((void**)&m->step_scale, sizeof(float));
     cudaMemcpy(m->step_scale, &one, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(m->trust, &one, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(m->step_trust, &one, sizeof(float), cudaMemcpyHostToDevice);
     m->mb = {.shape = {param_alloc->total_elems}};
-    m->debug_weights_before = {.shape = {param_alloc->total_elems}};
-    m->debug_momentum_before = {.shape = {param_alloc->total_elems}};
     alloc_register(alloc, &m->mb);
-    alloc_register(alloc, &m->debug_weights_before);
-    alloc_register(alloc, &m->debug_momentum_before);
     long max_M = 0, max_N = 0;
     for (int _i = 0; _i < param_alloc->num_regs; _i++) {
         AllocEntry& e = param_alloc->regs[_i];
@@ -1444,95 +1198,6 @@ void muon_step(Muon* m, Float weights, Prec grads,
         grads.data, m->step_scale, n_grad);
     muon_weight_update<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
         weights.data, grads.data, m->lr, 0.0f, n_grad);
-}
-
-// Conventional globally-clipped Nesterov SGD. This intentionally reuses
-// Muon's momentum storage and clipping kernel so optimizer ablations differ
-// only by the Newton-Schulz orthogonalization and its post-NS rescaling.
-void sgd_step(Muon* m, Float weights, Prec grads,
-        float max_grad_norm, cudaStream_t stream = 0) {
-    int n_grad = (int)numel(grads.shape);
-    int sum_blocks = min((int)grid_size(n_grad), 256);
-    muon_sum_sq_partials<<<sum_blocks, 256, 0, stream>>>(
-        m->norm_partials, grads.data, n_grad);
-    muon_sum_sq_reduce<<<1, 256, 0, stream>>>(
-        m->grad_norm, m->norm_partials, sum_blocks);
-    muon_clip_nesterov<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
-        m->mb.data, grads.data, m->grad_norm,
-        max_grad_norm, 1e-6f, (float)m->momentum, 1, nullptr, n_grad);
-    muon_weight_update<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
-        weights.data, grads.data, m->lr, 0.0f, n_grad);
-}
-
-struct MuonDebugValues {
-    float trust;
-    float step_scale;
-    float step_trust;
-    float policy_overlap;
-    float grad_norm;
-    float lr;
-    float weight_delta;
-    float weight_norm;
-    float momentum_delta;
-    float momentum_norm;
-};
-
-void muon_debug_snapshot(Muon* m, Float weights, cudaStream_t stream) {
-    size_t bytes = numel(weights.shape) * sizeof(float);
-    cudaMemcpyAsync(m->debug_weights_before.data, weights.data, bytes,
-        cudaMemcpyDeviceToDevice, stream);
-    cudaMemcpyAsync(m->debug_momentum_before.data, m->mb.data, bytes,
-        cudaMemcpyDeviceToDevice, stream);
-}
-
-MuonDebugValues muon_debug_measure(
-        Muon* m, Float weights, cudaStream_t stream) {
-    int n = (int)numel(weights.shape);
-    int blocks = min((int)grid_size(n), 256);
-    muon_f32_diff_sum_sq_partials<<<blocks, 256, 0, stream>>>(
-        m->norm_partials, weights.data, m->debug_weights_before.data, n);
-    muon_sum_sq_reduce<<<1, 256, 0, stream>>>(
-        m->debug_weight_delta_sq, m->norm_partials, blocks);
-    muon_f32_sum_sq_partials<<<blocks, 256, 0, stream>>>(
-        m->norm_partials, weights.data, n);
-    muon_sum_sq_reduce<<<1, 256, 0, stream>>>(
-        m->debug_weight_norm_sq, m->norm_partials, blocks);
-    muon_f32_diff_sum_sq_partials<<<blocks, 256, 0, stream>>>(
-        m->norm_partials, m->mb.data, m->debug_momentum_before.data, n);
-    muon_sum_sq_reduce<<<1, 256, 0, stream>>>(
-        m->debug_momentum_delta_sq, m->norm_partials, blocks);
-    muon_f32_sum_sq_partials<<<blocks, 256, 0, stream>>>(
-        m->norm_partials, m->mb.data, n);
-    muon_sum_sq_reduce<<<1, 256, 0, stream>>>(
-        m->debug_momentum_norm_sq, m->norm_partials, blocks);
-
-    MuonDebugValues out = {};
-    cudaMemcpyAsync(&out.trust, m->trust, sizeof(float),
-        cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(&out.step_scale, m->step_scale, sizeof(float),
-        cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(&out.step_trust, m->step_trust, sizeof(float),
-        cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(&out.policy_overlap, m->policy_overlap, sizeof(float),
-        cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(&out.grad_norm, m->grad_norm, sizeof(float),
-        cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(&out.lr, m->lr, sizeof(float),
-        cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(&out.weight_delta, m->debug_weight_delta_sq, sizeof(float),
-        cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(&out.weight_norm, m->debug_weight_norm_sq, sizeof(float),
-        cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(&out.momentum_delta, m->debug_momentum_delta_sq, sizeof(float),
-        cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(&out.momentum_norm, m->debug_momentum_norm_sq, sizeof(float),
-        cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-    out.weight_delta = sqrtf(fmaxf(out.weight_delta, 0.0f));
-    out.weight_norm = sqrtf(fmaxf(out.weight_norm, 0.0f));
-    out.momentum_delta = sqrtf(fmaxf(out.momentum_delta, 0.0f));
-    out.momentum_norm = sqrtf(fmaxf(out.momentum_norm, 0.0f));
-    return out;
 }
 
 // Train data layout is transposed to (B, T) from rollouts layout (T, B)
@@ -1914,7 +1579,6 @@ struct PPOKernelArgs {
     // TODO(offpolicy-cleanup): Remove this ablation field after validation.
     // 0=full PPO ratio, 1=no ratio (IS only in adv), 2=min(ratio,1) one-sided
     bool normalize_advantage;
-    bool clip_auxiliary;
     int pg_ratio_mode;
 };
 
@@ -2034,6 +1698,7 @@ __global__ void ppo_loss_compute(
             policy_adv = (adv - a.adv_mean[0]) / (adv_std + 1e-8f);
         }
         float ent_coef = *a.ent_coef;
+        float d_entropy_term = aux_support * inv_NT * (-ent_coef);
 
         // Value loss + gradient: 0.5 * max((v-r)^2, (v_clip-r)^2).
         // When clipped term wins, v_clip is constant in val_pred → grad 0.
@@ -2097,11 +1762,7 @@ __global__ void ppo_loss_compute(
         float logratio = total_log_prob - old_logp;
         float ratio = __expf(logratio);
         g.out_ratio[nt] = from_float(ratio);
-        float entropy_support = a.clip_auxiliary
-            && (!isfinite(ratio) || fabsf(ratio - 1.0f) > a.clip_coef)
-            ? 0.0f : 1.0f;
-        float d_entropy_term = entropy_support * inv_NT * (-ent_coef);
-        float wa = -policy_support * w * policy_adv;
+        float wa = -policy_support * w * adv;
         float pg_loss;
         float d_new_logp;
         if (a.pg_ratio_mode == 1) {
@@ -2163,11 +1824,11 @@ __global__ void ppo_loss_compute(
         }
 
         float thread_loss = (pg_loss + aux_support * a.vf_coef * v_loss
-            - entropy_support * ent_coef * total_entropy) * inv_NT;
+            - aux_support * ent_coef * total_entropy) * inv_NT;
 
         block_losses[LOSS_PG][tid] = pg_loss * inv_NT;
         block_losses[LOSS_VF][tid] = aux_support * v_loss * inv_NT;
-        block_losses[LOSS_ENT][tid] = entropy_support * total_entropy * inv_NT;
+        block_losses[LOSS_ENT][tid] = aux_support * total_entropy * inv_NT;
         block_losses[LOSS_TOTAL][tid] = thread_loss;
         block_losses[LOSS_OLD_APPROX_KL][tid] = (-logratio) * inv_NT;
         block_losses[LOSS_APPROX_KL][tid] = ((ratio - 1.0f) - logratio) * inv_NT;
@@ -2261,8 +1922,7 @@ void ppo_loss_fwd_bwd(
         TrainGraph& graph,
         int* act_sizes, float* losses_acc,
         float clip_coef, float vf_clip_coef, float vf_coef, const float* ent_coef,
-        PPOBufs& bufs, bool is_continuous, bool normalize_advantage,
-        bool clip_auxiliary, cudaStream_t stream) {
+        PPOBufs& bufs, bool is_continuous, cudaStream_t stream) {
     int N = dec_out.shape[0], T = dec_out.shape[1], fused_cols = dec_out.shape[2];
     int A_total = fused_cols - 1;  // last column is value
     int total = N * T;
@@ -2312,8 +1972,6 @@ void ppo_loss_fwd_bwd(
         .ent_coef = ent_coef,
         .T_seq = T, .A_total = A_total, .N = N,
         .is_continuous = is_continuous,
-        .normalize_advantage = normalize_advantage,
-        .clip_auxiliary = clip_auxiliary,
         .pg_ratio_mode = 0,
     };
     ppo_loss_compute<<<ppo_grid, PPO_THREADS, 0, stream>>>(

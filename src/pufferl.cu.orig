@@ -305,7 +305,6 @@ typedef struct {
     bool anneal_lr;
     float momentum;
     bool muon_grad_scale;
-    bool use_sgd;          // temporary optimizer ablation
     int minibatch_size;
     float replay_ratio;
     long total_timesteps;
@@ -321,7 +320,6 @@ typedef struct {
     float vtrace_rho_clip;
     float vtrace_c_clip;
     bool advantage_is;
-    bool fixed_value_cache; // do not refresh frozen-GAE value targets
     bool clipfrac_trust;  // gate Muon by 1 - standard PPO clipfrac
     bool offpol_debug;     // temporary exact optimizer-delta trace
     bool offpol_mom;       // gate whole Muon step and optimizer-state time
@@ -1724,11 +1722,24 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
             // PPO/V-trace supplies sample-level correction. Fixed
             // behavior/reference overlap measures rollout data trust; absolute
             // reference/current overlap supplies a memoryless hard boundary.
-            if (hypers->offpol_mom) {
+            if (hypers->offpol_mom && hypers->clipfrac_trust) {
                 assert(hypers->offpol_min_overlap >= 0.0f
                     && hypers->offpol_min_overlap < 1.0f);
-                assert(!hypers->clipfrac_trust
-                    && "offpol_mom and clipfrac_trust are mutually exclusive");
+                assert(hypers->offpol_min_trust >= 0.0f
+                    && hypers->offpol_min_trust <= 1.0f);
+                cudaMemsetAsync(muon->trust, 0, sizeof(float), stream);
+                cudaMemsetAsync(muon->policy_overlap, 0, sizeof(float), stream);
+                int nt = (int)numel(graph->mb_ratio.shape);
+                int blocks = min((nt + 255) / 256, 256);
+                mean_unclipped_trust<<<blocks, 256, 0, stream>>>(
+                    muon->trust, graph->mb_ratio.data, hypers->clip_coef, nt);
+                mean_reference_overlap<<<blocks, 256, 0, stream>>>(
+                    muon->policy_overlap, graph->mb_ratio.data,
+                    graph->mb_ref_ratio.data, nt);
+                threshold_clip_overlap_trust<<<1, 1, 0, stream>>>(
+                    muon->trust, muon->step_trust, muon->policy_overlap,
+                    hypers->offpol_min_overlap, hypers->offpol_min_trust);
+            } else if (hypers->offpol_mom) {
                 assert(hypers->offpol_min_overlap >= 0.0f
                     && hypers->offpol_min_overlap < 1.0f);
                 assert(hypers->offpol_min_trust >= 0.0f
@@ -1764,20 +1775,13 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
                     cudaMemcpyHostToDevice, stream);
             }
             int np = (int)numel(primary->master_weights.shape);
-            if (hypers->use_sgd) {
-                assert(!hypers->offpol_mom && !hypers->clipfrac_trust
-                    && "SGD control excludes Muon trust corrections");
-                sgd_step(muon, primary->master_weights, pufferl->grad,
-                    hypers->max_grad_norm, stream);
-            } else {
-                muon_step(muon, primary->master_weights, pufferl->grad,
-                    hypers->max_grad_norm,
-                    (hypers->offpol_mom || hypers->clipfrac_trust)
-                        ? muon->trust : nullptr,
-                    hypers->offpol_mom ? muon->step_trust
-                        : (hypers->clipfrac_trust ? muon->trust : nullptr),
-                    hypers->muon_grad_scale, stream);
-            }
+            muon_step(muon, primary->master_weights, pufferl->grad,
+                hypers->max_grad_norm,
+                (hypers->offpol_mom || hypers->clipfrac_trust)
+                    ? muon->trust : nullptr,
+                hypers->offpol_mom ? muon->step_trust
+                    : (hypers->clipfrac_trust ? muon->trust : nullptr),
+                hypers->muon_grad_scale, stream);
             if (USE_BF16) {
                 cast<<<grid_size(np), BLOCK_SIZE, 0, stream>>>(
                     primary->param.data, primary->master_weights.data, np);
@@ -1808,7 +1812,7 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
                 graph->mb_values, graph->mb_returns,
                 hypers->vf_clip_coef, train_stream);
             fprintf(stderr,
-                "OFFPOL_TRACE epoch=%d mb=%d/%d unclipped=%.9g clipfrac=%.9g "
+                "OFFPOL_TRACE epoch=%d mb=%d/%d trust=%.9g clipfrac=%.9g "
                 "step_scale=%.9g step_trust=%.9g overlap=%.9g "
                 "grad_norm=%.9g lr=%.9g "
                 "weight_delta=%.9g weight_norm=%.9g "
@@ -1816,18 +1820,15 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
                 "ratio_abs=%.9g ratio_min=%.9g ratio_max=%.9g "
                 "behavior_trust=%.9g behavior_abs=%.9g "
                 "behavior_min=%.9g behavior_max=%.9g "
-                "policy_active=%.9g active_outside=%.9g "
-                "vf_trust=%.9g vf_abs=%.9g vf_active=%.9g\n",
-                current_epoch, mb, total_minibatches, r.current_unclipped,
-                1.0f - r.current_unclipped,
+                "policy_active=%.9g active_outside=%.9g\n",
+                current_epoch, mb, total_minibatches, d.trust, 1.0f - d.trust,
                 d.step_scale, d.step_trust, d.policy_overlap, d.grad_norm, d.lr,
                 d.weight_delta, d.weight_norm,
                 d.momentum_delta, d.momentum_norm,
                 r.current_mean_abs, r.current_min, r.current_max,
                 r.behavior_unclipped, r.behavior_mean_abs,
                 r.behavior_min, r.behavior_max,
-                r.policy_active, r.active_outside,
-                v.in_band, v.mean_abs_delta, v.gradient_active);
+                r.policy_active, r.active_outside);
         }
         profile_end(hypers->profile);
 
@@ -1842,7 +1843,7 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
                 BLOCK_SIZE, 0, train_stream>>>(
                 rollouts->ratio.data, pufferl->prio_bufs.idx.data,
                 graph->mb_ratio.data, num_idx, ratio_row);
-            if (!hypers->clipfrac_trust && !hypers->fixed_value_cache) {
+            if (!hypers->clipfrac_trust) {
                 scatter_rows<<<grid_size(num_idx * value_row),
                     BLOCK_SIZE, 0, train_stream>>>(
                     rollouts->values.data, pufferl->prio_bufs.idx.data,
@@ -2016,7 +2017,6 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .momentum = puf_ini_get(ini, "train", "momentum"),
         .muon_grad_scale = puf_ini_get(
             ini, "train", "muon_grad_scale") != 0,
-        .use_sgd = puf_ini_get(ini, "train", "use_sgd") != 0,
         .minibatch_size = puf_ini_get(ini, "train", "minibatch_size"),
         .replay_ratio = puf_ini_get(ini, "train", "replay_ratio"),
         .total_timesteps = puf_ini_get(ini, "train", "total_timesteps"),
@@ -2032,8 +2032,6 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .vtrace_rho_clip = puf_ini_get(ini, "train", "vtrace_rho_clip"),
         .vtrace_c_clip = puf_ini_get(ini, "train", "vtrace_c_clip"),
         .advantage_is = puf_ini_get(ini, "train", "advantage_is") != 0,
-        .fixed_value_cache = puf_ini_get(
-            ini, "train", "fixed_value_cache") != 0,
         .clipfrac_trust = puf_ini_get(
             ini, "train", "clipfrac_trust") != 0,
         .offpol_debug = puf_ini_get(
@@ -3245,14 +3243,6 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     }
 
     PuffeRL* pufferl = create_pufferl(ini, ctx);
-    // TODO(offpolicy-cleanup): Temporary continuation control for optimizer
-    // ablations. Checkpoints contain weights only, so optimizer state is zero.
-    char load_buf[4096];
-    const char* load_path = puf_checkpoint_path_key(
-        ini, "load_model_path", load_buf, sizeof(load_buf));
-    if (load_path) {
-        pufferl_load_policy(pufferl, 0, load_path);
-    }
     Selfplay selfplay = {0};
     if (use_selfplay) {
         char initial_checkpoint[4096];
