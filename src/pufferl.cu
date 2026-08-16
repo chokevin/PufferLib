@@ -3430,18 +3430,28 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     }
 
     PuffeRL* pufferl = create_pufferl(ini, ctx);
+    char load_path_buf[4096];
+    const char* load_path = puf_checkpoint_path_key(
+        ini, "load_model_path", load_path_buf, sizeof(load_path_buf));
+    if (load_path) {
+        pufferl_load_policy(pufferl, 0, load_path);
+    }
+
+    char initial_checkpoint[4096] = {0};
+    if (load_path || use_selfplay) {
+        snprintf(initial_checkpoint, sizeof(initial_checkpoint),
+            "%s/%016ld.bin", checkpoint_dir, pufferl->global_step);
+        if (ctx->artifact_owner) {
+            puf_save_weights(pufferl, initial_checkpoint);
+        }
+    }
+
     Selfplay selfplay = {0};
     if (use_selfplay) {
         const char* fixed_opponent_path =
             puf_ini_get_str(ini, "selfplay", "fixed_opponent_path");
         selfplay.fixed_opponent = fixed_opponent_path[0]
             && strcmp(fixed_opponent_path, "None") != 0;
-        char initial_checkpoint[4096];
-        snprintf(initial_checkpoint, sizeof(initial_checkpoint),
-            "%s/%016ld.bin", checkpoint_dir, pufferl->global_step);
-        if (ctx->artifact_owner) {
-            puf_save_weights(pufferl, initial_checkpoint);
-        }
         selfplay.num_hist = pufferl->num_policies - 1;
         assert(selfplay.num_hist > 0 && selfplay.num_hist <= SELFPLAY_MAX_HIST
             && "selfplay requires num_policies in 2..SELFPLAY_MAX_HIST+1");
