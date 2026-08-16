@@ -1939,10 +1939,15 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     int primary_per_buf = vec->policy_layout[1] - vec->policy_layout[0];
     pufferl->train_agents = primary_per_buf * num_buffers;
     int minibatch_rows = hypers.minibatch_size / hypers.horizon;
+    int total_minibatches = (int)(hypers.replay_ratio
+        * pufferl->train_agents * hypers.horizon / hypers.minibatch_size);
     assert(hypers.minibatch_size <= pufferl->train_agents * hypers.horizon
         && "train.minibatch_size must fit policy-0 rollout rows");
-    assert(pufferl->train_agents % minibatch_rows == 0
-        && "policy-0 agents must be divisible by minibatch rows");
+    assert(minibatch_rows > 0 && total_minibatches > 0
+        && "train minibatch configuration must produce optimizer updates");
+    assert((pufferl->train_agents % minibatch_rows == 0
+            || total_minibatches * minibatch_rows <= pufferl->train_agents)
+        && "non-divisible minibatch rows support only one partial rollout pass");
 
     for (int s = 0; s < 2; s++) {
         for (int i = 0; i < NUM_TE; i++) {
@@ -3776,8 +3781,6 @@ TrainResult launch_train(Ini* ini) {
         && "train.minibatch_size must be divisible by train.horizon");
     assert((long)mb <= (long)horizon * agents
         && "train.minibatch_size must be <= train.horizon * vec.total_agents");
-    assert(agents % (mb / horizon) == 0
-        && "vec.total_agents must be divisible by minibatch rows");
     assert(horizon % ADV_VEC_WIDTH == 0
         && "train.horizon must be a multiple of ADV_VEC_WIDTH (4 float / 8 bf16)");
 
