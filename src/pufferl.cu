@@ -2564,15 +2564,17 @@ void rollouts(PuffeRL* p) {
 }
 
 typedef struct {
+    char key[PUF_DICT_MAX_KEY];
+    double value;
+} EvalMetric;
+
+#define EVAL_RESULT_MAX_ENV_METRICS 128
+typedef struct {
     float score;
     float draw;
-    float terminal_cash;
-    float opponent_cash;
-    float cash_margin;
-    float terminal_cash_50k_rate;
-    float terminal_cash_100k_rate;
-    float terminal_cash_150k_rate;
     int games;
+    int num_env_metrics;
+    EvalMetric env_metrics[EVAL_RESULT_MAX_ENV_METRICS];
 } EvalResult;
 
 #define TRAIN_RESULT_MAX_POINTS 1024
@@ -2592,6 +2594,47 @@ typedef struct {
 
 #define SELFPLAY_MAX_HIST 8
 #define SELFPLAY_PATH_MAX 4096
+
+static bool eval_metric_key_valid(const char* key) {
+    size_t len = strlen(key);
+    if (len <= 4 || len >= PUF_DICT_MAX_KEY || strncmp(key, "env/", 4) != 0) {
+        return false;
+    }
+    for (size_t i = 4; i < len; i++) {
+        char c = key[i];
+        if (!(isalnum((unsigned char)c) || c == '_' || c == '-' || c == '.'
+                || c == '/')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void eval_capture_env_metrics(EvalResult* result, Dict* log) {
+    for (int i = 0; i < log->size; i++) {
+        DictItem* item = &log->items[i];
+        if (!eval_metric_key_valid(item->key) || !isfinite(item->value)) {
+            continue;
+        }
+        if (result->num_env_metrics == EVAL_RESULT_MAX_ENV_METRICS) {
+            fprintf(stderr, "match env metric limit reached; omitting remaining metrics\n");
+            return;
+        }
+        EvalMetric* metric = &result->env_metrics[result->num_env_metrics++];
+        snprintf(metric->key, sizeof(metric->key), "%s", item->key);
+        metric->value = item->value;
+    }
+}
+
+static double eval_env_metric(EvalResult* result, const char* key) {
+    for (int i = 0; i < result->num_env_metrics; i++) {
+        if (strcmp(result->env_metrics[i].key, key) == 0) {
+            return result->env_metrics[i].value;
+        }
+    }
+    fprintf(stderr, "match result missing required metric %s\n", key);
+    exit(1);
+}
 
 // One historical opponent ↔ policies[policy_idx] (env tag == policy_idx).
 typedef struct {
@@ -3178,15 +3221,7 @@ static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
             : dict_get(&el, "env/score");
         if (match) {
             result.draw = dict_get(&el, "env/draw_rate");
-            result.terminal_cash = dict_get(&el, "env/score");
-            result.opponent_cash = dict_get(&el, "env/opponent_cash");
-            result.cash_margin = dict_get(&el, "env/cash_margin");
-            result.terminal_cash_50k_rate =
-                dict_get(&el, "env/terminal_cash_50k_rate");
-            result.terminal_cash_100k_rate =
-                dict_get(&el, "env/terminal_cash_100k_rate");
-            result.terminal_cash_150k_rate =
-                dict_get(&el, "env/terminal_cash_150k_rate");
+            eval_capture_env_metrics(&result, &el);
         }
         result.games = (int)n;
         dict_clear(&el);
@@ -3254,14 +3289,27 @@ EvalResult run_eval(Ini* ini, TrainContext* ctx, int mode, int verbose) {
     PuffeRL* p = eval_make(ini, ctx, mode);
     EvalResult r = eval_loop(ini, p, mode, verbose, n, NULL, 0);
     if (mode == EVAL_MATCH) {
+        double terminal_cash = eval_env_metric(&r, "env/score");
+        double opponent_cash = eval_env_metric(&r, "env/opponent_cash");
+        double cash_margin = eval_env_metric(&r, "env/cash_margin");
+        double terminal_cash_50k_rate =
+            eval_env_metric(&r, "env/terminal_cash_50k_rate");
+        double terminal_cash_100k_rate =
+            eval_env_metric(&r, "env/terminal_cash_100k_rate");
+        double terminal_cash_150k_rate =
+            eval_env_metric(&r, "env/terminal_cash_150k_rate");
         printf(
             "PUFFER_MATCH_RESULT games=%d score=%.9g draw=%.9g "
             "terminal_cash=%.9g opponent_cash=%.9g cash_margin=%.9g "
             "terminal_cash_50k_rate=%.9g terminal_cash_100k_rate=%.9g "
-            "terminal_cash_150k_rate=%.9g\n",
-            r.games, r.score, r.draw, r.terminal_cash, r.opponent_cash,
-            r.cash_margin, r.terminal_cash_50k_rate,
-            r.terminal_cash_100k_rate, r.terminal_cash_150k_rate);
+            "terminal_cash_150k_rate=%.9g",
+            r.games, r.score, r.draw, terminal_cash, opponent_cash,
+            cash_margin, terminal_cash_50k_rate,
+            terminal_cash_100k_rate, terminal_cash_150k_rate);
+        for (int i = 0; i < r.num_env_metrics; i++) {
+            printf(" %s=%.9g", r.env_metrics[i].key, r.env_metrics[i].value);
+        }
+        fputc('\n', stdout);
     }
     close_pufferl(p);
     return r;
