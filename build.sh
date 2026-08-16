@@ -371,6 +371,7 @@ if [ "$MODE" = "native" ]; then
     fi
     echo "Compiling native train/eval binary ($ARCH) -> $TRAIN_BIN..."
     $NVCC $NVCC_OPT -arch=$ARCH -std=c++17 \
+        --fmad=false -Xcompiler=-ffp-contract=off \
         -I. -Isrc -I$SRC_DIR -Ivendor \
         "${INCLUDES[@]}" \
         -I$CUDA_HOME/include -I$CUDA_HOME/include/cccl $NCCL_IFLAG -I$RAYLIB_NAME/include \
@@ -397,6 +398,7 @@ elif [ "$MODE" = "profile" ]; then
     PROFILE_BIN="build/profile_${ENV}"
     echo "Compiling profile binary ($ARCH) -> $PROFILE_BIN..."
     $NVCC $NVCC_OPT -arch=$ARCH -std=c++17 \
+        --fmad=false -Xcompiler=-ffp-contract=off \
         -I. -Isrc -I$SRC_DIR -Ivendor \
         "${INCLUDES[@]}" \
         -I$CUDA_HOME/include -I$CUDA_HOME/include/cccl $NCCL_IFLAG -I$RAYLIB_NAME/include \

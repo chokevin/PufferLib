@@ -1288,7 +1288,7 @@ __global__ void cache_imp_and_v(
             for (int a = 0; a < A; ++a) {
                 logps[at_base + logits_offset + a] = cache[a] - lse;
             }
-#ifdef PUFFER_NETHACK
+#if defined(PUFFER_NETHACK)
             int used = nethack_head_used(verb, h);
             if (used) {
                 int act = (int)actions[idx * NUM_ATNS + h];
@@ -1300,6 +1300,10 @@ __global__ void cache_imp_and_v(
                 } else {
                     new_lp += cache[act] - lse;
                 }
+            }
+#elif defined(KG_HEAD_GATING_SELECTOR_VALUES)
+            if (kg_puffer5_head_used(actions + idx * NUM_ATNS, h)) {
+                new_lp += cache[(int)actions[idx * NUM_ATNS + h]] - lse;
             }
 #else
             new_lp += cache[(int)actions[idx * NUM_ATNS + h]] - lse;
@@ -1406,6 +1410,15 @@ __global__ void ppo_loss_compute(
                 int A = a.act_sizes[h];
 #ifdef PUFFER_NETHACK
                 if (!nethack_head_used(verb, h)) {
+                    for (int j = 0; j < A; ++j) {
+                        a.grad_logits[at_base + logits_offset + j] = 0.0f;
+                    }
+                    logits_offset += A;
+                    continue;
+                }
+#elif defined(KG_HEAD_GATING_SELECTOR_VALUES)
+                if (!kg_puffer5_head_used(
+                        g.actions + nt * a.num_atns, h)) {
                     for (int j = 0; j < A; ++j) {
                         a.grad_logits[at_base + logits_offset + j] = 0.0f;
                     }

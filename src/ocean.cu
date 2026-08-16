@@ -23,9 +23,16 @@ void puf_normal_init(Prec* dst, float std, ulong seed, cudaStream_t stream) {
 #ifdef PUFFER_NETHACK
 #include "../ocean/nethack/nethack.cu"
 #endif
+#ifdef ENV_ENCODER_HEADER
+#include ENV_ENCODER_HEADER
+#endif
 
 // Override encoder vtable for known ocean environments. No-op for unknown envs.
 static void create_custom_encoder(const char* env_name, Encoder* enc) {
+#ifdef ENV_ENCODER_HEADER
+    create_env_encoder(enc);
+    return;
+#endif
 #ifdef PUFFER_NETHACK
     if (strcmp(env_name, "nethack") == 0) {
         create_nethack_encoder(enc);

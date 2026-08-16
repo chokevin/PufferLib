@@ -536,6 +536,7 @@ typedef struct PuffeRL {
     bool is_continuous;  // True if all action dimensions are continuous (size==1)
     RolloutBuf rollouts;
     RolloutBuf train_rollouts;  // Pre-allocated transposed copy for train_impl
+    int train_agents;  // policy 0 agents only; frozen-policy rows never enter PPO
     EnvBuf env;
     TrainGraph train_buf;
     Prec train_state;  // (L, A, H) carry in env order; graph reads with dest_off
@@ -682,7 +683,7 @@ __global__ void sample_logits(
             float action = (float)sampled;
             actions[aidx] = action;
             env_actions[aidx] = action;
-#ifdef PUFFER_NETHACK
+#if defined(PUFFER_NETHACK)
             int verb = (int)actions[idx * num_atns];
             int used = nethack_head_used(verb, h);
             if (used) {
@@ -692,6 +693,10 @@ __global__ void sample_logits(
                 } else {
                     total_log_prob += cache[sampled] - logsumexp;
                 }
+            }
+#elif defined(KG_HEAD_GATING_SELECTOR_VALUES)
+            if (kg_puffer5_head_used(actions + idx * num_atns, h)) {
+                total_log_prob += cache[sampled] - logsumexp;
             }
 #else
             total_log_prob += cache[sampled] - logsumexp;
@@ -704,6 +709,10 @@ __global__ void sample_logits(
     value_out[idx] = logits[logits_base + fused_cols - 1];
     rng_states[idx] = state;
 }
+
+#ifdef ENV_ACTION_KERNEL_HEADER
+#include ENV_ACTION_KERNEL_HEADER
+#endif
 
 // Index into (L, agents, H): element-parallel over L*count*H.
 // state_row is agent index within the state tensor's agent dim.
@@ -854,11 +863,11 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         zero_term_state<<<grid_size(state_n), BLOCK_SIZE, 0, stream>>>(
             *st, env->terminals, 0, sub, n);
 
-        // Carry path: snapshot trainable policy state into per-slot initial_states.
+        // Carry path: compact policy-0 state by buffer for learner-only training.
         if (!pol->frozen && t == 0 && rollouts.initial_states.data != NULL) {
             Prec slot_st = init_slot(rollouts.initial_states, graph_slot);
             snapshot_state<<<grid_size(state_n), BLOCK_SIZE, 0, stream>>>(
-                slot_st, *st, sub, n);
+                slot_st, *st, buf * n, n);
         }
 
         Prec dec = arch_forward(&pol->arch, *w, *acts, obs_b, *st, stream);
@@ -870,7 +879,11 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         }
 
         // Offset RNG by off so policies don't collide on per-buffer rng slots.
+#ifdef ENV_SAMPLE_LOGITS
+        ENV_SAMPLE_LOGITS<<<n, BLOCK_SIZE, 0, stream>>>(
+#else
         sample_logits<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+#endif
             dec, p_logstd, pufferl->act_sizes,
             act_b.data, env->actions.data + (long)sub * act_cols,
             lp_b.data, val_b.data,
@@ -1416,6 +1429,45 @@ __global__ void transpose_102(float* dst, const float* src, int A, int B, int C)
     dst[b * A * C + a * C + c] = src[idx];
 }
 
+// Gather policy-0 rows from each buffer while transposing time-major rollouts.
+__global__ void transpose_primary_102(precision_t* dst, const precision_t* src,
+        int T, int B, int C, int agents_per_buf,
+        int primary_start, int primary_count) {
+    int train_agents = (B / agents_per_buf) * primary_count;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = T * train_agents * C;
+    if (idx >= total) {
+        return;
+    }
+    int t = idx / (train_agents * C);
+    int rem = idx % (train_agents * C);
+    int train_agent = rem / C;
+    int c = rem % C;
+    int buf = train_agent / primary_count;
+    int local = train_agent % primary_count;
+    int src_agent = buf * agents_per_buf + primary_start + local;
+    dst[(train_agent * T + t) * C + c] = src[(t * B + src_agent) * C + c];
+}
+
+__global__ void transpose_primary_102(float* dst, const float* src,
+        int T, int B, int C, int agents_per_buf,
+        int primary_start, int primary_count) {
+    int train_agents = (B / agents_per_buf) * primary_count;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = T * train_agents * C;
+    if (idx >= total) {
+        return;
+    }
+    int t = idx / (train_agents * C);
+    int rem = idx % (train_agents * C);
+    int train_agent = rem / C;
+    int c = rem % C;
+    int buf = train_agent / primary_count;
+    int local = train_agent % primary_count;
+    int src_agent = buf * agents_per_buf + primary_start + local;
+    dst[(train_agent * T + t) * C + c] = src[(t * B + src_agent) * C + c];
+}
+
 // Cosine decay base → min over t in [0, T). Double for t/T (float loses
 // precision past 2^24). Caller passes epoch and total train epochs.
 float cosine_annealing(float base, float min_v, long t, long T) {
@@ -1443,20 +1495,31 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
     int obs_size = (int)src.observations.shape[2];
     int num_atns = (int)src.actions.shape[2];
     int mask_c = src.action_mask.shape[2];
-    transpose_102<<<grid_size(T * B * obs_size), BLOCK_SIZE, 0, stream>>>(
-        rollouts->observations.data, src.observations.data, T, B, obs_size);
-    transpose_102<<<grid_size(T * B * num_atns), BLOCK_SIZE, 0, stream>>>(
-        rollouts->actions.data, src.actions.data, T, B, num_atns);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->logprobs.data, src.logprobs.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->rewards.data, src.rewards.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->terminals.data, src.terminals.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->values.data, src.values.data, T, B, 1);
-    transpose_102<<<grid_size(T * B * mask_c), BLOCK_SIZE, 0, stream>>>(
-        rollouts->action_mask.data, src.action_mask.data, T, B, mask_c);
+    int agents_per_buf = pufferl->vec->agents_per_buf;
+    int primary_start = pufferl->vec->policy_layout[0];
+    int primary_count = pufferl->vec->policy_layout[1] - primary_start;
+    int train_agents = pufferl->train_agents;
+    transpose_primary_102<<<grid_size(T * train_agents * obs_size), BLOCK_SIZE, 0, stream>>>(
+        rollouts->observations.data, src.observations.data, T, B, obs_size,
+        agents_per_buf, primary_start, primary_count);
+    transpose_primary_102<<<grid_size(T * train_agents * num_atns), BLOCK_SIZE, 0, stream>>>(
+        rollouts->actions.data, src.actions.data, T, B, num_atns,
+        agents_per_buf, primary_start, primary_count);
+    transpose_primary_102<<<grid_size(T * train_agents), BLOCK_SIZE, 0, stream>>>(
+        rollouts->logprobs.data, src.logprobs.data, T, B, 1,
+        agents_per_buf, primary_start, primary_count);
+    transpose_primary_102<<<grid_size(T * train_agents), BLOCK_SIZE, 0, stream>>>(
+        rollouts->rewards.data, src.rewards.data, T, B, 1,
+        agents_per_buf, primary_start, primary_count);
+    transpose_primary_102<<<grid_size(T * train_agents), BLOCK_SIZE, 0, stream>>>(
+        rollouts->terminals.data, src.terminals.data, T, B, 1,
+        agents_per_buf, primary_start, primary_count);
+    transpose_primary_102<<<grid_size(T * train_agents), BLOCK_SIZE, 0, stream>>>(
+        rollouts->values.data, src.values.data, T, B, 1,
+        agents_per_buf, primary_start, primary_count);
+    transpose_primary_102<<<grid_size(T * train_agents * mask_c), BLOCK_SIZE, 0, stream>>>(
+        rollouts->action_mask.data, src.action_mask.data, T, B, mask_c,
+        agents_per_buf, primary_start, primary_count);
 
     clamp_precision_kernel<<<grid_size(
         numel(rollouts->rewards.shape)), BLOCK_SIZE, 0, stream>>>(
@@ -1474,7 +1537,7 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
     cudaEventRecord(ev[TE_E], stream);
     cudaEventRecord(ev[TE_MS], stream);
 
-    int batch_size = hypers->total_agents * hypers->horizon;
+    int batch_size = pufferl->train_agents * hypers->horizon;
     int mb_segs = hypers->minibatch_size / hypers->horizon;
     int total_minibatches = hypers->replay_ratio * batch_size / hypers->minibatch_size;
     int n_rows = (int)rollouts->observations.shape[0];
@@ -1871,6 +1934,13 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
 
     env_setup(pufferl, vec, &vec_kwargs, env_kwargs);
     pufferl->vec = vec;
+    int primary_per_buf = vec->policy_layout[1] - vec->policy_layout[0];
+    pufferl->train_agents = primary_per_buf * num_buffers;
+    int minibatch_rows = hypers.minibatch_size / hypers.horizon;
+    assert(hypers.minibatch_size <= pufferl->train_agents * hypers.horizon
+        && "train.minibatch_size must fit policy-0 rollout rows");
+    assert(pufferl->train_agents % minibatch_rows == 0
+        && "policy-0 agents must be divisible by minibatch rows");
 
     for (int s = 0; s < 2; s++) {
         for (int i = 0; i < NUM_TE; i++) {
@@ -1958,15 +2028,16 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     // Carry path: per-slot initial RNN states. reset_every_horizon zeros train_state.
     if (!hypers.reset_every_horizon) {
         pufferl->rollouts.initial_states = {
-            .shape = {async_slots, num_layers, total_agents, hidden_size}};
+            .shape = {async_slots, num_layers, pufferl->train_agents, hidden_size}};
         alloc_register(acts, &pufferl->rollouts.initial_states);
     }
     register_train_buffers(pufferl->train_buf, acts, minibatch_segments, horizon);
     register_rollout_buffers(&pufferl->train_rollouts,
-        acts, total_agents, horizon, input_size, num_action_heads, act_n);
+        acts, pufferl->train_agents, horizon, input_size, num_action_heads, act_n);
     register_ppo_buffers(pufferl->ppo_bufs, acts, minibatch_segments,
         hypers.horizon, decoder_output_size, is_continuous);
-    pufferl->train_state = {.shape = {num_layers, total_agents, hidden_size}};
+    pufferl->train_state = {
+        .shape = {num_layers, pufferl->train_agents, hidden_size}};
     alloc_register(acts, &pufferl->train_state);
 
     cudaMalloc((void**)&pufferl->rng_offset, (num_buffers + 1) * sizeof(long));
@@ -2409,20 +2480,39 @@ static void puf_log_history_add(PufLogHistory* h, Dict* log) {
 static void log_history_bin_mean(PufLogHistory* h, const char* key,
         int points, double* out) {
     assert(h->size > 0 && points >= 1);
+    if (points == h->size) {
+        double fallback = 0;
+        for (int i = 0; i < h->size; i++) {
+            DictItem* item = dict_find(&h->items[i], key);
+            if (item) fallback = item->value;
+            out[i] = fallback;
+        }
+        return;
+    }
     if (points == 1) {
-        out[0] = dict_get(&h->items[h->size - 1], key);
+        out[0] = 0;
+        for (int i = h->size - 1; i >= 0; i--) {
+            DictItem* item = dict_find(&h->items[i], key);
+            if (item) {
+                out[0] = item->value;
+                break;
+            }
+        }
         return;
     }
     double final_steps = dict_get(&h->items[h->size - 1], "agent_steps");
     int out_idx = 0;
     int bin_n = 0;
     double bin_sum = 0;
-    double fallback = dict_get(&h->items[0], key);
+    double fallback = 0;
     double next_bin = final_steps / (points - 1);
     for (int i = 0; i < h->size; i++) {
         Dict* log = &h->items[i];
-        bin_sum += dict_get(log, key);
-        bin_n++;
+        DictItem* item = dict_find(log, key);
+        if (item) {
+            bin_sum += item->value;
+            bin_n++;
+        }
         double steps = dict_get(log, "agent_steps");
         if (steps < next_bin || out_idx >= points - 1) {
             continue;
@@ -2433,7 +2523,8 @@ static void log_history_bin_mean(PufLogHistory* h, const char* key,
         bin_sum = 0;
         next_bin += final_steps / (points - 1);
     }
-    out[points - 1] = dict_get(&h->items[h->size - 1], key);
+    if (bin_n) fallback = bin_sum / bin_n;
+    out[points - 1] = fallback;
     while (out_idx < points - 1) {
         out[out_idx++] = fallback;
     }
@@ -2475,10 +2566,16 @@ void rollouts(PuffeRL* p) {
 typedef struct {
     float score;
     float draw;
+    float terminal_cash;
+    float opponent_cash;
+    float cash_margin;
+    float terminal_cash_50k_rate;
+    float terminal_cash_100k_rate;
+    float terminal_cash_150k_rate;
     int games;
 } EvalResult;
 
-#define TRAIN_RESULT_MAX_POINTS 64
+#define TRAIN_RESULT_MAX_POINTS 1024
 typedef struct {
     float score;
     float cost;
@@ -2505,6 +2602,7 @@ typedef struct {
 typedef struct {
     int num_hist;
     int max_size;
+    bool fixed_opponent;
     long opp_timeout_steps;
     unsigned int rng;
     char (*pool)[SELFPLAY_PATH_MAX];
@@ -2534,6 +2632,39 @@ typedef struct {
     char key[64];
 } SweepParam;
 
+static int sweep_param_allowed(const char* path, const char* kind) {
+    if (strcmp(kind, "ppo") == 0) {
+        return strcmp(path, "train.learning_rate") == 0
+        || strcmp(path, "train.ent_coef") == 0
+        || strcmp(path, "train.replay_ratio") == 0
+        || strcmp(path, "train.clip_coef") == 0
+        || strcmp(path, "train.vf_coef") == 0
+        || strcmp(path, "train.vf_clip_coef") == 0
+        || strcmp(path, "train.max_grad_norm") == 0
+        || strcmp(path, "train.gamma") == 0
+        || strcmp(path, "train.gae_lambda") == 0
+        || strcmp(path, "train.min_ent_coef_ratio") == 0;
+    }
+    if (strcmp(kind, "reward") == 0) {
+        return strcmp(path, "env.reward_scale") == 0
+            || strcmp(path, "env.planting_event_coefficient") == 0
+            || strcmp(path, "env.harvest_event_coefficient") == 0
+            || strcmp(path, "env.sale_event_coefficient") == 0
+            || strcmp(path, "env.pipeline_delta_coefficient") == 0;
+    }
+    if (strcmp(kind, "curriculum") != 0 || strncmp(path, "env.", 4) != 0) {
+        return 0;
+    }
+    return strcmp(path, "env.reward_mode") != 0
+        && strcmp(path, "env.seed") != 0
+        && strcmp(path, "env.domain_randomization") != 0
+        && strcmp(path, "env.domain_stage") != 0
+        && strcmp(path, "env.domain_seed") != 0
+        && strcmp(path, "env.domain_official_ppm") != 0
+        && strcmp(path, "env.paired_seats") != 0
+        && strcmp(path, "env.training_domain_contract") != 0;
+}
+
 extern char** environ;
 
 typedef struct {
@@ -2546,6 +2677,147 @@ typedef struct {
     float* sample;
     TrainResult result;
 } SweepJob;
+
+static void sweep_obs_append(const char* path, SweepParam* params, SweepSpace* space,
+        const float* sample, int run, int point, float score, float cost) {
+    int fresh = access(path, F_OK) != 0;
+    FILE* f = fopen(path, "a");
+    if (!f) {
+        fprintf(stderr, "sweep: cannot append observations to %s: %s\n",
+            path, strerror(errno));
+        exit(1);
+    }
+    if (fresh) {
+        fprintf(f, "run,point,score,cost");
+        for (int i = 0; i < space->num; i++) {
+            fprintf(f, ",%s.%s", params[i].section, params[i].key);
+        }
+        fprintf(f, "\n");
+    }
+    fprintf(f, "%d,%d,%.17g,%.17g", run, point, score, cost);
+    for (int i = 0; i < space->num; i++) {
+        fprintf(f, ",%.17g",
+            space_unnormalize(&space->spaces[i], sample[i]));
+    }
+    fprintf(f, "\n");
+    int persist_error = fflush(f) != 0;
+    persist_error |= fsync(fileno(f)) != 0;
+    persist_error |= fclose(f) != 0;
+    if (persist_error) {
+        fprintf(stderr, "sweep: failed to persist observations to %s: %s\n",
+            path, strerror(errno));
+        exit(1);
+    }
+}
+
+static int sweep_obs_resume(const char* path, ProteinSweep* protein,
+        SweepParam* params, SweepSpace* space) {
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "sweep.resume_from: cannot read %s: %s\n",
+            path, strerror(errno));
+        exit(1);
+    }
+    char line[16384];
+    if (!fgets(line, sizeof(line), f)) {
+        fprintf(stderr, "sweep.resume_from: %s is empty\n", path);
+        exit(1);
+    }
+    int* col_of = (int*)calloc((size_t)space->num, sizeof(int));
+    for (int i = 0; i < space->num; i++) {
+        col_of[i] = -1;
+    }
+    int score_col = -1;
+    int cost_col = -1;
+    int ncols = 0;
+    char* save = NULL;
+    for (char* tok = strtok_r(line, ",\r\n", &save); tok;
+            tok = strtok_r(NULL, ",\r\n", &save)) {
+        if (strcmp(tok, "score") == 0) {
+            score_col = ncols;
+        } else if (strcmp(tok, "cost") == 0) {
+            cost_col = ncols;
+        }
+        for (int i = 0; i < space->num; i++) {
+            char name[160];
+            snprintf(name, sizeof(name), "%s.%s", params[i].section, params[i].key);
+            if (strcmp(tok, name) == 0) {
+                if (col_of[i] >= 0) {
+                    fprintf(stderr,
+                        "sweep.resume_from: %s has duplicate column %s\n",
+                        path, name);
+                    exit(1);
+                }
+                col_of[i] = ncols;
+            }
+        }
+        ncols++;
+    }
+    if (score_col < 0 || cost_col < 0) {
+        fprintf(stderr, "sweep.resume_from: %s has no score/cost columns\n", path);
+        exit(1);
+    }
+    for (int i = 0; i < space->num; i++) {
+        if (col_of[i] < 0) {
+            fprintf(stderr, "sweep.resume_from: %s has no column for [%s] %s\n",
+                path, params[i].section, params[i].key);
+            exit(1);
+        }
+    }
+
+    float* sample = (float*)calloc((size_t)space->num, sizeof(float));
+    float* vals = (float*)calloc((size_t)ncols, sizeof(float));
+    int replayed = 0;
+    int skipped = 0;
+    while (fgets(line, sizeof(line), f)) {
+        int n = 0;
+        int malformed = 0;
+        save = NULL;
+        for (char* tok = strtok_r(line, ",\r\n", &save); tok && n < ncols;
+                tok = strtok_r(NULL, ",\r\n", &save)) {
+            char* end = NULL;
+            errno = 0;
+            vals[n] = strtof(tok, &end);
+            if (errno || end == tok || *end != '\0') {
+                malformed = 1;
+            }
+            n++;
+        }
+        if (malformed || n != ncols) {
+            skipped++;
+            continue;
+        }
+        int in_range = 1;
+        for (int i = 0; i < space->num; i++) {
+            float norm = space_normalize(&space->spaces[i], vals[col_of[i]]);
+            if (!isfinite(norm) || norm < -1.001f || norm > 1.001f) {
+                in_range = 0;
+                break;
+            }
+            sample[i] = fmaxf(-1.0f, fminf(1.0f, norm));
+        }
+        float score = vals[score_col];
+        float cost = vals[cost_col];
+        if (!in_range || !isfinite(score) || !isfinite(cost)) {
+            skipped++;
+            continue;
+        }
+        protein_sweep_observe(protein, sample, score, cost, 0);
+        replayed++;
+    }
+    free(vals);
+    free(sample);
+    free(col_of);
+    fclose(f);
+    if (replayed > 0 && protein->suggestion_idx < protein->num_random_samples) {
+        protein->suggestion_idx = protein->num_random_samples;
+    }
+    printf("sweep resume: replayed %d observations from %s "
+        "(%d rejected as out of range or malformed)\n",
+        replayed, path, skipped);
+    fflush(stdout);
+    return replayed;
+}
 
 void run_sweep(Ini* ini, const char* exe_path) {
     // Build SweepSpace + param map from [sweep.<section>.<key>] sections.
@@ -2565,7 +2837,16 @@ void run_sweep(Ini* ini, const char* exe_path) {
         if (strncmp(dict->name, "sweep.", 6) != 0) {
             continue;
         }
+        if (!dict_get(dict, "enabled")) {
+            continue;
+        }
         const char* path = dict->name + 6;
+        const char* kind = dict_get_str(dict, "kind");
+        if (!sweep_param_allowed(path, kind)) {
+            fprintf(stderr, "unsafe or unsupported sweep field kind=%s target=%s\n",
+                kind, path);
+            abort();
+        }
         const char* dot = strrchr(path, '.');
         assert(dot && dot != path && dot[1]
             && "expected section [sweep.<section>.<key>]");
@@ -2615,6 +2896,8 @@ void run_sweep(Ini* ini, const char* exe_path) {
         n_params++;
     }
     space->num = n_params;
+    assert(n_params >= 1 && n_params <= 32
+        && "fixed-profit sweep requires 1-32 validated experiment fields");
 
     int max_runs = puf_ini_get(ini, "sweep", "max_runs");
     int downsample = puf_ini_get(ini, "sweep", "downsample");
@@ -2663,12 +2946,29 @@ void run_sweep(Ini* ini, const char* exe_path) {
         .success_cap = success_cap,
         .failure_cap = 1024,
         .top_k = 5,
-        .rng_seed = 73ULL,
+        .rng_seed = (uint64_t)puf_ini_get(ini, "sweep", "seed"),
     });
+
+    char obs_path[2048];
+    {
+        char dir[1024];
+        snprintf(dir, sizeof(dir), "%s/%s",
+            puf_ini_get_str(ini, "base", "log_dir"),
+            puf_ini_get_str(ini, "base", "env_name"));
+        mkdir_p(dir);
+        snprintf(obs_path, sizeof(obs_path), "%s/sweep_observations.csv", dir);
+    }
+    const char* resume_from = puf_ini_get_str(ini, "sweep", "resume_from");
+    if (resume_from && resume_from[0]) {
+        sweep_obs_resume(resume_from, protein, params, space);
+    }
 
     int parallel = sweep_gpus / train_gpus;
     // Row 0 = staging for suggest; rows 1..parallel = per-slot copies for observe.
-    float* samples = (float*)calloc((parallel + 1) * space->num, sizeof(float));
+    float* samples = NULL;
+    size_t samples_bytes = (size_t)(parallel + 1) * space->num * sizeof(float);
+    assert(cudaMallocManaged(&samples, samples_bytes) == cudaSuccess);
+    memset(samples, 0, samples_bytes);
     SweepJob* jobs = (SweepJob*)calloc(parallel, sizeof(SweepJob));
     int failed_workers = 0;
     int next_run_id = 0;
@@ -2688,13 +2988,22 @@ void run_sweep(Ini* ini, const char* exe_path) {
                 for (int j = 0; j < space->num; j++) {
                     float val = puf_ini_get(ini, params[j].section, params[j].key);
                     float norm = space_normalize(&space->spaces[j], val);
-                    assert(isfinite(norm) && norm >= -1.0f && norm <= 1.0f
-                        && "default sweep value outside its sweep range");
+                    if (!isfinite(norm) || norm < -1.0f || norm > 1.0f) {
+                        Space* s = &space->spaces[j];
+                        fprintf(stderr,
+                            "invalid sweep default [%s] %s=%.17g "
+                            "normalized=%.9g range=[%.9g,%.9g] type=%d\n",
+                            params[j].section, params[j].key, val, norm,
+                            s->min, s->max, (int)s->type);
+                        abort();
+                    }
                     samples[j] = norm;
                 }
             } else {
                 // Invalid jobs die and produce "fail" obs
                 info = protein_sweep_suggest(protein, samples, NAN);
+                assert(cudaDeviceSynchronize() == cudaSuccess
+                    && "Protein suggestion generation failed");
             }
 
             SweepJob job = {
@@ -2809,6 +3118,8 @@ void run_sweep(Ini* ini, const char* exe_path) {
         for (int pi = 0; pi < job->result.points; pi++) {
             protein_sweep_observe(protein, job->sample,
                 job->result.scores[pi], job->result.costs[pi], 0);
+            sweep_obs_append(obs_path, params, space, job->sample, job->run, pi,
+                job->result.scores[pi], job->result.costs[pi]);
         }
         printf("sweep run=%d score=%.4f cost=%.2f steps=%.0f random=%d gp_obs=%d pareto=%d\n",
             job->run, job->result.score, job->result.cost, job->result.steps,
@@ -2867,6 +3178,15 @@ static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
             : dict_get(&el, "env/score");
         if (match) {
             result.draw = dict_get(&el, "env/draw_rate");
+            result.terminal_cash = dict_get(&el, "env/score");
+            result.opponent_cash = dict_get(&el, "env/opponent_cash");
+            result.cash_margin = dict_get(&el, "env/cash_margin");
+            result.terminal_cash_50k_rate =
+                dict_get(&el, "env/terminal_cash_50k_rate");
+            result.terminal_cash_100k_rate =
+                dict_get(&el, "env/terminal_cash_100k_rate");
+            result.terminal_cash_150k_rate =
+                dict_get(&el, "env/terminal_cash_150k_rate");
         }
         result.games = (int)n;
         dict_clear(&el);
@@ -2900,6 +3220,15 @@ static PuffeRL* eval_make(Ini* ini, TrainContext* ctx, int mode) {
     if (render) {
         puf_ini_put(ini, "train.horizon", "1");
     }
+    long active_agents = puf_ini_get(ini, "vec", "total_agents");
+    long train_agents = match ? active_agents / 2 : active_agents;
+    long horizon = puf_ini_get(ini, "train", "horizon");
+    long max_minibatch = train_agents * horizon;
+    if (puf_ini_get(ini, "train", "minibatch_size") > max_minibatch) {
+        char mb_buf[64];
+        snprintf(mb_buf, sizeof(mb_buf), "%ld", max_minibatch);
+        puf_ini_put(ini, "train.minibatch_size", mb_buf);
+    }
     PuffeRL* p = create_pufferl(ini, ctx);
     if (match) {
         char a_buf[4096], b_buf[4096];
@@ -2924,6 +3253,16 @@ EvalResult run_eval(Ini* ini, TrainContext* ctx, int mode, int verbose) {
     assert((mode == EVAL_RENDER || n > 0) && "eval requires positive base.eval_episodes");
     PuffeRL* p = eval_make(ini, ctx, mode);
     EvalResult r = eval_loop(ini, p, mode, verbose, n, NULL, 0);
+    if (mode == EVAL_MATCH) {
+        printf(
+            "PUFFER_MATCH_RESULT games=%d score=%.9g draw=%.9g "
+            "terminal_cash=%.9g opponent_cash=%.9g cash_margin=%.9g "
+            "terminal_cash_50k_rate=%.9g terminal_cash_100k_rate=%.9g "
+            "terminal_cash_150k_rate=%.9g\n",
+            r.games, r.score, r.draw, r.terminal_cash, r.opponent_cash,
+            r.cash_margin, r.terminal_cash_50k_rate,
+            r.terminal_cash_100k_rate, r.terminal_cash_150k_rate);
+    }
     close_pufferl(p);
     return r;
 }
@@ -2960,6 +3299,10 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     PuffeRL* pufferl = create_pufferl(ini, ctx);
     Selfplay selfplay = {0};
     if (use_selfplay) {
+        const char* fixed_opponent_path =
+            puf_ini_get_str(ini, "selfplay", "fixed_opponent_path");
+        selfplay.fixed_opponent = fixed_opponent_path[0]
+            && strcmp(fixed_opponent_path, "None") != 0;
         char initial_checkpoint[4096];
         snprintf(initial_checkpoint, sizeof(initial_checkpoint),
             "%s/%016ld.bin", checkpoint_dir, pufferl->global_step);
@@ -2974,10 +3317,13 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         selfplay.pool = (char (*)[SELFPLAY_PATH_MAX])calloc(
             selfplay.max_size, sizeof(*selfplay.pool));
         selfplay.opp_timeout_steps = puf_ini_get(ini, "selfplay", "opp_timeout_steps");
+        assert((!selfplay.fixed_opponent || selfplay.opp_timeout_steps == 0)
+            && "fixed opponent requires selfplay.opp_timeout_steps=0");
         selfplay.rng = puf_ini_get(ini, "selfplay", "seed") + pufferl->hypers.rank;
         long current_step = pufferl->global_step * pufferl->hypers.world_size;
 
-        selfplay_add_checkpoint(&selfplay, initial_checkpoint);
+        selfplay_add_checkpoint(&selfplay,
+            selfplay.fixed_opponent ? fixed_opponent_path : initial_checkpoint);
         for (int s = 0; s < selfplay.num_hist; s++) {
             SelfplayHist* hist = &selfplay.hist[s];
             hist->policy_idx = s + 1;
@@ -3051,7 +3397,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
                     "%s", saved_checkpoint);
             }
         }
-        if (use_selfplay && saved_checkpoint[0]) {
+        if (use_selfplay && !selfplay.fixed_opponent && saved_checkpoint[0]) {
             selfplay_add_checkpoint(&selfplay, saved_checkpoint);
         }
 
@@ -3068,8 +3414,11 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             }
         }
 
-        if (last_log.size && wall_clock()
-                < pufferl->last_log_time + 0.6 && epoch < train_epochs - 1) {
+        int final_epoch = epoch == train_epochs - 1;
+        int fixed_opponent = use_selfplay && selfplay.fixed_opponent;
+        int log_due = !last_log.size || wall_clock()
+            >= pufferl->last_log_time + 0.6 || final_epoch;
+        if (!log_due && !fixed_opponent) {
             continue;
         }
 
@@ -3117,18 +3466,22 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             dict_set(&new_log, "pool/size", selfplay.pool_size);
             dict_set(&new_log, "pool/num_hist", selfplay.num_hist);
             dict_set(&new_log, "pool/num_policies", pufferl->num_policies);
+            dict_set(&new_log, "pool/fixed_opponent",
+                selfplay.fixed_opponent ? 1.0 : 0.0);
         }
         // Dense keys: replace last_log wholesale.
         dict_clear(&last_log);
         dict_copy(&last_log, &new_log);
         dict_clear(&new_log);
 
-        if (ctx->artifact_owner) {
+        if (ctx->artifact_owner && log_due) {
             puf_dashboard_print(ini, pufferl, &last_log, (int)pufferl->epoch);
         }
 
-        // Wait until the objective appears; do not treat negative values as missing.
-        if (!dict_find(&last_log, target_key)) {
+        // Fixed-opponent qualification requires one immutable metric row per
+        // optimizer epoch even when no episode ended during that rollout.
+        if (!dict_find(&last_log, target_key)
+                && !fixed_opponent) {
             continue;
         }
         puf_log_history_add(&log_history, &last_log);
@@ -3138,9 +3491,14 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     result.cost = dict_get(&last_log, "uptime");
     result.steps = dict_get(&last_log, "agent_steps");
     DictItem* target = dict_find(&last_log, target_key);
+    for (int i = log_history.size - 1; !target && i >= 0; i--) {
+        target = dict_find(&log_history.items[i], target_key);
+    }
     result.score = target ? (float)target->value : 0;
 
-    int points = use_selfplay ? 1 : puf_ini_get(ini, "sweep", "downsample");
+    int points = use_selfplay && !selfplay.fixed_opponent
+        ? 1
+        : puf_ini_get(ini, "sweep", "downsample");
     assert(points >= 1 && points <= TRAIN_RESULT_MAX_POINTS
         && "sweep.downsample must be in [1, TRAIN_RESULT_MAX_POINTS]");
     result.points = points;
@@ -3207,7 +3565,15 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     }
 
     if (ctx->artifact_owner) {
-        puf_log_history_add(&log_history, &last_log);
+        if (use_selfplay && selfplay.fixed_opponent && log_history.size > 0) {
+            Dict* final_log = &log_history.items[log_history.size - 1];
+            DictItem* pool_score = dict_find(&last_log, "selfplay/pool_score");
+            if (pool_score) {
+                dict_set(final_log, "selfplay/pool_score", pool_score->value);
+            }
+        } else {
+            puf_log_history_add(&log_history, &last_log);
+        }
         char log_path[4096];
         snprintf(log_path, sizeof(log_path), "%s/%s.ini", log_dir, run_id);
 
@@ -3218,16 +3584,21 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         puf_ini_write(fp, ini);
         fprintf(fp, "\n[metrics]\n");
 
-        // Dense keys from first history row; bin-mean same as TrainResult curve.
+        // Episodic env metrics are sparse, so serialize the union and carry the
+        // most recent observed value across bins without inventing episodes.
         if (log_history.size > 0) {
             int metric_points = points;
             double* out = (double*)calloc(metric_points, sizeof(double));
-            Dict* key_src = &log_history.items[0];
-            for (int k = 0; k < key_src->size; k++) {
-                const char* key = key_src->items[k].key;
-                if (strncmp(key, "loss/", 5) == 0) {
-                    continue;
+            Dict keys = {0};
+            for (int i = 0; i < log_history.size; i++) {
+                Dict* log = &log_history.items[i];
+                for (int k = 0; k < log->size; k++) {
+                    const char* key = log->items[k].key;
+                    if (!dict_find(&keys, key)) dict_set(&keys, key, 0);
                 }
+            }
+            for (int k = 0; k < keys.size; k++) {
+                const char* key = keys.items[k].key;
                 log_history_bin_mean(&log_history, key, metric_points, out);
                 fprintf(fp, "%s = ", key);
                 for (int i = 0; i < metric_points; i++) {
@@ -3235,6 +3606,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
                 }
                 fputc('\n', fp);
             }
+            dict_clear(&keys);
             free(out);
         }
         fclose(fp);
