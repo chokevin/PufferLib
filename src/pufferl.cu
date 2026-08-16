@@ -1356,7 +1356,7 @@ static void env_close(VecEnv* vec) {
 #endif
 }
 
-void vec_log(VecEnv* vec, Dict* out, int clear) {
+void vec_log(VecEnv* vec, Dict* out, int clear, int empty_schema) {
     Log aggregate = {0};
     float* acc = (float*)&aggregate;
     env_log_sum(vec, &aggregate, clear);
@@ -1367,6 +1367,8 @@ void vec_log(VecEnv* vec, Dict* out, int clear) {
         for (int j = 0; j < LOG_NF; j++) {
             acc[j] /= n;
         }
+    }
+    if (n > 0.0f || empty_schema) {
         puf_log(&aggregate, &env_out);
     }
     dict_set(&env_out, "n", n);
@@ -2452,7 +2454,7 @@ void trainer_eval_log(PuffeRL* p, Dict* out) {
     p->last_log_time = wall_clock();
     p->last_log_step = p->global_step;
     log_util(p, out);
-    vec_log(p->vec, out, 0);
+    vec_log(p->vec, out, 0, 0);
 }
 
 // One dict copy per train log (+ optional final snapshot). Capacity fixed at
@@ -3253,7 +3255,7 @@ static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
     EvalResult result = {0};
     if (!render) {
         Dict wipe = {0};
-        vec_log(p->vec, &wipe, 1);
+        vec_log(p->vec, &wipe, 1, 0);
         dict_clear(&wipe);
     }
     double last_dash = 0;
@@ -3562,7 +3564,20 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         dict_set(&new_log, "uptime", now - pufferl->start_time);
         dict_set(&new_log, "epoch", (double)pufferl->epoch);
 
-        vec_log(pufferl->vec, &new_log, 1);
+        vec_log(pufferl->vec, &new_log, 1, fixed_opponent);
+        DictItem* completed_episodes = dict_find(&new_log, "env/n");
+        if (fixed_opponent && completed_episodes
+                && completed_episodes->value == 0 && last_log.size) {
+            for (int i = 0; i < last_log.size; i++) {
+                DictItem* item = &last_log.items[i];
+                if (strncmp(item->key, "env/", 4) != 0
+                        || strcmp(item->key, "env/n") == 0
+                        || item->str || item->values) {
+                    continue;
+                }
+                dict_set(&new_log, item->key, item->value);
+            }
+        }
 
         float losses_host[NUM_LOSSES];
         cudaMemcpy(losses_host, pufferl->losses, sizeof(losses_host),
