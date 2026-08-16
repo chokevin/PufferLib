@@ -3430,6 +3430,12 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     }
 
     PuffeRL* pufferl = create_pufferl(ini, ctx);
+    char initial_model_buf[4096];
+    const char* initial_model = puf_checkpoint_path_key(
+        ini, "load_model_path", initial_model_buf, sizeof(initial_model_buf));
+    if (initial_model) {
+        pufferl_load_policy(pufferl, 0, initial_model);
+    }
     Selfplay selfplay = {0};
     if (use_selfplay) {
         const char* fixed_opponent_path =
