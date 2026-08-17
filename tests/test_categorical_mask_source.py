@@ -161,7 +161,7 @@ def test_rollout_status_checked_before_gpu_env_step():
     start = body(PUFFERL, "static void rollout_start(PuffeRL* p)")
     discrete = start[:start.index("bool first = p->hypers.cudagraphs")]
     assert order(discrete,
-                 "if (!p->is_continuous)",
+                 "if (!p->is_continuous || PUF_CUSTOM_SAMPLE_LOGITS)",
                  "pufferl_forward(p, 0, t, stream)",
                  "cudaStreamSynchronize(stream)",
                  "pufferl_rollout_status_check(p, 0)",
@@ -199,7 +199,9 @@ def test_status_reset_before_each_launch():
 
 def test_train_graphs_disabled_for_discrete_actions():
     impl = body(PUFFERL, "void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg)")
-    assert "bool train_graphs = hypers->cudagraphs && pufferl->is_continuous;" in impl
+    normalized = re.sub(r"\s+", " ", impl)
+    assert ("bool train_graphs = hypers->cudagraphs && pufferl->is_continuous "
+            "&& !PUF_CUSTOM_SAMPLE_LOGITS;") in normalized
     assert "bool first = train_graphs && pufferl->train_cudagraph[slot] == NULL;" in impl
     assert "if (train_graphs && !first)" in impl
 
@@ -290,24 +292,66 @@ def test_mask_semantics_stay_zero_illegal_nonzero_legal():
 
 
 def test_environment_specific_gating_stays_caller_side():
-    for hook in ("nethack_head_used", "nethack_verb_eps_load",
-                 "nethack_verb_train_logp", "kg_puffer5_head_used"):
+    for hook in ("nethack_head_used", "nethack_verb_eps_for_mask",
+                 "kg_puffer5_head_used"):
         assert hook in PUFFERL_CODE or hook in ALGO_CODE
         assert hook not in CATEGORICAL_CODE
     # Nethack epsilon mixing still reaches the sampler as a generic parameter.
     sampler = body(PUFFERL, "__global__ void sample_logits(")
-    assert "eps = nethack_verb_eps_load(head_mask, A, &inv_K);" in sampler
     assert order(sampler,
-                 "eps = nethack_verb_eps_load(head_mask, A, &inv_K);",
+                 "eps = nethack_verb_eps_for_mask(",
                  "PufCatNorm norm = puf_cat_head_norm(",
                  "head_logits, head_mask, A, eps > 0.0f);")
     assert "puf_cat_sample(\n            head_logits, head_mask, A, norm, rand_val, eps, inv_K)" in sampler
     learner = body(ALGO, "__global__ void cache_imp_and_v(")
     assert order(learner,
-                 "nethack_verb_eps_load(head_mask, A, &inv_K)",
+                 "nethack_verb_eps_for_mask(head_mask, A, eps, &inv_K)",
                  "PufCatNorm norm = puf_cat_head_norm(",
                  "head_logits, head_mask, A, eps > 0.0f);")
     assert "KG_HEAD_GATING_SELECTOR_VALUES" in sampler
+
+
+def test_nethack_mixture_math_and_epsilon_are_shared_with_rollout_slot():
+    assert "PufCatUniformMix puf_cat_uniform_mix(" in CATEGORICAL
+    assert "Float policy_eps;" in PUFFERL
+    assert re.search(
+        r"view\.policy_eps\s*=\s*puf_time_view\(base->policy_eps", PUFFERL)
+    assert "rollouts->policy_eps.data, src.policy_eps.data" in PUFFERL
+    assert "Float mb_policy_eps;" in ALGO
+    assert "graph.mb_policy_eps = slice_rows(rollouts->policy_eps" in PUFFERL
+
+    sampler = body(PUFFERL, "__global__ void sample_logits(")
+    learner = body(ALGO, "__global__ void cache_imp_and_v(")
+    gradient = body(ALGO, "__global__ void ppo_categorical_grad(")
+    for text in (sampler, learner, gradient):
+        assert "puf_cat_uniform_mix(" in text
+    assert "nethack_verb_train_logp" not in ALGO_CODE
+    assert "nethack_verb_train_logp" not in PUFFERL_CODE
+    assert "policy_eps[idx]" in sampler
+    assert "rollout_eps[idx]" in learner
+    assert "rollout_eps[idx]" in gradient
+
+
+def test_custom_sampler_status_checks_cover_continuous_graph_paths():
+    assert "PUF_CUSTOM_SAMPLE_LOGITS" in PUFFERL_CODE
+    rollout = body(PUFFERL, "static void rollout_start(PuffeRL* p)")
+    assert "if (!p->is_continuous || PUF_CUSTOM_SAMPLE_LOGITS)" in rollout
+    epoch = body(PUFFERL, "static void train_epoch_gpu(PuffeRL* pufferl")
+    assert "if (!pufferl->is_continuous || PUF_CUSTOM_SAMPLE_LOGITS)" in epoch
+    impl = body(PUFFERL, "void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg)")
+    normalized = re.sub(r"\s+", " ", impl)
+    assert ("bool train_graphs = hypers->cudagraphs && pufferl->is_continuous "
+            "&& !PUF_CUSTOM_SAMPLE_LOGITS;") in normalized
+    create = body(PUFFERL, "PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx)")
+    create_normalized = re.sub(r"\s+", " ", create)
+    assert ("if (hypers.cudagraphs && (PUF_BACKEND != PUF_GPU "
+            "|| !is_continuous || PUF_CUSTOM_SAMPLE_LOGITS))") in create_normalized
+
+    hook_path = os.path.join(HERE, "nonfinite_sample_hook.cuh")
+    assert os.path.exists(hook_path)
+    with open(hook_path, "r") as handle:
+        hook = handle.read()
+    assert "logprobs[idx] = from_float(NAN);" in hook
 
 
 def test_continuous_path_preserved():

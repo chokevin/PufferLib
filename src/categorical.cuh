@@ -256,6 +256,25 @@ __device__ __forceinline__ float puf_cat_logp_at(
     return puf_cat_logp(to_float(logits[a]), n);
 }
 
+// Exact operation order for an epsilon mixture with uniform-over-legal mass.
+// Rollout old logprob, learner recomputation and policy-gradient scaling all
+// call this helper so an unchanged mixed policy produces an exact ratio of one.
+struct PufCatUniformMix {
+    float logp;
+    float base_scale;
+};
+
+__device__ __forceinline__ PufCatUniformMix puf_cat_uniform_mix(
+        float base_logp, float eps, float inv_legal) {
+    if (eps <= 0.0f) {
+        return {base_logp, 1.0f};
+    }
+    float base_prob = expf(base_logp);
+    float weighted_base = (1.0f - eps) * base_prob;
+    float mixed_prob = weighted_base + eps * inv_legal;
+    return {logf(mixed_prob), weighted_base / mixed_prob};
+}
+
 // Per-category log probabilities: legal exact, masked literal +0.0f.
 __device__ void puf_cat_write_logps(
         const precision_t* __restrict__ logits,

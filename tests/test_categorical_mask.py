@@ -625,7 +625,7 @@ def _nvcc_tu_flags():
     return flags
 
 
-def _compile_pufferl(tmp_path, extra_defines, tag):
+def _compile_pufferl(tmp_path, extra_defines, tag, env="breakout"):
     obj = os.path.join(str(tmp_path), f"pufferl_{tag}.o")
     cmd = [
         NVCC, "-c", "-o", obj, os.path.join(ROOT, "src", "pufferl.cu"),
@@ -633,8 +633,8 @@ def _compile_pufferl(tmp_path, extra_defines, tag):
         "--fmad=false", "-Xcompiler=-ffp-contract=off",
         "-Xcompiler=-Wno-narrowing", "--diag-suppress=2361",
         "-Xcompiler=-DPLATFORM_DESKTOP", "-Xcompiler=-fopenmp",
-        '-DENV_HEADER="ocean/breakout/breakout.h"',
-        "-DENV_NAME=breakout", '-DPUFFER_ENV_NAME="breakout"',
+        f'-DENV_HEADER="ocean/{env}/{env}.h"',
+        f"-DENV_NAME={env}", f'-DPUFFER_ENV_NAME="{env}"',
     ] + extra_defines + _nvcc_tu_flags()
     proc = subprocess.run(cmd, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr[-8000:]
@@ -653,3 +653,13 @@ def test_legacy_custom_sampler_hook_still_compiles(tmp_path):
         "-DENV_SAMPLE_LOGITS=legacy_sample_logits",
     ]
     _compile_pufferl(tmp_path, defines, "legacy_hook")
+
+
+def test_nonfinite_continuous_custom_sampler_hook_still_compiles(tmp_path):
+    defines = [
+        '-DENV_ACTION_KERNEL_HEADER="../tests/nonfinite_sample_hook.cuh"',
+        "-DENV_SAMPLE_LOGITS=nonfinite_sample_logits",
+    ]
+    _compile_pufferl(
+        tmp_path, defines, "nonfinite_continuous_hook",
+        env="squared_continuous")

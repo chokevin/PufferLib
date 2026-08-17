@@ -142,7 +142,7 @@ static __global__ void shim_sample_kernel(
             eps, inv_legal);
         float logp = puf_cat_logp_at(head_logits, sampled, norm);
         if (eps > 0.0f) {
-            logp = logf((1.0f - eps) * expf(logp) + eps * inv_legal);
+            logp = puf_cat_uniform_mix(logp, eps, inv_legal).logp;
         }
         if (lane == 0) {
             actions_out[row * num_heads + h] = (float)sampled;

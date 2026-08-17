@@ -509,6 +509,41 @@ static void case_ratio_one() {
         check(std::exp(new_lp - old_lp) == 1.0f, "ratio exactly 1",
             std::exp(new_lp - old_lp), 1.0);
     }
+
+    begin_case("mixed rollout and learner ratio is exactly 1");
+    const float eps = 0.35f;
+    const float inv_legal = 0.2f;
+    const float base_logps[] = {-INFINITY, -7.0f, -1.25f, 0.0f};
+    for (float base_logp : base_logps) {
+        PufCatUniformMix rollout = puf_cat_uniform_mix(
+            base_logp, eps, inv_legal);
+        PufCatUniformMix learner = puf_cat_uniform_mix(
+            base_logp, eps, inv_legal);
+        check(rollout.logp == learner.logp, "mixed logprob bit identical",
+            rollout.logp, learner.logp);
+        check(std::exp(learner.logp - rollout.logp) == 1.0f,
+            "mixed ratio exactly 1",
+            std::exp(learner.logp - rollout.logp), 1.0);
+        check(rollout.base_scale == learner.base_scale,
+            "mixed gradient scale bit identical",
+            rollout.base_scale, learner.base_scale);
+    }
+
+    begin_case("async slot keeps rollout epsilon");
+    float stored_slot_eps = 0.35f;
+    float current_global_eps = 0.05f;
+    PufCatUniformMix rollout = puf_cat_uniform_mix(
+        -1.25f, stored_slot_eps, inv_legal);
+    PufCatUniformMix stored_learner = puf_cat_uniform_mix(
+        -1.25f, stored_slot_eps, inv_legal);
+    PufCatUniformMix stale_global_learner = puf_cat_uniform_mix(
+        -1.25f, current_global_eps, inv_legal);
+    check(stored_learner.logp == rollout.logp,
+        "slot epsilon reproduces rollout logp",
+        stored_learner.logp, rollout.logp);
+    check(stale_global_learner.logp != rollout.logp,
+        "changed global epsilon would mismatch",
+        stale_global_learner.logp, rollout.logp);
 }
 
 static void case_gradients() {

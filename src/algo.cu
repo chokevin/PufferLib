@@ -1068,6 +1068,7 @@ struct TrainGraph {
     Float mb_actions;    // view (B, T, num_atns)
     Prec mb_logprobs;    // view (B, T) legacy precision store
     Float mb_logprobs_f32; // view (B, T) exact float32 PPO old logprob
+    Float mb_policy_eps;  // view (B, T) rollout-time categorical mixture epsilon
     Prec mb_terminals;   // view (B, T)
     Prec mb_rewards;     // view (B, T)
     Prec mb_advantages;  // scratch
@@ -1215,6 +1216,7 @@ __global__ void cache_imp_and_v(
         Prec dec_out,
         const float* __restrict__ actions,
         const float* __restrict__ old_logprobs,   // float32 PPO shadow
+        const float* __restrict__ rollout_eps,
         const precision_t* __restrict__ action_mask,
         Prec logstd,
         const int* __restrict__ act_sizes,
@@ -1282,8 +1284,8 @@ __global__ void cache_imp_and_v(
         float* head_logps = logps + at_base + logits_offset;
 #ifdef PUFFER_NETHACK
         float inv_K = 0.0f;
-        float eps = h == 0
-            ? nethack_verb_eps_load(head_mask, A, &inv_K) : 0.0f;
+        float eps = h == 0 ? rollout_eps[idx] : 0.0f;
+        eps = nethack_verb_eps_for_mask(head_mask, A, eps, &inv_K);
 #else
         float eps = 0.0f;
 #endif
@@ -1322,8 +1324,7 @@ __global__ void cache_imp_and_v(
         if (nethack_head_used(verb, h)) {
             total_entropy += puf_cat_entropy_from_logps(head_logps, head_mask, A);
             if (h == 0) {
-                float mix = 1.0f;
-                new_lp += nethack_verb_train_logp(head_mask, A, act_logp, &mix);
+                new_lp += puf_cat_uniform_mix(act_logp, eps, inv_K).logp;
             } else {
                 new_lp += act_logp;
             }
@@ -1380,7 +1381,8 @@ Prec arch_forward_train(Arch* p, Weights& w,
         w.decoder, activations.decoder, *puf_squeeze(&h, 0), stream);
     Prec dec = *puf_unsqueeze(&dec_out, 0, B, TT);
     cache_imp_and_v<<<grid_size(B * TT * PUF_CAT_WARP), BLOCK_SIZE, 0, stream>>>(
-        dec, g.mb_actions.data, g.mb_logprobs_f32.data, g.mb_action_mask.data,
+        dec, g.mb_actions.data, g.mb_logprobs_f32.data, g.mb_policy_eps.data,
+        g.mb_action_mask.data,
         logstd, act_sizes, g.mb_imp.data, g.mb_gae_v.data, logps, new_lp,
         g.mb_entropy.data, status);
     return dec;
@@ -1490,6 +1492,7 @@ __global__ void ppo_categorical_grad(
         const precision_t* __restrict__ action_mask,
         const float* __restrict__ actions,
         const float* __restrict__ dlogp,
+        const float* __restrict__ rollout_eps,
         const int* __restrict__ act_sizes,
         const float* __restrict__ ent_coef,
         float inv_NT, int num_atns, int A_total, int NT) {
@@ -1535,9 +1538,13 @@ __global__ void ppo_categorical_grad(
         float d_logp = d_new_logp;
 #ifdef PUFFER_NETHACK
         if (h == 0) {
-            nethack_verb_train_logp(head_mask, A, head_grad[act],
-                &verb_mix_scale);
-            d_logp *= verb_mix_scale;
+            float inv_K = 0.0f;
+            float eps = nethack_verb_eps_for_mask(
+                head_mask, A, rollout_eps[idx], &inv_K);
+            PufCatUniformMix mix = puf_cat_uniform_mix(
+                head_grad[act], eps, inv_K);
+            verb_mix_scale = mix.base_scale;
+            d_logp *= mix.base_scale;
         }
 #endif
         // All cache reads above complete before the in-place writes below.
@@ -1610,7 +1617,8 @@ void ppo_loss_fwd_bwd(
         int grad_grid = (total * PUF_CAT_WARP + PPO_THREADS - 1) / PPO_THREADS;
         ppo_categorical_grad<<<grad_grid, PPO_THREADS, 0, stream>>>(
             bufs.grad_logits.data, graph.mb_action_mask.data,
-            graph.mb_actions.data, graph.mb_dlogp.data, act_sizes,
+            graph.mb_actions.data, graph.mb_dlogp.data,
+            graph.mb_policy_eps.data, act_sizes,
             ent_coef, 1.0f / float(total), NUM_ATNS, A_total, total);
     }
     ppo_loss_reduce<<<1, LOSS_N, 0, stream>>>(

@@ -65,6 +65,12 @@ int grid_size(int N) {
 // Exclusive env: -DENV_HEADER=ocean/<env>/<env>.h or .cu (--gpu). Never both.
 #include ENV_HEADER
 
+#ifdef ENV_SAMPLE_LOGITS
+constexpr bool PUF_CUSTOM_SAMPLE_LOGITS = true;
+#else
+constexpr bool PUF_CUSTOM_SAMPLE_LOGITS = false;
+#endif
+
 // Exact legal-only categorical primitive shared by rollout sampling and the
 // PPO learner. Must stay after the precision typedefs / ENV_HEADER and before
 // the textual include of algo.cu below.
@@ -359,6 +365,7 @@ struct RolloutBuf {
     Prec values;        // (horizon, agents)
     Prec logprobs;      // legacy precision store (custom sampler ABI)
     Float logprobs_f32; // (horizon, agents) exact float32 PPO old logprob
+    Float policy_eps;   // (horizon, agents) rollout-time mixture epsilon
     Prec rewards;
     Prec terminals;
     Prec action_mask;   // (horizon, agents, mask_size)
@@ -375,6 +382,7 @@ void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
     bufs->values       = {.shape = {T, B}};
     bufs->logprobs     = {.shape = {T, B}};
     bufs->logprobs_f32 = {.shape = {T, B}};
+    bufs->policy_eps   = {.shape = {T, B}};
     bufs->rewards      = {.shape = {T, B}};
     bufs->terminals    = {.shape = {T, B}};
     bufs->action_mask  = {.shape = {T, B, mask_size}};
@@ -387,6 +395,7 @@ void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
     }
     alloc_register(alloc, &bufs->actions);
     alloc_register(alloc, &bufs->logprobs_f32);
+    alloc_register(alloc, &bufs->policy_eps);
 }
 
 // Rank-2 or rank-3 time-major tensor. F==0 means rank-2 (zero-terminated shape);
@@ -418,6 +427,7 @@ RolloutBuf rollout_time_view(RolloutBuf* base, int start_t, int T) {
     view.values       = puf_time_view(base->values,       start_t, T);
     view.logprobs     = puf_time_view(base->logprobs,     start_t, T);
     view.logprobs_f32 = puf_time_view(base->logprobs_f32, start_t, T);
+    view.policy_eps   = puf_time_view(base->policy_eps,   start_t, T);
     view.rewards      = puf_time_view(base->rewards,      start_t, T);
     view.terminals    = puf_time_view(base->terminals,    start_t, T);
     view.action_mask  = puf_time_view(base->action_mask,  start_t, T);
@@ -600,6 +610,18 @@ __global__ void rng_init(curandStatePhilox4_32_10_t* states, uint64_t seed, int 
     }
 }
 
+__global__ void snapshot_policy_eps(float* out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+#ifdef PUFFER_NETHACK
+    out[idx] = nethack_verb_eps_current();
+#else
+    out[idx] = 0.0f;
+#endif
+}
+
 // Action logits and value share one row: [logits..., value]. logstd empty ⇒ discrete.
 // Discrete: exact legal-only normalization + inverse-CDF from src/categorical.cuh;
 // mask always present (all-ones if env has none). Continuous: ignores mask.
@@ -621,6 +643,7 @@ __global__ void sample_logits(
         precision_t* action_mask,             // (B, A_total); always allocated
         int mask_stride,
         float* logprobs_f32,                  // (B,) exact float32 PPO old logprob
+        const float* policy_eps,               // (B,) rollout-time mixture epsilon
         PufCatStatus* status) {               // first-error payload (rollout)
     int B = dec_out.shape[0];
     int fused_cols = dec_out.shape[1];
@@ -687,7 +710,8 @@ __global__ void sample_logits(
         float eps = 0.0f;
 #ifdef PUFFER_NETHACK
         if (h == 0) {
-            eps = nethack_verb_eps_load(head_mask, A, &inv_K);
+            eps = nethack_verb_eps_for_mask(
+                head_mask, A, policy_eps[idx], &inv_K);
         }
 #endif
         PufCatNorm norm = puf_cat_head_norm(
@@ -723,8 +747,8 @@ __global__ void sample_logits(
         int used = nethack_head_used(verb, h);
         if (used) {
             if (eps > 0.0f) {
-                total_log_prob += logf(
-                    (1.0f - eps) * expf(logp) + eps * inv_K);
+                total_log_prob += puf_cat_uniform_mix(
+                    logp, eps, inv_K).logp;
             } else {
                 total_log_prob += logp;
             }
@@ -936,6 +960,7 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         Float act_b = puf_slice(rollouts.actions,      t, sub, n);
         Prec lp_b   = puf_slice(rollouts.logprobs,     t, sub, n);
         Float lp32_b = puf_slice(rollouts.logprobs_f32, t, sub, n);
+        Float eps_b  = puf_slice(rollouts.policy_eps,   t, sub, n);
         Prec val_b  = puf_slice(rollouts.values,       t, sub, n);
         Prec mask_b = puf_slice(rollouts.action_mask,  t, sub, n);
 
@@ -958,6 +983,8 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         if (dw->continuous) {
             p_logstd = dw->logstd;
         }
+        snapshot_policy_eps<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+            eps_b.data, n);
 
         // Offset RNG by off so policies don't collide on per-buffer rng slots.
 #ifdef ENV_SAMPLE_LOGITS
@@ -979,7 +1006,7 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
             lp_b.data, val_b.data,
             pufferl->rng_states[buf] + off,
             mask_b.data, mask_stride,
-            lp32_b.data, status);
+            lp32_b.data, eps_b.data, status);
 #endif
     }
 }
@@ -1363,9 +1390,10 @@ static void rollout_start(PuffeRL* p) {
         // sample → env-step boundary, so the sampler error could not be
         // surfaced before puf_step consumes the row. Split it per step:
         // pufferl_forward keeps a per-step net graph (when cudagraphs is on)
-        // and the env step runs after the host check. Continuous action
-        // spaces never touch the categorical path and keep the full graph.
-        if (!p->is_continuous) {
+        // and the env step runs after the host check. Default continuous
+        // sampling cannot set this status and keeps the full graph; a custom
+        // sampler can, so it uses the checked path regardless of action type.
+        if (!p->is_continuous || PUF_CUSTOM_SAMPLE_LOGITS) {
             p->profile.skip_rollout_time = 0;
             for (int t = 0; t < H; t++) {
                 int base = t * EV_T;
@@ -1647,6 +1675,9 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         rollouts->logprobs_f32.data, src.logprobs_f32.data, T, B, 1,
         agents_per_buf, primary_start, primary_count);
     transpose_primary_102<<<grid_size(T * train_agents), BLOCK_SIZE, 0, stream>>>(
+        rollouts->policy_eps.data, src.policy_eps.data, T, B, 1,
+        agents_per_buf, primary_start, primary_count);
+    transpose_primary_102<<<grid_size(T * train_agents), BLOCK_SIZE, 0, stream>>>(
         rollouts->rewards.data, src.rewards.data, T, B, 1,
         agents_per_buf, primary_start, primary_count);
     transpose_primary_102<<<grid_size(T * train_agents), BLOCK_SIZE, 0, stream>>>(
@@ -1691,6 +1722,7 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         graph.mb_actions = slice_rows(rollouts->actions, dest_off, Nmb);
         graph.mb_logprobs = slice_rows(rollouts->logprobs, dest_off, Nmb);
         graph.mb_logprobs_f32 = slice_rows(rollouts->logprobs_f32, dest_off, Nmb);
+        graph.mb_policy_eps = slice_rows(rollouts->policy_eps, dest_off, Nmb);
         graph.mb_terminals = slice_rows(rollouts->terminals, dest_off, Nmb);
         graph.mb_rewards = slice_rows(rollouts->rewards, dest_off, Nmb);
         graph.mb_values = slice_rows(rollouts->values, dest_off, Nmb);
@@ -1710,9 +1742,9 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             pufferl->cat_status_train.device, stream);
         // Fail before consume: mask/action/old-logprob errors on this minibatch
         // are surfaced before GAE, the loss reduction, backward or the
-        // optimizer can touch the row. Discrete builds therefore run this
-        // epoch eagerly (see train_impl); continuous rows never take this path.
-        if (!pufferl->is_continuous) {
+        // optimizer can touch the row. Discrete and custom-sampler builds
+        // therefore run this epoch eagerly (see train_impl).
+        if (!pufferl->is_continuous || PUF_CUSTOM_SAMPLE_LOGITS) {
             puf_cat_status_fetch(pufferl->cat_status_train.host,
                 pufferl->cat_status_train.device, stream);
             cudaStreamSynchronize(stream);
@@ -1795,13 +1827,14 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
     int total_minibatches = hypers->replay_ratio * batch_size / hypers->minibatch_size;
     // Discrete learning checks the categorical status between the cache stage
     // and GAE/loss/backward/optimizer, which a captured graph cannot express.
-    // Correctness wins: the train epoch runs eagerly for discrete builds.
-    // Continuous PPO keeps the existing whole-epoch graph.
-    bool train_graphs = hypers->cudagraphs && pufferl->is_continuous;
+    // Correctness wins: the train epoch runs eagerly for discrete or custom
+    // sampler builds. Default continuous PPO keeps the whole-epoch graph.
+    bool train_graphs = hypers->cudagraphs && pufferl->is_continuous
+        && !PUF_CUSTOM_SAMPLE_LOGITS;
     if (hypers->cudagraphs && !train_graphs && pufferl->epoch == 0
             && hypers->rank == 0) {
-        fprintf(stderr, "[puffer] train.cudagraphs disabled for discrete "
-            "actions: exact action-mask checks must run before GAE/backward\n");
+        fprintf(stderr, "[puffer] train.cudagraphs disabled for checked "
+            "sampling: action status must run before GAE/backward\n");
     }
     bool first = train_graphs && pufferl->train_cudagraph[slot] == NULL;
     profile_begin("train_forward_backward", hypers->profile);
@@ -2291,10 +2324,11 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     nethack_policy_init(ini);
 #endif
 
-    // Per-step net graphs on CPU, and on GPU when the discrete sampler needs a
-    // host check between sampling and the env step. Continuous GPU rollout
-    // keeps the full-horizon graph. All captured on first use.
-    if (hypers.cudagraphs && (PUF_BACKEND != PUF_GPU || !is_continuous)) {
+    // Per-step net graphs on CPU, and on GPU whenever sampling needs a host
+    // check before the env step. Only default continuous GPU rollout keeps the
+    // full-horizon graph. All captured on first use.
+    if (hypers.cudagraphs && (PUF_BACKEND != PUF_GPU
+            || !is_continuous || PUF_CUSTOM_SAMPLE_LOGITS)) {
         int rollout_graph_slots = pufferl->async_num_slots;
         pufferl->rollout_graphs = (cudaGraphExec_t*)calloc(1,
             rollout_graph_slots*horizon*num_buffers*sizeof(cudaGraphExec_t));

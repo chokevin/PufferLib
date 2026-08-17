@@ -63,13 +63,13 @@ __device__ int nethack_head_used(int verb, int h) {
     return (int)d_hc_dev[verb * d_hc_stride + h];
 }
 
-__device__ float nethack_verb_eps_load(const precision_t* mask_row,
-        int A, float* inv_K) {
+__device__ float nethack_verb_eps_current() {
+    return d_veps_dev ? *d_veps_dev : 0.0f;
+}
+
+__device__ float nethack_verb_eps_for_mask(const precision_t* mask_row,
+        int A, float eps, float* inv_K) {
     *inv_K = 0.0f;
-    if (!d_veps_dev) {
-        return 0.0f;
-    }
-    float eps = *d_veps_dev;
     if (eps <= 0.0f) {
         return 0.0f;
     }
@@ -84,34 +84,4 @@ __device__ float nethack_verb_eps_load(const precision_t* mask_row,
     }
     *inv_K = 1.0f / (float)K;
     return eps;
-}
-
-__device__ float nethack_verb_eps_mix(float prob, precision_t mask,
-        float eps, float inv_K) {
-    float legal = to_float(mask) != 0.0f ? 1.0f : 0.0f;
-    return (1.0f - eps) * prob + eps * legal * inv_K;
-}
-
-__device__ float nethack_verb_train_logp(const precision_t* mask_row,
-        int A, float lp, float* scale) {
-    if (!d_veps_dev) {
-        return lp;
-    }
-    float eps = *d_veps_dev;
-    if (eps <= 0.0f) {
-        return lp;
-    }
-    int K = 0;
-    for (int j = 0; j < A; ++j) {
-        if (to_float(mask_row[j]) != 0.0f) {
-            K++;
-        }
-    }
-    if (K == 0) {
-        K = A;
-    }
-    float p_act = __expf(lp);
-    float p_mix = (1.0f - eps) * p_act + eps / (float)K;
-    *scale = (1.0f - eps) * p_act / p_mix;
-    return __logf(p_mix);
 }
