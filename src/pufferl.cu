@@ -65,6 +65,11 @@ int grid_size(int N) {
 // Exclusive env: -DENV_HEADER=ocean/<env>/<env>.h or .cu (--gpu). Never both.
 #include ENV_HEADER
 
+// Exact legal-only categorical primitive shared by rollout sampling and the
+// PPO learner. Must stay after the precision typedefs / ENV_HEADER and before
+// the textual include of algo.cu below.
+#include "categorical.cuh"
+
 typedef struct {
     float* data;
     int64_t shape[PUF_MAX_DIMS];
@@ -352,7 +357,8 @@ struct RolloutBuf {
     Prec initial_states;
     Float actions;      // (horizon, agents, num_atns) float32: large discrete IDs
     Prec values;        // (horizon, agents)
-    Prec logprobs;      // ...
+    Prec logprobs;      // legacy precision store (custom sampler ABI)
+    Float logprobs_f32; // (horizon, agents) exact float32 PPO old logprob
     Prec rewards;
     Prec terminals;
     Prec action_mask;   // (horizon, agents, mask_size)
@@ -368,6 +374,7 @@ void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
     bufs->actions      = {.shape = {T, B, num_atns}};
     bufs->values       = {.shape = {T, B}};
     bufs->logprobs     = {.shape = {T, B}};
+    bufs->logprobs_f32 = {.shape = {T, B}};
     bufs->rewards      = {.shape = {T, B}};
     bufs->terminals    = {.shape = {T, B}};
     bufs->action_mask  = {.shape = {T, B, mask_size}};
@@ -379,6 +386,7 @@ void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
         alloc_register(alloc, prec_fields[i]);
     }
     alloc_register(alloc, &bufs->actions);
+    alloc_register(alloc, &bufs->logprobs_f32);
 }
 
 // Rank-2 or rank-3 time-major tensor. F==0 means rank-2 (zero-terminated shape);
@@ -409,6 +417,7 @@ RolloutBuf rollout_time_view(RolloutBuf* base, int start_t, int T) {
     view.actions      = puf_time_view(base->actions,      start_t, T);
     view.values       = puf_time_view(base->values,       start_t, T);
     view.logprobs     = puf_time_view(base->logprobs,     start_t, T);
+    view.logprobs_f32 = puf_time_view(base->logprobs_f32, start_t, T);
     view.rewards      = puf_time_view(base->rewards,      start_t, T);
     view.terminals    = puf_time_view(base->terminals,    start_t, T);
     view.action_mask  = puf_time_view(base->action_mask,  start_t, T);
@@ -548,6 +557,8 @@ typedef struct PuffeRL {
     cudaStream_t train_stream;    // dedicated learner stream (always non-default)
     int* act_sizes;        // device ACT_SIZES (NUM_ATNS ints)
     float* losses;         // device loss accumulator (NUM_LOSSES)
+    PufCatStatusPair* cat_status_rollout;  // [num_buffers] sampler first-error
+    PufCatStatusPair cat_status_train;     // learner first-error (train stream)
     PPOBufs ppo_bufs; // Pre-allocated buffers for ppo_loss_fwd_bwd
     Prec actor_param;      // async flat actor params
     Prec grad;
@@ -590,19 +601,27 @@ __global__ void rng_init(curandStatePhilox4_32_10_t* states, uint64_t seed, int 
 }
 
 // Action logits and value share one row: [logits..., value]. logstd empty ⇒ discrete.
-// Discrete: always-cache logsumexp + inverse-CDF; mask always present (all-ones if env has none).
-// Continuous: ignores mask.
+// Discrete: exact legal-only normalization + inverse-CDF from src/categorical.cuh;
+// mask always present (all-ones if env has none). Continuous: ignores mask.
+//
+// One warp per row (launch grid_size(B * PUF_CAT_WARP) threads). Lane 0 owns the
+// RNG stream and the row-scalar stores, so the per-head curand draw order — and
+// therefore the sampled trajectory for a given seed — is unchanged. Masked
+// categories contribute exactly zero probability, so a legal logit below -1e4
+// can never lose to a masked huge/NaN/Inf logit.
 __global__ void sample_logits(
         Prec dec_out,              // (B, logits_dim + 1)
         Prec logstd,           // (1, od) continuous only; .data null if discrete
         int* act_sizes,            // (NUM_ATNS,)
         float* actions,                       // (B, num_atns) float32 rollout store
         float* env_actions,                   // (B, num_atns) env dispatch
-        precision_t* logprobs,                // (B,)
+        precision_t* logprobs,                // (B,) legacy precision store
         precision_t* value_out,               // (B,)
         curandStatePhilox4_32_10_t* rng_states,
         precision_t* action_mask,             // (B, A_total); always allocated
-        int mask_stride) {
+        int mask_stride,
+        float* logprobs_f32,                  // (B,) exact float32 PPO old logprob
+        PufCatStatus* status) {               // first-error payload (rollout)
     int B = dec_out.shape[0];
     int fused_cols = dec_out.shape[1];
     int num_atns = NUM_ATNS;
@@ -610,16 +629,21 @@ __global__ void sample_logits(
     bool is_continuous = logstd.data != NULL && numel(logstd.shape) > 0;
     precision_t* logstd_data = logstd.data;
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int lane = puf_cat_lane();
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) / PUF_CAT_WARP;
     if (idx >= B) {
         return;
     }
 
-    curandStatePhilox4_32_10_t state = rng_states[idx];
     int logits_base = idx * fused_cols;
     float total_log_prob = 0.0f;
 
     if (is_continuous) {
+        // Row-serial on lane 0: identical math and RNG draws as before.
+        if (lane != 0) {
+            return;
+        }
+        curandStatePhilox4_32_10_t state = rng_states[idx];
         for (int h = 0; h < num_atns; h++) {
             float mean = safe_continuous_mean(logits, logits_base + h);
             float log_std = safe_continuous_logstd(logstd_data, h);
@@ -636,78 +660,129 @@ __global__ void sample_logits(
             actions[aidx] = stored;
             env_actions[aidx] = stored;
         }
-    } else {
-        int logits_offset = 0;
-        int mask_base = idx * mask_stride;
-        for (int h = 0; h < num_atns; h++) {
-            int A = act_sizes[h];
-            float cache[PPO_MAX_HEAD_A];
-            float logsumexp = ppo_discrete_logsumexp(
-                logits, logits_base, logits_offset, A, action_mask, mask_base, cache);
-#ifdef PUFFER_NETHACK
-            float inv_K = 0.0f;
-            float eps = h == 0 ? nethack_verb_eps_load(
-                action_mask + mask_base + logits_offset, A, &inv_K) : 0.0f;
-#endif
-            float rand_val = curand_uniform(&state);
-            float cumsum = 0.0f;
-            int sampled = A - 1;
-            for (int a = 0; a < A; a++) {
-#ifdef PUFFER_NETHACK
-                if (eps > 0.0f) {
-                    cumsum += nethack_verb_eps_mix(expf(cache[a] - logsumexp),
-                        action_mask[mask_base + logits_offset + a], eps, inv_K);
-                } else
-#endif
-                {
-                    cumsum += expf(cache[a] - logsumexp);
-                }
-                if (rand_val < cumsum) {
-                    sampled = a;
-                    break;
-                }
-            }
-            // CDF fall-through (float rounding) lands on A - 1, which may be
-            // masked; snap to the last legal action. A legitimate A - 1 pick
-            // is always legal, so the snap is an exact no-op for it.
-            if (sampled == A - 1) {
-                for (int a = A - 1; a >= 0; a--) {
-                    if (to_float(action_mask[mask_base + logits_offset + a]) != 0.0f) {
-                        sampled = a;
-                        break;
-                    }
-                }
-            }
-            // Float32 preserves large categorical IDs that BF16 cannot represent.
-            int aidx = idx * num_atns + h;
-            float action = (float)sampled;
-            actions[aidx] = action;
-            env_actions[aidx] = action;
-#if defined(PUFFER_NETHACK)
-            int verb = (int)actions[idx * num_atns];
-            int used = nethack_head_used(verb, h);
-            if (used) {
-                if (eps > 0.0f) {
-                    total_log_prob += logf((1.0f - eps)
-                        * expf(cache[sampled] - logsumexp) + eps * inv_K);
-                } else {
-                    total_log_prob += cache[sampled] - logsumexp;
-                }
-            }
-#elif defined(KG_HEAD_GATING_SELECTOR_VALUES)
-            if (kg_puffer5_head_used(actions + idx * num_atns, h)) {
-                total_log_prob += cache[sampled] - logsumexp;
-            }
-#else
-            total_log_prob += cache[sampled] - logsumexp;
-#endif
-            logits_offset += A;
-        }
+        logprobs[idx] = from_float(total_log_prob);
+        logprobs_f32[idx] = total_log_prob;
+        value_out[idx] = logits[logits_base + fused_cols - 1];
+        rng_states[idx] = state;
+        return;
     }
 
-    logprobs[idx] = from_float(total_log_prob);
-    value_out[idx] = logits[logits_base + fused_cols - 1];
-    rng_states[idx] = state;
+    curandStatePhilox4_32_10_t state;
+    if (lane == 0) {
+        state = rng_states[idx];
+    }
+    int logits_offset = 0;
+    int mask_base = idx * mask_stride;
+    int err_code = PUF_CAT_OK;
+    int err_head = -1;
+    int err_detail = -1;
+#ifdef PUFFER_NETHACK
+    int verb = 0;
+#endif
+    for (int h = 0; h < num_atns; h++) {
+        int A = act_sizes[h];
+        const precision_t* head_logits = logits + logits_base + logits_offset;
+        const precision_t* head_mask = action_mask + mask_base + logits_offset;
+        float inv_K = 0.0f;
+        float eps = 0.0f;
+#ifdef PUFFER_NETHACK
+        if (h == 0) {
+            eps = nethack_verb_eps_load(head_mask, A, &inv_K);
+        }
+#endif
+        PufCatNorm norm = puf_cat_head_norm(
+            head_logits, head_mask, A, eps > 0.0f);
+        if (norm.code != PUF_CAT_OK) {
+            err_code = norm.code;
+            err_head = h;
+            err_detail = norm.detail;
+            break;
+        }
+        float rand_val = 0.0f;
+        if (lane == 0) {
+            rand_val = curand_uniform(&state);
+        }
+        rand_val = __shfl_sync(PUF_CAT_ALL_LANES, rand_val, 0);
+        int sampled = puf_cat_sample(
+            head_logits, head_mask, A, norm, rand_val, eps, inv_K);
+        float logp = puf_cat_logp_at(head_logits, sampled, norm);
+
+        // Float32 preserves large categorical IDs that BF16 cannot represent.
+        int aidx = idx * num_atns + h;
+        float action = (float)sampled;
+        if (lane == 0) {
+            actions[aidx] = action;
+            env_actions[aidx] = action;
+        }
+        // Head-gating hooks below read earlier heads of this action row.
+        __syncwarp();
+#if defined(PUFFER_NETHACK)
+        if (h == 0) {
+            verb = sampled;
+        }
+        int used = nethack_head_used(verb, h);
+        if (used) {
+            if (eps > 0.0f) {
+                total_log_prob += logf(
+                    (1.0f - eps) * expf(logp) + eps * inv_K);
+            } else {
+                total_log_prob += logp;
+            }
+        }
+#elif defined(KG_HEAD_GATING_SELECTOR_VALUES)
+        if (kg_puffer5_head_used(actions + idx * num_atns, h)) {
+            total_log_prob += logp;
+        }
+#else
+        total_log_prob += logp;
+#endif
+        logits_offset += A;
+    }
+
+    if (err_code != PUF_CAT_OK) {
+        // Finite, in-range placeholders only. Action 0 is in range because a
+        // reported row never has a nonpositive head width. The host surfaces
+        // the error before puf_step can consume this row.
+        for (int h = lane; h < num_atns; h += PUF_CAT_WARP) {
+            actions[idx * num_atns + h] = 0.0f;
+            env_actions[idx * num_atns + h] = 0.0f;
+        }
+        if (lane == 0) {
+            float v = to_float(logits[logits_base + fused_cols - 1]);
+            logprobs[idx] = from_float(0.0f);
+            logprobs_f32[idx] = 0.0f;
+            value_out[idx] = from_float(isfinite(v) ? v : 0.0f);
+            rng_states[idx] = state;
+            puf_cat_report(status, err_code, idx, err_head, err_detail);
+        }
+        return;
+    }
+
+    if (lane == 0) {
+        logprobs[idx] = from_float(total_log_prob);
+        logprobs_f32[idx] = total_log_prob;
+        value_out[idx] = logits[logits_base + fused_cols - 1];
+        rng_states[idx] = state;
+    }
+}
+
+// Legacy ENV_SAMPLE_LOGITS hooks keep the original 10-argument ABI and write
+// only the precision logprob store. Convert into the float32 PPO shadow and
+// validate finiteness so the learner still consumes a checked value.
+__global__ void logprob_shadow_from_precision(
+        float* __restrict__ dst, const precision_t* __restrict__ src,
+        int n, PufCatStatus* status) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    float lp = to_float(src[idx]);
+    if (!isfinite(lp)) {
+        dst[idx] = 0.0f;
+        puf_cat_report(status, PUF_CAT_ERR_OLD_LOGPROB, idx, -1, -1);
+        return;
+    }
+    dst[idx] = lp;
 }
 
 #ifdef ENV_ACTION_KERNEL_HEADER
@@ -807,6 +882,11 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
     int start = buf * block_size;
     int* layout = vec->policy_layout;
 
+    // First-error slot for this buffer's sampler work. Reset inside the
+    // captured region so every replay starts clean.
+    PufCatStatus* status = pufferl->cat_status_rollout[buf].device;
+    puf_cat_status_reset(status, stream);
+
     // Copy observations, rewards, terminals from GPU env buffers to rollout buffer
     ObsTensor* obs_env = &env->obs;
     int n = block_size * obs_env->shape[1];
@@ -855,6 +935,7 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         Prec obs_b  = puf_slice(rollouts.observations, t, sub, n);
         Float act_b = puf_slice(rollouts.actions,      t, sub, n);
         Prec lp_b   = puf_slice(rollouts.logprobs,     t, sub, n);
+        Float lp32_b = puf_slice(rollouts.logprobs_f32, t, sub, n);
         Prec val_b  = puf_slice(rollouts.values,       t, sub, n);
         Prec mask_b = puf_slice(rollouts.action_mask,  t, sub, n);
 
@@ -880,16 +961,40 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
 
         // Offset RNG by off so policies don't collide on per-buffer rng slots.
 #ifdef ENV_SAMPLE_LOGITS
+        // Legacy custom sampler: original 10-argument ABI and launch geometry.
         ENV_SAMPLE_LOGITS<<<n, BLOCK_SIZE, 0, stream>>>(
-#else
-        sample_logits<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
-#endif
             dec, p_logstd, pufferl->act_sizes,
             act_b.data, env->actions.data + (long)sub * act_cols,
             lp_b.data, val_b.data,
             pufferl->rng_states[buf] + off,
             mask_b.data, mask_stride);
+        // Precision → float32 PPO shadow, with a finiteness check.
+        logprob_shadow_from_precision<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+            lp32_b.data, lp_b.data, n, status);
+#else
+        // One warp per row for the exact legal-only categorical primitive.
+        sample_logits<<<grid_size(n * PUF_CAT_WARP), BLOCK_SIZE, 0, stream>>>(
+            dec, p_logstd, pufferl->act_sizes,
+            act_b.data, env->actions.data + (long)sub * act_cols,
+            lp_b.data, val_b.data,
+            pufferl->rng_states[buf] + off,
+            mask_b.data, mask_stride,
+            lp32_b.data, status);
+#endif
     }
+}
+
+// Rollout-side fail-before-consume: pull this buffer's first-error payload back
+// to pinned host memory. Callers must sync the stream before checking it.
+static void pufferl_rollout_status_fetch(PuffeRL* pufferl, int buf,
+        cudaStream_t stream) {
+    PufCatStatusPair* pair = &pufferl->cat_status_rollout[buf];
+    puf_cat_status_fetch(pair->host, pair->device, stream);
+}
+
+static void pufferl_rollout_status_check(PuffeRL* pufferl, int buf) {
+    puf_cat_status_check(pufferl->cat_status_rollout[buf].host,
+        "rollout action sampling");
 }
 
 void pufferl_forward(PuffeRL* pufferl, int buf, int t, cudaStream_t stream) {
@@ -904,6 +1009,8 @@ void pufferl_forward(PuffeRL* pufferl, int buf, int t, cudaStream_t stream) {
         assert(cudaGraphLaunch(
             pufferl->rollout_graphs[graph], stream) == cudaSuccess
             && "cudaGraphLaunch failed");
+        // Status copy stays outside the capture so the host can read it.
+        pufferl_rollout_status_fetch(pufferl, buf, stream);
         profile_end(hypers->profile);
         return;
     }
@@ -924,6 +1031,7 @@ void pufferl_forward(PuffeRL* pufferl, int buf, int t, cudaStream_t stream) {
         assert(cudaGraphLaunch(pufferl->rollout_graphs[graph], stream) == cudaSuccess
                 && "cudaGraphLaunch failed");
     }
+    pufferl_rollout_status_fetch(pufferl, buf, stream);
     profile_end(hypers->profile);
 }
 
@@ -1179,6 +1287,8 @@ static void* vec_thread_main(void* arg) {
                 cudaMemcpyDeviceToHost, stream);
             cudaEventRecord(ev[COPY_END], stream);
             cudaStreamSynchronize(stream);
+            // Fail before consume: no sampled row reaches puf_step unchecked.
+            pufferl_rollout_status_check(pufferl, buf);
             cudaEventElapsedTime(&ms, ev[MODEL_START], ev[MODEL_END]);
             my_accum[PROF_MODEL] += ms;
             cudaEventElapsedTime(&ms, ev[MODEL_END], ev[COPY_END]);
@@ -1247,6 +1357,30 @@ static void rollout_start(PuffeRL* p) {
         puf_bind_stream(stream);
         cudaEvent_t* ev = p->profile.rollout_ev;
         int slot = p->write_slot;
+        int H = p->hypers.horizon;
+
+        // Discrete GPU rollout: the whole-horizon graph would span the
+        // sample → env-step boundary, so the sampler error could not be
+        // surfaced before puf_step consumes the row. Split it per step:
+        // pufferl_forward keeps a per-step net graph (when cudagraphs is on)
+        // and the env step runs after the host check. Continuous action
+        // spaces never touch the categorical path and keep the full graph.
+        if (!p->is_continuous) {
+            p->profile.skip_rollout_time = 0;
+            for (int t = 0; t < H; t++) {
+                int base = t * EV_T;
+                cudaEventRecord(ev[base + MODEL_START], stream);
+                pufferl_forward(p, 0, t, stream);
+                cudaEventRecord(ev[base + MODEL_END], stream);
+                cudaStreamSynchronize(stream);
+                // Fail before consume: no sampled row reaches puf_step unchecked.
+                pufferl_rollout_status_check(p, 0);
+                puf_step(p->vec->envs);
+                cudaEventRecord(ev[base + ENV_END], stream);
+            }
+            return;
+        }
+
         bool first = p->hypers.cudagraphs && p->gpu_rollout_graph[slot] == NULL;
         p->profile.skip_rollout_time = first;
         if (p->hypers.cudagraphs && !first) {
@@ -1262,7 +1396,6 @@ static void rollout_start(PuffeRL* p) {
                 stream, cudaStreamCaptureModeThreadLocal) == cudaSuccess
                 && "cudaStreamBeginCapture failed");
         }
-        int H = p->hypers.horizon;
         for (int t = 0; t < H; t++) {
             int base = t * EV_T;
             cudaEventRecord(ev[base + MODEL_START], stream);
@@ -1511,6 +1644,9 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         rollouts->logprobs.data, src.logprobs.data, T, B, 1,
         agents_per_buf, primary_start, primary_count);
     transpose_primary_102<<<grid_size(T * train_agents), BLOCK_SIZE, 0, stream>>>(
+        rollouts->logprobs_f32.data, src.logprobs_f32.data, T, B, 1,
+        agents_per_buf, primary_start, primary_count);
+    transpose_primary_102<<<grid_size(T * train_agents), BLOCK_SIZE, 0, stream>>>(
         rollouts->rewards.data, src.rewards.data, T, B, 1,
         agents_per_buf, primary_start, primary_count);
     transpose_primary_102<<<grid_size(T * train_agents), BLOCK_SIZE, 0, stream>>>(
@@ -1554,6 +1690,7 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         graph.mb_obs = slice_rows(rollouts->observations, dest_off, Nmb);
         graph.mb_actions = slice_rows(rollouts->actions, dest_off, Nmb);
         graph.mb_logprobs = slice_rows(rollouts->logprobs, dest_off, Nmb);
+        graph.mb_logprobs_f32 = slice_rows(rollouts->logprobs_f32, dest_off, Nmb);
         graph.mb_terminals = slice_rows(rollouts->terminals, dest_off, Nmb);
         graph.mb_rewards = slice_rows(rollouts->rewards, dest_off, Nmb);
         graph.mb_values = slice_rows(rollouts->values, dest_off, Nmb);
@@ -1564,11 +1701,24 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         if (dw_train->continuous) {
             p_logstd = dw_train->logstd;
         }
+        puf_cat_status_reset(pufferl->cat_status_train.device, stream);
         Prec dec = arch_forward_train(&primary->arch, primary->weights,
             pufferl->train_activs, graph.mb_obs, graph.mb_state,
             graph.mb_terminals, dest_off, graph, p_logstd,
             pufferl->act_sizes, pufferl->ppo_bufs.grad_logits.data,
-            pufferl->ppo_bufs.grad_values.data, stream);
+            pufferl->ppo_bufs.grad_values.data,
+            pufferl->cat_status_train.device, stream);
+        // Fail before consume: mask/action/old-logprob errors on this minibatch
+        // are surfaced before GAE, the loss reduction, backward or the
+        // optimizer can touch the row. Discrete builds therefore run this
+        // epoch eagerly (see train_impl); continuous rows never take this path.
+        if (!pufferl->is_continuous) {
+            puf_cat_status_fetch(pufferl->cat_status_train.host,
+                pufferl->cat_status_train.device, stream);
+            cudaStreamSynchronize(stream);
+            puf_cat_status_check(pufferl->cat_status_train.host,
+                "ppo learner categorical cache");
+        }
         puff_advantage<<<adv_grid, ADV_THREADS, 0, stream>>>(
             graph.mb_gae_v.data, graph.mb_rewards.data,
             graph.mb_terminals.data,
@@ -1643,9 +1793,19 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
 
     int slot = hypers->async ? pufferl->async_ready_slot : 0;
     int total_minibatches = hypers->replay_ratio * batch_size / hypers->minibatch_size;
-    bool first = hypers->cudagraphs && pufferl->train_cudagraph[slot] == NULL;
+    // Discrete learning checks the categorical status between the cache stage
+    // and GAE/loss/backward/optimizer, which a captured graph cannot express.
+    // Correctness wins: the train epoch runs eagerly for discrete builds.
+    // Continuous PPO keeps the existing whole-epoch graph.
+    bool train_graphs = hypers->cudagraphs && pufferl->is_continuous;
+    if (hypers->cudagraphs && !train_graphs && pufferl->epoch == 0
+            && hypers->rank == 0) {
+        fprintf(stderr, "[puffer] train.cudagraphs disabled for discrete "
+            "actions: exact action-mask checks must run before GAE/backward\n");
+    }
+    bool first = train_graphs && pufferl->train_cudagraph[slot] == NULL;
     profile_begin("train_forward_backward", hypers->profile);
-    if (hypers->cudagraphs && !first) {
+    if (train_graphs && !first) {
         cudaGraphLaunch(pufferl->train_cudagraph[slot], train_stream);
     } else {
         double t_cap = 0;
@@ -1898,6 +2058,12 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     int n_cont = 0;
     int n_disc = 0;
     for (int i = 0; i < num_action_heads; i++) {
+        if (act_sizes[i] <= 0) {
+            fprintf(stderr,
+                "[puffer] fatal action-space error: head %d has width %d\n",
+                i, act_sizes[i]);
+            abort();
+        }
         if (act_sizes[i] == 1) {
             n_cont++;
         } else {
@@ -2106,6 +2272,14 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
             pufferl->rng_states[i], pufferl->seed + i, agents_per_buf);
     }
 
+    // Per-stream first-error payloads for the exact categorical primitive.
+    pufferl->cat_status_rollout = (PufCatStatusPair*)calloc(
+        1, num_buffers * sizeof(PufCatStatusPair));
+    for (int i = 0; i < num_buffers; i++) {
+        pufferl->cat_status_rollout[i] = puf_cat_status_create();
+    }
+    pufferl->cat_status_train = puf_cat_status_create();
+
     // Post-create initialization
     cudaMemcpy(pufferl->act_sizes, act_sizes,
         num_action_heads*sizeof(int), cudaMemcpyHostToDevice);
@@ -2117,8 +2291,10 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     nethack_policy_init(ini);
 #endif
 
-    // CPU: per-step net graphs. GPU: full-horizon. Both captured on first use.
-    if (hypers.cudagraphs && PUF_BACKEND != PUF_GPU) {
+    // Per-step net graphs on CPU, and on GPU when the discrete sampler needs a
+    // host check between sampling and the env step. Continuous GPU rollout
+    // keeps the full-horizon graph. All captured on first use.
+    if (hypers.cudagraphs && (PUF_BACKEND != PUF_GPU || !is_continuous)) {
         int rollout_graph_slots = pufferl->async_num_slots;
         pufferl->rollout_graphs = (cudaGraphExec_t*)calloc(1,
             rollout_graph_slots*horizon*num_buffers*sizeof(cudaGraphExec_t));

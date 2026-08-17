@@ -1066,7 +1066,8 @@ struct TrainGraph {
     Prec mb_state;       // view into train_state (L, A, H); read with agent_off
     Prec mb_obs;         // view (B, T, input_size)
     Float mb_actions;    // view (B, T, num_atns)
-    Prec mb_logprobs;    // view (B, T)
+    Prec mb_logprobs;    // view (B, T) legacy precision store
+    Float mb_logprobs_f32; // view (B, T) exact float32 PPO old logprob
     Prec mb_terminals;   // view (B, T)
     Prec mb_rewards;     // view (B, T)
     Prec mb_advantages;  // scratch
@@ -1075,6 +1076,8 @@ struct TrainGraph {
     Prec mb_action_mask; // view (B, T, mask_size)
     Prec mb_imp;         // scratch
     Prec mb_gae_v;       // scratch: live V in, overwritten with returns
+    Float mb_entropy;    // scratch: per-row categorical entropy (discrete)
+    Float mb_dlogp;      // scratch: per-row dLoss/dlogp handoff to the grad stage
 };
 
 void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int B, int T) {
@@ -1082,10 +1085,14 @@ void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int B, int T) {
         .mb_advantages =    {.shape = {B, T}},
         .mb_imp =           {.shape = {B, T}},
         .mb_gae_v =         {.shape = {B, T}},
+        .mb_entropy =       {.shape = {B, T}},
+        .mb_dlogp =         {.shape = {B, T}},
     };
     alloc_register(alloc, &bufs.mb_advantages);
     alloc_register(alloc, &bufs.mb_imp);
     alloc_register(alloc, &bufs.mb_gae_v);
+    alloc_register(alloc, &bufs.mb_entropy);
+    alloc_register(alloc, &bufs.mb_dlogp);
 }
 
 // TODO: test whether these finite/clamp guards improve continuous-control stability
@@ -1128,18 +1135,9 @@ constexpr int PPO_THREADS = 256;
 #ifndef ACT_SIZES
 #error "ENV_HEADER must #define ACT_SIZES { ... } (classes per head)"
 #endif
-// Exact max head width for this env build — discrete logit cache size.
-constexpr int ppo_max_head_classes() {
-    constexpr int s[] = ACT_SIZES;
-    int m = 0;
-    for (int i = 0; i < NUM_ATNS; i++) {
-        if (s[i] > m) {
-            m = s[i];
-        }
-    }
-    return m > 0 ? m : 1;
-}
-constexpr int PPO_MAX_HEAD_A = ppo_max_head_classes();
+// Head widths are a runtime device array (act_sizes). The categorical
+// primitive scans them in warp tiles, so there is no compile-time width or
+// head-count cap and no width-sized thread-local cache.
 
 // Fused loss function. PPO clipped loss + value + entropy
 // buffers + args are quite complex. We do the entire
@@ -1147,10 +1145,12 @@ constexpr int PPO_MAX_HEAD_A = ppo_max_head_classes();
 struct PPOGraphArgs {
     precision_t* imp;
     const float* actions;
-    const precision_t* old_logprobs;
+    const float* old_logprobs;   // float32 PPO shadow (exact rollout value)
     const precision_t* advantages;
     const precision_t* values;
     const precision_t* returns;
+    const float* entropy;        // per-row categorical entropy (discrete)
+    float* dlogp;                // per-row dLoss/dlogp for the gradient stage
 };
 
 struct PPOKernelArgs {
@@ -1194,40 +1194,6 @@ void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_t
     cudaMalloc((void**)&bufs.ent_coef, sizeof(float));
 }
 
-// Discrete only. mask is always present (env mask or synthetic all-ones).
-__device__ __forceinline__ float load_logit_masked(
-        const precision_t* __restrict__ logits, int logits_base,
-        int logits_offset, int a,
-        const precision_t* __restrict__ mask, int mask_base) {
-    float l = to_float(logits[logits_base + logits_offset + a]);
-    float m = to_float(mask[mask_base + logits_offset + a]);
-    if (m == 0.0f) {
-        l = -1e4f;
-    }
-    return l;
-}
-
-// Shared by sample_logits + ppo_loss. Fills cache[0..A) (sized PPO_MAX_HEAD_A).
-__device__ __forceinline__ float ppo_discrete_logsumexp(
-        const precision_t* __restrict__ logits, int logits_base,
-        int logits_offset, int A,
-        const precision_t* __restrict__ mask, int mask_base,
-        float* __restrict__ cache) {
-    float max_logit = -INFINITY;
-    float sum = 0.0f;
-    for (int a = 0; a < A; ++a) {
-        float l = load_logit_masked(
-            logits, logits_base, logits_offset, a, mask, mask_base);
-        cache[a] = l;
-        if (l > max_logit) {
-            sum *= __expf(max_logit - l);
-            max_logit = l;
-        }
-        sum += __expf(l - max_logit);
-    }
-    return max_logit + __logf(sum);
-}
-
 __device__ __forceinline__ void ppo_continuous_head(
         float mean, float log_std, float action,
         float* out_logp, float* out_entropy) {
@@ -1239,33 +1205,46 @@ __device__ __forceinline__ void ppo_continuous_head(
     *out_entropy = HALF_1_PLUS_LOG_2PI + log_std;
 }
 
-// After decoder GEMM, before GAE. One logit walk: live V, ρ, logp=logit-lse.
-// logp is written into grad_logits (overwritten with grads after GAE).
+// After decoder GEMM, before GAE. Validates masks/actions/old logprobs, writes
+// per-category float32 logprobs (legal exact, masked +0), the selected new
+// logprob, the categorical entropy, live V and the importance ratio.
+// One warp per row (launch grid_size(NT * PUF_CAT_WARP) threads). Discrete rows
+// use the shared exact primitive, so an unchanged policy reproduces the rollout
+// old logprob bit for bit and the ratio is exactly 1.
 __global__ void cache_imp_and_v(
         Prec dec_out,
         const float* __restrict__ actions,
-        const precision_t* __restrict__ old_logprobs,
+        const float* __restrict__ old_logprobs,   // float32 PPO shadow
         const precision_t* __restrict__ action_mask,
         Prec logstd,
         const int* __restrict__ act_sizes,
         precision_t* __restrict__ imp_out,
         precision_t* __restrict__ value_out,
         float* __restrict__ logps,
-        float* __restrict__ new_lp_out) {
+        float* __restrict__ new_lp_out,
+        float* __restrict__ entropy_out,
+        PufCatStatus* status) {
     int NT = (int)dec_out.shape[0] * (int)dec_out.shape[1];
     int fused_cols = (int)dec_out.shape[2];
     int A_total = fused_cols - 1;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int lane = puf_cat_lane();
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) / PUF_CAT_WARP;
     if (idx >= NT) {
         return;
     }
     int logits_base = idx * fused_cols;
     int at_base = idx * A_total;
     precision_t* logits = dec_out.data;
-    value_out[idx] = logits[logits_base + A_total];
+    float old_lp = old_logprobs[idx];
+    bool old_lp_ok = isfinite(old_lp);
 
-    float new_lp = 0.0f;
     if (logstd.data) {
+        // Continuous rows are row-serial on lane 0: unchanged math.
+        if (lane != 0) {
+            return;
+        }
+        value_out[idx] = logits[logits_base + A_total];
+        float new_lp = 0.0f;
         for (int h = 0; h < NUM_ATNS; ++h) {
             float lp, ent;
             ppo_continuous_head(
@@ -1274,52 +1253,124 @@ __global__ void cache_imp_and_v(
                 actions[idx * NUM_ATNS + h], &lp, &ent);
             new_lp += lp;
         }
-    } else {
-#ifdef PUFFER_NETHACK
-        int verb = (int)actions[idx * NUM_ATNS];
-#endif
-        int logits_offset = 0;
-        for (int h = 0; h < NUM_ATNS; ++h) {
-            int A = act_sizes[h];
-            float cache[PPO_MAX_HEAD_A];
-            float lse = ppo_discrete_logsumexp(
-                logits, logits_base, logits_offset, A,
-                action_mask, at_base, cache);
-            for (int a = 0; a < A; ++a) {
-                logps[at_base + logits_offset + a] = cache[a] - lse;
-            }
-#if defined(PUFFER_NETHACK)
-            int used = nethack_head_used(verb, h);
-            if (used) {
-                int act = (int)actions[idx * NUM_ATNS + h];
-                if (h == 0) {
-                    float mix = 1.0f;
-                    new_lp += nethack_verb_train_logp(
-                        action_mask + at_base + logits_offset, A,
-                        cache[act] - lse, &mix);
-                } else {
-                    new_lp += cache[act] - lse;
-                }
-            }
-#elif defined(KG_HEAD_GATING_SELECTOR_VALUES)
-            if (kg_puffer5_head_used(actions + idx * NUM_ATNS, h)) {
-                new_lp += cache[(int)actions[idx * NUM_ATNS + h]] - lse;
-            }
-#else
-            new_lp += cache[(int)actions[idx * NUM_ATNS + h]] - lse;
-#endif
-            logits_offset += A;
+        if (!old_lp_ok) {
+            new_lp_out[idx] = 0.0f;
+            entropy_out[idx] = 0.0f;
+            imp_out[idx] = from_float(1.0f);
+            puf_cat_report(status, PUF_CAT_ERR_OLD_LOGPROB, idx, -1, -1);
+            return;
         }
+        new_lp_out[idx] = new_lp;
+        entropy_out[idx] = 0.0f;  // continuous entropy is computed in the loss
+        imp_out[idx] = from_float(__expf(new_lp - old_lp));
+        return;
     }
-    new_lp_out[idx] = new_lp;
-    imp_out[idx] = from_float(__expf(new_lp - to_float(old_logprobs[idx])));
+
+    int err_code = old_lp_ok ? PUF_CAT_OK : PUF_CAT_ERR_OLD_LOGPROB;
+    int err_head = -1;
+    int err_detail = -1;
+    float new_lp = 0.0f;
+    float total_entropy = 0.0f;
+#ifdef PUFFER_NETHACK
+    int verb = 0;
+#endif
+    int logits_offset = 0;
+    for (int h = 0; h < NUM_ATNS && err_code == PUF_CAT_OK; ++h) {
+        int A = act_sizes[h];
+        const precision_t* head_logits = logits + logits_base + logits_offset;
+        const precision_t* head_mask = action_mask + at_base + logits_offset;
+        float* head_logps = logps + at_base + logits_offset;
+#ifdef PUFFER_NETHACK
+        float inv_K = 0.0f;
+        float eps = h == 0
+            ? nethack_verb_eps_load(head_mask, A, &inv_K) : 0.0f;
+#else
+        float eps = 0.0f;
+#endif
+        PufCatNorm norm = puf_cat_head_norm(
+            head_logits, head_mask, A, eps > 0.0f);
+        if (norm.code != PUF_CAT_OK) {
+            err_code = norm.code;
+            err_head = h;
+            err_detail = norm.detail;
+            break;
+        }
+        int act_code = PUF_CAT_OK;
+        int act = puf_cat_check_action(actions[idx * NUM_ATNS + h], A, &act_code);
+        if (act_code != PUF_CAT_OK) {
+            err_code = act_code;
+            err_head = h;
+            err_detail = -1;
+            break;
+        }
+        if (!puf_cat_legal(head_mask[act])) {
+            err_code = PUF_CAT_ERR_ACTION_ILLEGAL;
+            err_head = h;
+            err_detail = act;
+            break;
+        }
+        puf_cat_write_logps(head_logits, head_mask, A, norm, head_logps);
+        // Recomputed, not read back: bitwise identical to head_logps[act] and
+        // free of cross-lane read-after-write on the cache.
+        float act_logp = puf_cat_logp_at(head_logits, act, norm);
+#ifdef PUFFER_NETHACK
+        if (h == 0) {
+            verb = act;
+        }
+#endif
+#if defined(PUFFER_NETHACK)
+        if (nethack_head_used(verb, h)) {
+            total_entropy += puf_cat_entropy_from_logps(head_logps, head_mask, A);
+            if (h == 0) {
+                float mix = 1.0f;
+                new_lp += nethack_verb_train_logp(head_mask, A, act_logp, &mix);
+            } else {
+                new_lp += act_logp;
+            }
+        }
+#elif defined(KG_HEAD_GATING_SELECTOR_VALUES)
+        if (kg_puffer5_head_used(actions + idx * NUM_ATNS, h)) {
+            total_entropy += puf_cat_entropy_from_logps(head_logps, head_mask, A);
+            new_lp += act_logp;
+        }
+#else
+        total_entropy += puf_cat_entropy_from_logps(head_logps, head_mask, A);
+        new_lp += act_logp;
+#endif
+        logits_offset += A;
+    }
+
+    if (err_code != PUF_CAT_OK) {
+        // Finite placeholders only; the host aborts before GAE / loss /
+        // backward / optimizer can consume this row.
+        for (int a = lane; a < A_total; a += PUF_CAT_WARP) {
+            logps[at_base + a] = 0.0f;
+        }
+        if (lane == 0) {
+            float v = to_float(logits[logits_base + A_total]);
+            value_out[idx] = from_float(isfinite(v) ? v : 0.0f);
+            new_lp_out[idx] = old_lp_ok ? old_lp : 0.0f;
+            entropy_out[idx] = 0.0f;
+            imp_out[idx] = from_float(1.0f);
+            puf_cat_report(status, err_code, idx, err_head, err_detail);
+        }
+        return;
+    }
+
+    if (lane == 0) {
+        value_out[idx] = logits[logits_base + A_total];
+        new_lp_out[idx] = new_lp;
+        entropy_out[idx] = total_entropy;
+        imp_out[idx] = from_float(__expf(new_lp - old_lp));
+    }
 }
 
 Prec arch_forward_train(Arch* p, Weights& w,
         Activations& activations, Prec x,
         Prec state, Prec terminals, int agent_off,
         TrainGraph& g, Prec logstd, int* act_sizes,
-        float* logps, float* new_lp, cudaStream_t stream) {
+        float* logps, float* new_lp, PufCatStatus* status,
+        cudaStream_t stream) {
     int B = x.shape[0], TT = x.shape[1];
     Prec h = p->encoder.forward(w.encoder,
         activations.encoder, *puf_squeeze(&x, 0), stream);
@@ -1328,9 +1379,10 @@ Prec arch_forward_train(Arch* p, Weights& w,
     Prec dec_out = p->decoder.forward(
         w.decoder, activations.decoder, *puf_squeeze(&h, 0), stream);
     Prec dec = *puf_unsqueeze(&dec_out, 0, B, TT);
-    cache_imp_and_v<<<grid_size(B * TT), BLOCK_SIZE, 0, stream>>>(
-        dec, g.mb_actions.data, g.mb_logprobs.data, g.mb_action_mask.data,
-        logstd, act_sizes, g.mb_imp.data, g.mb_gae_v.data, logps, new_lp);
+    cache_imp_and_v<<<grid_size(B * TT * PUF_CAT_WARP), BLOCK_SIZE, 0, stream>>>(
+        dec, g.mb_actions.data, g.mb_logprobs_f32.data, g.mb_action_mask.data,
+        logstd, act_sizes, g.mb_imp.data, g.mb_gae_v.data, logps, new_lp,
+        g.mb_entropy.data, status);
     return dec;
 }
 
@@ -1358,7 +1410,9 @@ __global__ void ppo_loss_compute(
         float val_pred = to_float(a.values_pred[logits_base]);
         float ent_coef = *a.ent_coef;
         float d_entropy_term = inv_NT * (-ent_coef);
-        float logratio = a.grad_values_pred[nt] - to_float(g.old_logprobs[nt]);
+        // grad_values_pred carries new_lp from cache_imp_and_v until the
+        // value gradient overwrites it below.
+        float logratio = a.grad_values_pred[nt] - g.old_logprobs[nt];
         float ratio = __expf(logratio);
 
         // Value loss + gradient: 0.5 * max((v-r)^2, (v_clip-r)^2).
@@ -1401,59 +1455,11 @@ __global__ void ppo_loss_compute(
                     d_new_logp * (diff * diff / var - 1.0f) + d_entropy_term;
             }
         } else {
-#ifdef PUFFER_NETHACK
-            int verb = (int)g.actions[nt * a.num_atns];
-            float verb_mix_scale = 1.0f;
-#endif
-            int logits_offset = 0;
-            for (int h = 0; h < a.num_atns; ++h) {
-                int A = a.act_sizes[h];
-#ifdef PUFFER_NETHACK
-                if (!nethack_head_used(verb, h)) {
-                    for (int j = 0; j < A; ++j) {
-                        a.grad_logits[at_base + logits_offset + j] = 0.0f;
-                    }
-                    logits_offset += A;
-                    continue;
-                }
-#elif defined(KG_HEAD_GATING_SELECTOR_VALUES)
-                if (!kg_puffer5_head_used(
-                        g.actions + nt * a.num_atns, h)) {
-                    for (int j = 0; j < A; ++j) {
-                        a.grad_logits[at_base + logits_offset + j] = 0.0f;
-                    }
-                    logits_offset += A;
-                    continue;
-                }
-#endif
-                int act = (int)g.actions[nt * a.num_atns + h];
-                float ent = 0.0f;
-                for (int j = 0; j < A; ++j) {
-                    float logp = a.grad_logits[at_base + logits_offset + j];
-                    ent -= __expf(logp) * logp;
-                }
-                total_entropy += ent;
-#ifdef PUFFER_NETHACK
-                float d_logp = d_new_logp;
-                if (h == 0) {
-                    nethack_verb_train_logp(
-                        a.action_mask + at_base + logits_offset, A,
-                        a.grad_logits[at_base + act],
-                        &verb_mix_scale);
-                    d_logp *= verb_mix_scale;
-                }
-#else
-                float d_logp = d_new_logp;
-#endif
-                for (int j = 0; j < A; ++j) {
-                    float logp = a.grad_logits[at_base + logits_offset + j];
-                    float p = __expf(logp);
-                    a.grad_logits[at_base + logits_offset + j] =
-                        ((j == act ? 1.0f : 0.0f) - p) * d_logp
-                        + d_entropy_term * p * (-ent - logp);
-                }
-                logits_offset += A;
-            }
+            // Discrete categorical entropy and gradients are produced by the
+            // warp-row stages around this kernel (cache_imp_and_v and
+            // ppo_categorical_grad) so masked categories stay bitwise +0.
+            total_entropy = g.entropy[nt];
+            g.dlogp[nt] = d_new_logp;
         }
 
         float thread_loss = (pg_loss + a.vf_coef * v_loss
@@ -1472,6 +1478,74 @@ __global__ void ppo_loss_compute(
 
     block_reduce_sum(&block_losses[0][0], &ppo_partials[blockIdx.x * LOSS_N],
         tid, PPO_THREADS, LOSS_N);
+}
+
+// Exact categorical policy gradient. One warp per row, run after the loss
+// kernel so it can consume that row's d(loss)/d(new logprob). Reads the cached
+// per-category logprobs in place and overwrites them with gradients:
+// masked categories are written as bitwise +0.0f whatever their raw logit was,
+// and gated-off heads are zeroed exactly as before.
+__global__ void ppo_categorical_grad(
+        float* __restrict__ grad_logits,
+        const precision_t* __restrict__ action_mask,
+        const float* __restrict__ actions,
+        const float* __restrict__ dlogp,
+        const int* __restrict__ act_sizes,
+        const float* __restrict__ ent_coef,
+        float inv_NT, int num_atns, int A_total, int NT) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) / PUF_CAT_WARP;
+    if (idx >= NT) {
+        return;
+    }
+    int at_base = idx * A_total;
+    float d_new_logp = dlogp[idx];
+    float d_entropy_term = inv_NT * (-(*ent_coef));
+#ifdef PUFFER_NETHACK
+    int verb = (int)actions[idx * num_atns];
+    float verb_mix_scale = 1.0f;
+#endif
+    int logits_offset = 0;
+    for (int h = 0; h < num_atns; ++h) {
+        int A = act_sizes[h];
+        float* head_grad = grad_logits + at_base + logits_offset;
+        const precision_t* head_mask = action_mask + at_base + logits_offset;
+#ifdef PUFFER_NETHACK
+        if (!nethack_head_used(verb, h)) {
+            puf_cat_zero_head(head_grad, A);
+            logits_offset += A;
+            continue;
+        }
+#elif defined(KG_HEAD_GATING_SELECTOR_VALUES)
+        if (!kg_puffer5_head_used(actions + idx * num_atns, h)) {
+            puf_cat_zero_head(head_grad, A);
+            logits_offset += A;
+            continue;
+        }
+#endif
+        int act_code = PUF_CAT_OK;
+        int act = puf_cat_check_action(actions[idx * num_atns + h], A, &act_code);
+        if (act_code != PUF_CAT_OK) {
+            // Validated in cache_imp_and_v; the host has already aborted by
+            // the time this could matter. Keep the write finite regardless.
+            puf_cat_zero_head(head_grad, A);
+            logits_offset += A;
+            continue;
+        }
+        float entropy = puf_cat_entropy_from_logps(head_grad, head_mask, A);
+        float d_logp = d_new_logp;
+#ifdef PUFFER_NETHACK
+        if (h == 0) {
+            nethack_verb_train_logp(head_mask, A, head_grad[act],
+                &verb_mix_scale);
+            d_logp *= verb_mix_scale;
+        }
+#endif
+        // All cache reads above complete before the in-place writes below.
+        __syncwarp();
+        puf_cat_write_grads(head_grad, head_mask, A, act,
+            d_logp, d_entropy_term, entropy);
+        logits_offset += A;
+    }
 }
 
 // Deterministic reduction of per-block PPO loss partials + count increment
@@ -1506,10 +1580,12 @@ void ppo_loss_fwd_bwd(
     PPOGraphArgs graph_args = {
         .imp = graph.mb_imp.data,
         .actions = graph.mb_actions.data,
-        .old_logprobs = graph.mb_logprobs.data,
+        .old_logprobs = graph.mb_logprobs_f32.data,
         .advantages = graph.mb_advantages.data,
         .values = graph.mb_values.data,
         .returns = graph.mb_returns.data,
+        .entropy = graph.mb_entropy.data,
+        .dlogp = graph.mb_dlogp.data,
     };
 
     PPOKernelArgs args = {
@@ -1530,6 +1606,13 @@ void ppo_loss_fwd_bwd(
     };
     ppo_loss_compute<<<ppo_grid, PPO_THREADS, 0, stream>>>(
             bufs.ppo_partials.data, args, graph_args);
+    if (!is_continuous) {
+        int grad_grid = (total * PUF_CAT_WARP + PPO_THREADS - 1) / PPO_THREADS;
+        ppo_categorical_grad<<<grad_grid, PPO_THREADS, 0, stream>>>(
+            bufs.grad_logits.data, graph.mb_action_mask.data,
+            graph.mb_actions.data, graph.mb_dlogp.data, act_sizes,
+            ent_coef, 1.0f / float(total), NUM_ATNS, A_total, total);
+    }
     ppo_loss_reduce<<<1, LOSS_N, 0, stream>>>(
         losses_acc, bufs.ppo_partials.data, ppo_grid);
 }

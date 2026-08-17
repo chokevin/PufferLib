@@ -20,6 +20,10 @@ typedef struct Agent {
     float* actions;
     float* rewards;
     float* terminals;
+    // Discrete action mask, one byte per category across all heads.
+    // Zero is illegal, any nonzero value is legal. Masked categories get
+    // exactly zero probability, entropy and gradient, so every head must keep
+    // at least one legal category: an empty head is a fatal runtime error.
     unsigned char* action_mask;
     int policy;
 } Agent;
