@@ -23,6 +23,7 @@ void puf_normal_init(Prec* dst, float std, ulong seed, cudaStream_t stream) {
 #ifdef PUFFER_NETHACK
 #include "../ocean/nethack/nethack.cu"
 #endif
+#include "custom_decoder.cuh"
 #ifdef ENV_ENCODER_HEADER
 #include ENV_ENCODER_HEADER
 #endif
@@ -51,13 +52,4 @@ static void create_custom_encoder(const char* env_name, Encoder* enc) {
         create_osrs_colosseum_encoder(enc);
         return;
     }
-}
-
-static void create_custom_decoder(const char* env_name, Decoder* dec) {
-#ifdef PUFFER_NETHACK
-    if (strcmp(env_name, "nethack") == 0) {
-        create_nethack_decoder(dec);
-        return;
-    }
-#endif
 }

@@ -35,6 +35,7 @@
 #include <unistd.h>
 
 // Project
+#include "checkpoint.h"
 #include "ini.h"
 
 // To investigate: 32f compute? Need to check bf16
@@ -58,6 +59,7 @@ constexpr cublasComputeType_t CUBLAS_COMPUTE = CUBLAS_COMPUTE_32F;
 
 #define PUF_MAX_DIMS 8
 #define BLOCK_SIZE 256
+#define PUF_STRICT_CHECKPOINT_SIZE_V1 1
 int grid_size(int N) {
     return (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 }
@@ -1973,12 +1975,7 @@ void puf_save_weights(PuffeRL* p, const char* path) {
 void puf_load_weights_into(Float dst, Prec params,
         cudaStream_t stream, const char* path) {
     int64_t nbytes = numel(dst.shape) * sizeof(float);
-    FILE* fp = fopen(path, "rb");
-    assert(fp && "failed to open weights for reading");
-    char* buf = (char*)malloc(nbytes);
-    size_t nread = fread(buf, 1, nbytes, fp);
-    fclose(fp);
-    assert((int64_t)nread == nbytes && "failed to read weights");
+    char* buf = puf_read_checkpoint_exact(path, nbytes);
     cudaMemcpy(dst.data, buf, nbytes, cudaMemcpyHostToDevice);
     free(buf);
     if (USE_BF16) {
