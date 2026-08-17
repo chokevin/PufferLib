@@ -1073,6 +1073,7 @@ struct TrainGraph {
     Prec mb_values;      // view: frozen rollout V (vf-clip)
     Prec mb_returns;     // view: aliases mb_gae_v after GAE (V+A)
     Prec mb_action_mask; // view (B, T, mask_size)
+    Float mb_group_logprobs;  // view (B, T, G) float32; grouped modes only
     Prec mb_imp;         // scratch
     Prec mb_gae_v;       // scratch: live V in, overwritten with returns
 };
@@ -1108,11 +1109,49 @@ __device__ __forceinline__ float safe_continuous_logstd(const precision_t* logst
     return finite_or_clamp(to_float(logstd[idx]), -20.0f, 2.0f);
 }
 
+#include "ppo_group.h"
+
+// Core loss channels. Index must match LOSS_NAMES in pufferl.cu.
+// LOSS_* values carry the SELECTED objective (joint or grouped).
 enum LossIdx {
     LOSS_PG = 0, LOSS_VF = 1, LOSS_ENT = 2, LOSS_TOTAL = 3,
     LOSS_OLD_APPROX_KL = 4, LOSS_APPROX_KL = 5, LOSS_CLIPFRAC = 6,
     LOSS_IMP = 7,
-    LOSS_N = 8, NUM_LOSSES = 9,
+    LOSS_N = 8,
+};
+
+// Always-on comparison diagnostics (sum channels; divided by the same epoch
+// count as LOSS_*). Index must match PPO_DIAG_NAMES in pufferl.cu:
+//   ppo/joint_old_kl ppo/joint_kl ppo/joint_clipfrac ppo/joint_importance
+//   ppo/joint_logratio ppo/active_groups ppo/active_heads ppo/logratio_absmean
+enum PpoDiagIdx {
+    DIAG_JOINT_OLD_KL = 0, DIAG_JOINT_KL = 1, DIAG_JOINT_CLIPFRAC = 2,
+    DIAG_JOINT_IMP = 3, DIAG_JOINT_LOGRATIO = 4,
+    DIAG_ACTIVE_GROUPS = 5, DIAG_ACTIVE_HEADS = 6, DIAG_ABS_LOGRATIO = 7,
+    PPO_DIAG_N = 8,
+};
+
+// Numerical-range diagnostics, reduced with max (not sum). Index must match
+// PPO_RANGE_NAMES: ppo/logratio_max ppo/logratio_min ppo/ratio_max.
+// RANGE_NEG_LOGRATIO stores max(-logratio) so the reduce stays a pure max.
+enum PpoRangeIdx {
+    RANGE_LOGRATIO = 0, RANGE_NEG_LOGRATIO = 1, RANGE_RATIO = 2,
+    PPO_RANGE_N = 3,
+};
+
+// Device accumulator layout: [core sums][count][diag sums][range maxima].
+enum {
+    PPO_ACC_COUNT = LOSS_N,
+    PPO_ACC_DIAG = LOSS_N + 1,
+    PPO_ACC_RANGE = LOSS_N + 1 + PPO_DIAG_N,
+    NUM_LOSSES = LOSS_N + 1 + PPO_DIAG_N + PPO_RANGE_N,
+    // Per-block partials: [core][diag][range], no count slot.
+    PPO_PARTIAL_N = LOSS_N + PPO_DIAG_N + PPO_RANGE_N,
+    // Shared-memory channel tile: reused across the three reduce phases so the
+    // default joint path keeps its original shared-memory footprint.
+    PPO_CHAN_N = (int)LOSS_N > (int)PPO_DIAG_N
+        ? ((int)LOSS_N > (int)PPO_RANGE_N ? (int)LOSS_N : (int)PPO_RANGE_N)
+        : ((int)PPO_DIAG_N > (int)PPO_RANGE_N ? (int)PPO_DIAG_N : (int)PPO_RANGE_N),
 };
 
 #ifdef PUFFER_NETHACK
@@ -1141,6 +1180,14 @@ constexpr int ppo_max_head_classes() {
 }
 constexpr int PPO_MAX_HEAD_A = ppo_max_head_classes();
 
+// Grouped kernels keep fixed-size per-thread group arrays. NUM_ATNS is a
+// compile-time env constant, so bound it here instead of using a VLA.
+static_assert(NUM_ATNS >= 1, "NUM_ATNS must be >= 1");
+// Envs with more than PPO_MAX_HEADS heads still build and run joint; grouped
+// modes are rejected for them at startup (ppo_group_config_validate).
+constexpr int PPO_GROUP_CAP = NUM_ATNS < PPO_MAX_GROUPS ? NUM_ATNS : PPO_MAX_GROUPS;
+constexpr int PPO_HEAD_CAP = NUM_ATNS < PPO_MAX_HEADS ? NUM_ATNS : PPO_MAX_HEADS;
+
 // Fused loss function. PPO clipped loss + value + entropy
 // buffers + args are quite complex. We do the entire
 // forward + backwards pass for the full loss function in one kernel
@@ -1151,6 +1198,8 @@ struct PPOGraphArgs {
     const precision_t* advantages;
     const precision_t* values;
     const precision_t* returns;
+    const float* old_group_logprobs;  // (N, T, num_groups); grouped modes only
+    const int* active_heads;  // (N, T) consumed AND stochastic head count
 };
 
 struct PPOKernelArgs {
@@ -1162,6 +1211,10 @@ struct PPOKernelArgs {
     const precision_t* values_pred;
     const int* act_sizes;
     const precision_t* action_mask; // (N, T, A_total); always present
+    const int* group_ids;   // (num_atns,) head -> group; NULL when joint
+    int* err;               // device error flag; checked at host sync points
+    int num_groups;         // 0 when joint
+    int clip_mode;          // PpoClipMode
     int num_atns;
     float clip_coef, vf_clip_coef, vf_coef;
     const float* ent_coef;  // device ptr — host by-value bakes into CUDA graphs
@@ -1172,6 +1225,8 @@ struct PPOKernelArgs {
 struct PPOBufs {
     Float grad_logits, grad_values, grad_logstd;
     Float ppo_partials;
+    Int active_heads;    // (N, T) filled by cache_imp_and_v
+    int* err;            // device error flag (PpoErr); host-checked at sync
     float* ent_coef;     // device scalar (graphs cannot bake host by-value)
 };
 
@@ -1182,8 +1237,9 @@ void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_t
         .grad_logits = {.shape = {N, T, A_total}},
         .grad_values = {.shape = {N, T, 1}},
         .grad_logstd = {.shape = {N, T, A_total}},
-        .ppo_partials = {.shape = {ppo_grid * LOSS_N}},
-        .ent_coef = NULL,
+        .ppo_partials = {.shape = {ppo_grid * PPO_PARTIAL_N}},
+        .active_heads = {.shape = {N, T}},
+        .err = NULL,
     };
     alloc_register(alloc, &bufs.grad_logits);
     alloc_register(alloc, &bufs.grad_values);
@@ -1191,7 +1247,60 @@ void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_t
         alloc_register(alloc, &bufs.grad_logstd);
     }
     alloc_register(alloc, &bufs.ppo_partials);
+    alloc_register(alloc, &bufs.active_heads);
     cudaMalloc((void**)&bufs.ent_coef, sizeof(float));
+    cudaMalloc((void**)&bufs.err, sizeof(int));
+    cudaMemset(bufs.err, 0, sizeof(int));
+}
+
+// Fail closed: keep the first error code any thread reports.
+__device__ __forceinline__ void ppo_set_err(int* err, int code) {
+    if (err != NULL && code != PPO_ERR_NONE) {
+        atomicCAS(err, PPO_ERR_NONE, code);
+    }
+}
+
+// Legal-action count + mask validation over a precision_t mask row.
+__device__ __forceinline__ int ppo_mask_legal_count_prec(
+        const precision_t* __restrict__ mask, int base, int A, int* out) {
+    int legal = 0;
+    for (int a = 0; a < A; a++) {
+        float m = to_float(mask[base + a]);
+        if (!isfinite(m) || (m != 0.0f && m != 1.0f)) {
+            *out = 0;
+            return PPO_ERR_MASK_NOT_BINARY;
+        }
+        legal += m != 0.0f ? 1 : 0;
+    }
+    *out = legal;
+    return legal == 0 ? PPO_ERR_MASK_NO_LEGAL : PPO_ERR_NONE;
+}
+
+// Sampled index must be inside the head and legal under the stored mask.
+__device__ __forceinline__ int ppo_check_action(
+        const precision_t* __restrict__ mask, int base, int A, int act) {
+    if (act < 0 || act >= A) {
+        return PPO_ERR_ACTION_RANGE;
+    }
+    return to_float(mask[base + act]) != 0.0f
+        ? PPO_ERR_NONE : PPO_ERR_ACTION_ILLEGAL;
+}
+
+// Env-conditional consumption. Generic envs consume every head by definition;
+// nethack/KG builds keep their authoritative hooks.
+__device__ __forceinline__ int ppo_head_consumed(
+        const float* __restrict__ actions_row, int h) {
+#if defined(PUFFER_NETHACK)
+    return nethack_head_used((int)actions_row[0], h);
+#elif defined(PUFFER_PROVIDES_PPO_HEAD_USED)
+    return puffer_ppo_head_used(actions_row, h);
+#elif defined(KG_HEAD_GATING_SELECTOR_VALUES)
+    return kg_puffer5_head_used(actions_row, h) ? 1 : 0;
+#else
+    (void)actions_row;
+    (void)h;
+    return 1;
+#endif
 }
 
 // Discrete only. mask is always present (env mask or synthetic all-ones).
@@ -1251,7 +1360,10 @@ __global__ void cache_imp_and_v(
         precision_t* __restrict__ imp_out,
         precision_t* __restrict__ value_out,
         float* __restrict__ logps,
-        float* __restrict__ new_lp_out) {
+        float* __restrict__ new_lp_out,
+        int* __restrict__ active_heads_out,
+        int num_groups,
+        int* __restrict__ err) {
     int NT = (int)dec_out.shape[0] * (int)dec_out.shape[1];
     int fused_cols = (int)dec_out.shape[2];
     int A_total = fused_cols - 1;
@@ -1265,6 +1377,7 @@ __global__ void cache_imp_and_v(
     value_out[idx] = logits[logits_base + A_total];
 
     float new_lp = 0.0f;
+    int n_active_heads = 0;
     if (logstd.data) {
         for (int h = 0; h < NUM_ATNS; ++h) {
             float lp, ent;
@@ -1275,13 +1388,29 @@ __global__ void cache_imp_and_v(
             new_lp += lp;
         }
     } else {
-#ifdef PUFFER_NETHACK
-        int verb = (int)actions[idx * NUM_ATNS];
-#endif
         int logits_offset = 0;
         for (int h = 0; h < NUM_ATNS; ++h) {
             int A = act_sizes[h];
             float cache[PPO_MAX_HEAD_A];
+            int legal = 0;
+            int consumed = ppo_head_consumed(actions + idx * NUM_ATNS, h);
+            if (num_groups > 0) {
+                // Grouped modes require exact masks and valid consumed actions.
+                int code = ppo_mask_legal_count_prec(
+                    action_mask, at_base + logits_offset, A, &legal);
+                if (code == PPO_ERR_NONE && consumed) {
+                    code = ppo_check_action(action_mask, at_base + logits_offset, A,
+                        (int)actions[idx * NUM_ATNS + h]);
+                }
+                ppo_set_err(err, code);
+            } else {
+                // Preserve joint-mode tolerance while still reporting activity.
+                for (int a = 0; a < A; ++a) {
+                    legal += to_float(
+                        action_mask[at_base + logits_offset + a]) != 0.0f;
+                }
+            }
+            n_active_heads += ppo_head_active(consumed, legal);
             float lse = ppo_discrete_logsumexp(
                 logits, logits_base, logits_offset, A,
                 action_mask, at_base, cache);
@@ -1289,8 +1418,7 @@ __global__ void cache_imp_and_v(
                 logps[at_base + logits_offset + a] = cache[a] - lse;
             }
 #if defined(PUFFER_NETHACK)
-            int used = nethack_head_used(verb, h);
-            if (used) {
+            if (ppo_head_consumed(actions + idx * NUM_ATNS, h)) {
                 int act = (int)actions[idx * NUM_ATNS + h];
                 if (h == 0) {
                     float mix = 1.0f;
@@ -1301,17 +1429,19 @@ __global__ void cache_imp_and_v(
                     new_lp += cache[act] - lse;
                 }
             }
-#elif defined(KG_HEAD_GATING_SELECTOR_VALUES)
-            if (kg_puffer5_head_used(actions + idx * NUM_ATNS, h)) {
+#else
+            if (ppo_head_consumed(actions + idx * NUM_ATNS, h)) {
                 new_lp += cache[(int)actions[idx * NUM_ATNS + h]] - lse;
             }
-#else
-            new_lp += cache[(int)actions[idx * NUM_ATNS + h]] - lse;
 #endif
             logits_offset += A;
         }
+        if (num_groups > 0 && n_active_heads == 0) {
+            ppo_set_err(err, PPO_ERR_NO_ACTIVE_FACTORS);
+        }
     }
     new_lp_out[idx] = new_lp;
+    active_heads_out[idx] = n_active_heads;
     imp_out[idx] = from_float(__expf(new_lp - to_float(old_logprobs[idx])));
 }
 
@@ -1319,7 +1449,8 @@ Prec arch_forward_train(Arch* p, Weights& w,
         Activations& activations, Prec x,
         Prec state, Prec terminals, int agent_off,
         TrainGraph& g, Prec logstd, int* act_sizes,
-        float* logps, float* new_lp, cudaStream_t stream) {
+        float* logps, float* new_lp, int* active_heads, int num_groups, int* err,
+        cudaStream_t stream) {
     int B = x.shape[0], TT = x.shape[1];
     Prec h = p->encoder.forward(w.encoder,
         activations.encoder, *puf_squeeze(&x, 0), stream);
@@ -1330,8 +1461,29 @@ Prec arch_forward_train(Arch* p, Weights& w,
     Prec dec = *puf_unsqueeze(&dec_out, 0, B, TT);
     cache_imp_and_v<<<grid_size(B * TT), BLOCK_SIZE, 0, stream>>>(
         dec, g.mb_actions.data, g.mb_logprobs.data, g.mb_action_mask.data,
-        logstd, act_sizes, g.mb_imp.data, g.mb_gae_v.data, logps, new_lp);
+        logstd, act_sizes, g.mb_imp.data, g.mb_gae_v.data, logps, new_lp,
+        active_heads, num_groups, err);
     return dec;
+}
+
+// Deterministic block tree-reduce with max. Mirrors block_reduce_sum layout.
+__device__ __forceinline__ void ppo_block_reduce_max(
+        float* smem, float* out, int tid, int nthreads, int nchan) {
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            for (int c = 0; c < nchan; c++) {
+                smem[c * nthreads + tid] = fmaxf(smem[c * nthreads + tid],
+                    smem[c * nthreads + tid + s]);
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        for (int c = 0; c < nchan; c++) {
+            out[c] = smem[c * nthreads];
+        }
+    }
 }
 
 __global__ void ppo_loss_compute(
@@ -1342,9 +1494,18 @@ __global__ void ppo_loss_compute(
     int total_elements = a.N * a.T_seq;
     float inv_NT = 1.0f / float(total_elements);
 
-    __shared__ float block_losses[LOSS_N][PPO_THREADS];
+    __shared__ float block_chan[PPO_CHAN_N][PPO_THREADS];
+    float core[LOSS_N];
+    float diag[PPO_DIAG_N];
+    float range[PPO_RANGE_N];
     for (int c = 0; c < LOSS_N; c++) {
-        block_losses[c][tid] = 0.0f;
+        core[c] = 0.0f;
+    }
+    for (int c = 0; c < PPO_DIAG_N; c++) {
+        diag[c] = 0.0f;
+    }
+    for (int c = 0; c < PPO_RANGE_N; c++) {
+        range[c] = -INFINITY;
     }
 
     if (idx < total_elements) {
@@ -1370,19 +1531,31 @@ __global__ void ppo_loss_compute(
         float v_loss = 0.5f * fmaxf(v_loss_unclipped, v_loss_clipped);
         float d_val_pred = (v_loss_clipped > v_loss_unclipped) ? 0.0f : (val_pred - ret);
         a.grad_values_pred[nt] = inv_NT * a.vf_coef * d_val_pred;
+        bool joint = a.clip_mode == PPO_CLIP_JOINT;
         float clip_lo = 1.0f - a.clip_coef;
         float clip_hi = 1.0f + a.clip_coef;
         float ratio_clipped = fmaxf(clip_lo, fminf(clip_hi, ratio));
         float wa = -adv_for_pg;
         float pg_loss1 = wa * ratio;
         float pg_loss2 = wa * ratio_clipped;
-        float pg_loss = fmaxf(pg_loss1, pg_loss2);
+        float pg_loss = joint ? fmaxf(pg_loss1, pg_loss2) : 0.0f;
         float d_ratio = wa * inv_NT;
         if (pg_loss2 > pg_loss1 && (ratio <= clip_lo || ratio >= clip_hi)) {
             d_ratio = 0.0f;
         }
         float d_new_logp = d_ratio * ratio;
         float total_entropy = 0.0f;
+        // Selected-objective statistics; joint fills them from the scalar path.
+        float sel_old_kl = -logratio;
+        float sel_kl = (ratio - 1.0f) - logratio;
+        float sel_clipfrac = fabsf(ratio - 1.0f) > a.clip_coef ? 1.0f : 0.0f;
+        float sel_imp = ratio;
+        float sel_abs_logratio = fabsf(logratio);
+        float sel_lr_max = logratio;
+        float sel_lr_min = logratio;
+        float sel_ratio_max = ratio;
+        float active_groups = 1.0f;
+        float active_heads = (float)(a.is_continuous ? 0 : g.active_heads[nt]);
 
         if (a.is_continuous) {
             for (int h = 0; h < a.num_atns; ++h) {
@@ -1400,32 +1573,20 @@ __global__ void ppo_loss_compute(
                 a.grad_logstd[nt * a.num_atns + h] =
                     d_new_logp * (diff * diff / var - 1.0f) + d_entropy_term;
             }
-        } else {
+        } else if (joint) {
 #ifdef PUFFER_NETHACK
-            int verb = (int)g.actions[nt * a.num_atns];
             float verb_mix_scale = 1.0f;
 #endif
             int logits_offset = 0;
             for (int h = 0; h < a.num_atns; ++h) {
                 int A = a.act_sizes[h];
-#ifdef PUFFER_NETHACK
-                if (!nethack_head_used(verb, h)) {
+                if (!ppo_head_consumed(g.actions + nt * a.num_atns, h)) {
                     for (int j = 0; j < A; ++j) {
                         a.grad_logits[at_base + logits_offset + j] = 0.0f;
                     }
                     logits_offset += A;
                     continue;
                 }
-#elif defined(KG_HEAD_GATING_SELECTOR_VALUES)
-                if (!kg_puffer5_head_used(
-                        g.actions + nt * a.num_atns, h)) {
-                    for (int j = 0; j < A; ++j) {
-                        a.grad_logits[at_base + logits_offset + j] = 0.0f;
-                    }
-                    logits_offset += A;
-                    continue;
-                }
-#endif
                 int act = (int)g.actions[nt * a.num_atns + h];
                 float ent = 0.0f;
                 for (int j = 0; j < A; ++j) {
@@ -1454,39 +1615,163 @@ __global__ void ppo_loss_compute(
                 }
                 logits_offset += A;
             }
+        } else {
+            // Grouped clipping. Factors are groups (per_head uses identity
+            // grouping). A head contributes only when the env consumed it and
+            // its legal-mask cardinality is > 1; log-ratios are summed inside
+            // one original transition, so no group can span a transition.
+            // All mask/precision-dependent work happens here; the objective
+            // itself is ppo_group_row_apply, shared with the host tests.
+            const float* act_row = g.actions + nt * a.num_atns;
+            int legal_count[PPO_HEAD_CAP];
+            int consumed[PPO_HEAD_CAP];
+            int logits_offset = 0;
+#ifdef PUFFER_NETHACK
+            float head_lp_mix[PPO_HEAD_CAP];
+            float head_grad_scale[PPO_HEAD_CAP];
+#endif
+            for (int h = 0; h < a.num_atns; ++h) {
+                int A = a.act_sizes[h];
+                int legal = 0;
+                ppo_set_err(a.err, ppo_mask_legal_count_prec(
+                    a.action_mask, at_base + logits_offset, A, &legal));
+                legal_count[h] = legal;
+                consumed[h] = ppo_head_consumed(act_row, h);
+#ifdef PUFFER_NETHACK
+                // Verb-eps mixing stays authoritative for head 0.
+                float scale = 1.0f;
+                int act_i = (int)act_row[h];
+                act_i = act_i < 0 || act_i >= A ? 0 : act_i;  // validated in cache_imp_and_v
+                float lp = a.grad_logits[at_base + logits_offset + act_i];
+                head_lp_mix[h] = h == 0
+                    ? nethack_verb_train_logp(
+                        a.action_mask + at_base + logits_offset, A, lp, &scale)
+                    : lp;
+                head_grad_scale[h] = h == 0 ? scale : 1.0f;
+#endif
+                logits_offset += A;
+            }
+
+            PpoGroupRowInput in;
+            in.num_atns = a.num_atns;
+            in.num_groups = a.num_groups;
+            in.mode = a.clip_mode;
+            in.act_sizes = a.act_sizes;
+            in.group_ids = a.group_ids;
+            in.legal_count = legal_count;
+            in.consumed = consumed;
+            in.actions = act_row;
+            in.old_group_lp = g.old_group_logprobs + nt * a.num_groups;
+#ifdef PUFFER_NETHACK
+            in.head_lp_mix = head_lp_mix;
+            in.head_grad_scale = head_grad_scale;
+#else
+            in.head_lp_mix = NULL;
+            in.head_grad_scale = NULL;
+#endif
+            in.adv = adv_for_pg;
+            in.clip_coef = a.clip_coef;
+            in.ent_coef = ent_coef;
+            in.inv_nt = inv_NT;
+
+            PpoGroupStats st;
+            int n_active_heads = 0;
+            int code = ppo_group_row_apply<PPO_GROUP_CAP>(
+                &in, a.grad_logits + at_base, &st, &total_entropy,
+                &n_active_heads);
+            ppo_set_err(a.err, code);
+            pg_loss = st.pg_loss;
+            sel_old_kl = st.old_kl;
+            sel_kl = st.kl;
+            sel_clipfrac = st.clipfrac;
+            sel_imp = st.importance;
+            sel_abs_logratio = st.abs_logratio;
+            active_groups = (float)st.active_groups;
+            active_heads = (float)n_active_heads;
+            if (code == PPO_ERR_NONE) {
+                sel_lr_max = st.logratio_max;
+                sel_lr_min = st.logratio_min;
+                sel_ratio_max = st.ratio_max;
+            } else {
+                sel_lr_max = 0.0f;
+                sel_lr_min = 0.0f;
+                sel_ratio_max = 0.0f;
+            }
         }
 
         float thread_loss = (pg_loss + a.vf_coef * v_loss
             - ent_coef * total_entropy) * inv_NT;
+        if (!joint && !isfinite(thread_loss)) {
+            ppo_set_err(a.err, PPO_ERR_NONFINITE);
+        }
 
-        block_losses[LOSS_PG][tid] = pg_loss * inv_NT;
-        block_losses[LOSS_VF][tid] = v_loss * inv_NT;
-        block_losses[LOSS_ENT][tid] = total_entropy * inv_NT;
-        block_losses[LOSS_TOTAL][tid] = thread_loss;
-        block_losses[LOSS_OLD_APPROX_KL][tid] = (-logratio) * inv_NT;
-        block_losses[LOSS_APPROX_KL][tid] = ((ratio - 1.0f) - logratio) * inv_NT;
-        block_losses[LOSS_CLIPFRAC][tid] =
+        core[LOSS_PG] = pg_loss * inv_NT;
+        core[LOSS_VF] = v_loss * inv_NT;
+        core[LOSS_ENT] = total_entropy * inv_NT;
+        core[LOSS_TOTAL] = thread_loss;
+        core[LOSS_OLD_APPROX_KL] = sel_old_kl * inv_NT;
+        core[LOSS_APPROX_KL] = sel_kl * inv_NT;
+        core[LOSS_CLIPFRAC] = sel_clipfrac * inv_NT;
+        core[LOSS_IMP] = sel_imp * inv_NT;
+
+        // Legacy joint geometry, always emitted for objective comparison.
+        diag[DIAG_JOINT_OLD_KL] = (-logratio) * inv_NT;
+        diag[DIAG_JOINT_KL] = ((ratio - 1.0f) - logratio) * inv_NT;
+        diag[DIAG_JOINT_CLIPFRAC] =
             (fabsf(ratio - 1.0f) > a.clip_coef ? 1.0f : 0.0f) * inv_NT;
-        block_losses[LOSS_IMP][tid] = ratio * inv_NT;
+        diag[DIAG_JOINT_IMP] = ratio * inv_NT;
+        diag[DIAG_JOINT_LOGRATIO] = logratio * inv_NT;
+        diag[DIAG_ACTIVE_GROUPS] = active_groups * inv_NT;
+        diag[DIAG_ACTIVE_HEADS] = active_heads * inv_NT;
+        diag[DIAG_ABS_LOGRATIO] = sel_abs_logratio * inv_NT;
+
+        range[RANGE_LOGRATIO] = sel_lr_max;
+        range[RANGE_NEG_LOGRATIO] = -sel_lr_min;
+        range[RANGE_RATIO] = sel_ratio_max;
     }
 
-    block_reduce_sum(&block_losses[0][0], &ppo_partials[blockIdx.x * LOSS_N],
-        tid, PPO_THREADS, LOSS_N);
+    float* out = &ppo_partials[blockIdx.x * PPO_PARTIAL_N];
+    for (int c = 0; c < LOSS_N; c++) {
+        block_chan[c][tid] = core[c];
+    }
+    block_reduce_sum(&block_chan[0][0], out, tid, PPO_THREADS, LOSS_N);
+    __syncthreads();
+    for (int c = 0; c < PPO_DIAG_N; c++) {
+        block_chan[c][tid] = diag[c];
+    }
+    block_reduce_sum(&block_chan[0][0], out + LOSS_N, tid, PPO_THREADS,
+        PPO_DIAG_N);
+    __syncthreads();
+    for (int c = 0; c < PPO_RANGE_N; c++) {
+        block_chan[c][tid] = range[c];
+    }
+    ppo_block_reduce_max(&block_chan[0][0], out + LOSS_N + PPO_DIAG_N, tid,
+        PPO_THREADS, PPO_RANGE_N);
 }
 
-// Deterministic reduction of per-block PPO loss partials + count increment
+// Deterministic reduction of per-block PPO partials + count increment.
+// Accumulator layout: [core sums][count][diag sums][range maxima].
 __global__ void ppo_loss_reduce(
         float* __restrict__ losses_acc,
         const float* __restrict__ partials,
         int num_blocks) {
     int tid = threadIdx.x;
-    float sum = 0.0f;
-    for (int b = 0; b < num_blocks; b++) {
-        sum += partials[b * LOSS_N + tid];
+    if (tid < LOSS_N + PPO_DIAG_N) {
+        float sum = 0.0f;
+        for (int b = 0; b < num_blocks; b++) {
+            sum += partials[b * PPO_PARTIAL_N + tid];
+        }
+        int dst = tid < LOSS_N ? tid : tid + 1;  // skip the count slot
+        losses_acc[dst] += sum;
+    } else if (tid < PPO_PARTIAL_N) {
+        float m = -INFINITY;
+        for (int b = 0; b < num_blocks; b++) {
+            m = fmaxf(m, partials[b * PPO_PARTIAL_N + tid]);
+        }
+        losses_acc[tid + 1] = fmaxf(losses_acc[tid + 1], m);
     }
-    losses_acc[tid] += sum;
     if (tid == 0) {
-        losses_acc[LOSS_N] += 1.0f;
+        losses_acc[PPO_ACC_COUNT] += 1.0f;
     }
 }
 
@@ -1497,6 +1782,7 @@ void ppo_loss_fwd_bwd(
         int* act_sizes, float* losses_acc,
         float clip_coef, float vf_clip_coef, float vf_coef, const float* ent_coef,
         PPOBufs& bufs, bool is_continuous,
+        int clip_mode, const int* group_ids, int num_groups,
         cudaStream_t stream) {
     int N = dec_out.shape[0], T = dec_out.shape[1], fused_cols = dec_out.shape[2];
     int A_total = fused_cols - 1;  // last column is value
@@ -1510,6 +1796,8 @@ void ppo_loss_fwd_bwd(
         .advantages = graph.mb_advantages.data,
         .values = graph.mb_values.data,
         .returns = graph.mb_returns.data,
+        .old_group_logprobs = graph.mb_group_logprobs.data,
+        .active_heads = bufs.active_heads.data,
     };
 
     PPOKernelArgs args = {
@@ -1521,6 +1809,10 @@ void ppo_loss_fwd_bwd(
         .values_pred = dec_out.data + A_total,
         .act_sizes = act_sizes,
         .action_mask = graph.mb_action_mask.data,
+        .group_ids = group_ids,
+        .err = bufs.err,
+        .num_groups = num_groups,
+        .clip_mode = clip_mode,
         .num_atns = NUM_ATNS,
         .clip_coef = clip_coef, .vf_clip_coef = vf_clip_coef,
         .vf_coef = vf_coef,
@@ -1530,7 +1822,7 @@ void ppo_loss_fwd_bwd(
     };
     ppo_loss_compute<<<ppo_grid, PPO_THREADS, 0, stream>>>(
             bufs.ppo_partials.data, args, graph_args);
-    ppo_loss_reduce<<<1, LOSS_N, 0, stream>>>(
+    ppo_loss_reduce<<<1, PPO_PARTIAL_N, 0, stream>>>(
         losses_acc, bufs.ppo_partials.data, ppo_grid);
 }
 

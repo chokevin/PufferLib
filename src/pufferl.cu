@@ -319,6 +319,10 @@ typedef struct {
     bool vtrace;
     float vtrace_rho_clip;
     float vtrace_c_clip;
+    // Grouped PPO clipping. joint (default) keeps the legacy scalar path.
+    int ppo_clip_mode;                  // PpoClipMode
+    int ppo_num_groups;                 // 0 when joint
+    int ppo_group_ids[PPO_MAX_HEADS];   // head -> group; -1 when unused
     bool async;
     bool reset_every_horizon;
     bool cudagraphs;
@@ -356,13 +360,17 @@ struct RolloutBuf {
     Prec rewards;
     Prec terminals;
     Prec action_mask;   // (horizon, agents, mask_size)
+    // Grouped PPO only: per-group old log-prob sums over ACTIVE member heads.
+    // float32 (never bf16): these are differences-of-sums at train time.
+    Float group_logprobs;  // (horizon, agents, num_groups); null when joint
 };
 
 // Buffers are initialized as raw structs with only shape information.
 // alloc_register stores the shape and data pointer.
 // Memory is only allocated after all buffers are registered.
 void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
-        int T, int B, int input_size, int num_atns, int mask_size) {
+        int T, int B, int input_size, int num_atns, int mask_size,
+        int num_groups) {
     memset(bufs, 0, sizeof(*bufs));
     bufs->observations = {.shape = {T, B, input_size}};
     bufs->actions      = {.shape = {T, B, num_atns}};
@@ -379,6 +387,10 @@ void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
         alloc_register(alloc, prec_fields[i]);
     }
     alloc_register(alloc, &bufs->actions);
+    if (num_groups > 0) {
+        bufs->group_logprobs = {.shape = {T, B, num_groups}};
+        alloc_register(alloc, &bufs->group_logprobs);
+    }
 }
 
 // Rank-2 or rank-3 time-major tensor. F==0 means rank-2 (zero-terminated shape);
@@ -412,6 +424,9 @@ RolloutBuf rollout_time_view(RolloutBuf* base, int start_t, int T) {
     view.rewards      = puf_time_view(base->rewards,      start_t, T);
     view.terminals    = puf_time_view(base->terminals,    start_t, T);
     view.action_mask  = puf_time_view(base->action_mask,  start_t, T);
+    if (base->group_logprobs.data != NULL) {
+        view.group_logprobs = puf_time_view(base->group_logprobs, start_t, T);
+    }
     return view;
 }
 
@@ -514,6 +529,55 @@ const char* LOSS_NAMES[] = {
     "importance",
 };
 
+// Index must match PpoDiagIdx in algo.cu. Always emitted so any run can be
+// compared against legacy joint geometry.
+const char* PPO_DIAG_NAMES[] = {
+    "ppo/joint_old_kl",
+    "ppo/joint_kl",
+    "ppo/joint_clipfrac",
+    "ppo/joint_importance",
+    "ppo/joint_logratio",
+    "ppo/active_groups",
+    "ppo/active_heads",
+    "ppo/logratio_absmean",
+};
+
+// Index must match PpoRangeIdx in algo.cu (max-reduced, not averaged).
+// RANGE_NEG_LOGRATIO is negated at emit time to give the true minimum.
+const char* PPO_RANGE_NAMES[] = {
+    "ppo/logratio_max",
+    "ppo/logratio_min",
+    "ppo/ratio_max",
+};
+
+// Host-side reset image for the device loss accumulator: sums/count zero,
+// range channels -inf so the first max is not biased toward 0.
+static void ppo_losses_reset(float* d_losses, cudaStream_t stream) {
+    static float init[NUM_LOSSES];
+    static bool ready = false;
+    if (!ready) {
+        for (int i = 0; i < NUM_LOSSES; i++) {
+            init[i] = i >= PPO_ACC_RANGE ? -INFINITY : 0.0f;
+        }
+        ready = true;
+    }
+    cudaMemcpyAsync(d_losses, init, sizeof(init), cudaMemcpyHostToDevice, stream);
+}
+
+// Fail closed on any device-side PPO error. Called at host sync boundaries.
+static void ppo_check_err(int* d_err, const char* where) {
+    if (d_err == NULL) {
+        return;
+    }
+    int code = PPO_ERR_NONE;
+    cudaMemcpy(&code, d_err, sizeof(int), cudaMemcpyDeviceToHost);
+    if (code != PPO_ERR_NONE) {
+        fprintf(stderr, "fatal: PPO %s error %d: %s\n", where, code,
+            ppo_err_name(code));
+        exit(1);
+    }
+}
+
 typedef struct {
     cudaEvent_t events[2][NUM_TE];  // per async slot; recorded inside the train graph
     cudaEvent_t* rollout_ev;  // GPU [EV_T * horizon]; null on CPU
@@ -547,6 +611,8 @@ typedef struct PuffeRL {
     cudaStream_t default_stream;  // main-thread stream (captured once at init)
     cudaStream_t train_stream;    // dedicated learner stream (always non-default)
     int* act_sizes;        // device ACT_SIZES (NUM_ATNS ints)
+    int* ppo_group_ids_dev;  // device head->group map (NUM_ATNS ints); NULL when joint
+    int* ppo_err;          // device PpoErr flag shared by rollout + train kernels
     float* losses;         // device loss accumulator (NUM_LOSSES)
     PPOBufs ppo_bufs; // Pre-allocated buffers for ppo_loss_fwd_bwd
     Prec actor_param;      // async flat actor params
@@ -602,7 +668,11 @@ __global__ void sample_logits(
         precision_t* value_out,               // (B,)
         curandStatePhilox4_32_10_t* rng_states,
         precision_t* action_mask,             // (B, A_total); always allocated
-        int mask_stride) {
+        int mask_stride,
+        float* group_logprobs,                // (B, num_groups); NULL when joint
+        const int* group_ids,                 // (NUM_ATNS,); NULL when joint
+        int num_groups,
+        int* err) {
     int B = dec_out.shape[0];
     int fused_cols = dec_out.shape[1];
     int num_atns = NUM_ATNS;
@@ -618,6 +688,11 @@ __global__ void sample_logits(
     curandStatePhilox4_32_10_t state = rng_states[idx];
     int logits_base = idx * fused_cols;
     float total_log_prob = 0.0f;
+    // Grouped modes accumulate old log-prob sums over ACTIVE member heads.
+    float group_lp[PPO_GROUP_CAP];
+    for (int gg = 0; gg < num_groups; gg++) {
+        group_lp[gg] = 0.0f;
+    }
 
     if (is_continuous) {
         for (int h = 0; h < num_atns; h++) {
@@ -642,6 +717,12 @@ __global__ void sample_logits(
         for (int h = 0; h < num_atns; h++) {
             int A = act_sizes[h];
             float cache[PPO_MAX_HEAD_A];
+            int legal = 0;
+            if (num_groups > 0) {
+                // Grouped activity depends on exact legal-mask cardinality.
+                ppo_set_err(err, ppo_mask_legal_count_prec(
+                    action_mask, mask_base + logits_offset, A, &legal));
+            }
             float logsumexp = ppo_discrete_logsumexp(
                 logits, logits_base, logits_offset, A, action_mask, mask_base, cache);
 #ifdef PUFFER_NETHACK
@@ -684,9 +765,7 @@ __global__ void sample_logits(
             actions[aidx] = action;
             env_actions[aidx] = action;
 #if defined(PUFFER_NETHACK)
-            int verb = (int)actions[idx * num_atns];
-            int used = nethack_head_used(verb, h);
-            if (used) {
+            if (ppo_head_consumed(actions + idx * num_atns, h)) {
                 if (eps > 0.0f) {
                     total_log_prob += logf((1.0f - eps)
                         * expf(cache[sampled] - logsumexp) + eps * inv_K);
@@ -694,17 +773,31 @@ __global__ void sample_logits(
                     total_log_prob += cache[sampled] - logsumexp;
                 }
             }
-#elif defined(KG_HEAD_GATING_SELECTOR_VALUES)
-            if (kg_puffer5_head_used(actions + idx * num_atns, h)) {
+#else
+            if (ppo_head_consumed(actions + idx * num_atns, h)) {
                 total_log_prob += cache[sampled] - logsumexp;
             }
-#else
-            total_log_prob += cache[sampled] - logsumexp;
 #endif
+            if (num_groups > 0
+                    && ppo_head_active(
+                        ppo_head_consumed(actions + idx * num_atns, h), legal)) {
+                float head_lp = cache[sampled] - logsumexp;
+#ifdef PUFFER_NETHACK
+                if (h == 0 && eps > 0.0f) {
+                    head_lp = logf((1.0f - eps) * expf(head_lp) + eps * inv_K);
+                }
+#endif
+                group_lp[group_ids[h]] += head_lp;
+            }
             logits_offset += A;
         }
     }
 
+    if (num_groups > 0) {
+        for (int gg = 0; gg < num_groups; gg++) {
+            group_logprobs[idx * num_groups + gg] = group_lp[gg];
+        }
+    }
     logprobs[idx] = from_float(total_log_prob);
     value_out[idx] = logits[logits_base + fused_cols - 1];
     rng_states[idx] = state;
@@ -880,15 +973,28 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
 
         // Offset RNG by off so policies don't collide on per-buffer rng slots.
 #ifdef ENV_SAMPLE_LOGITS
+        // Env-provided sampler: joint-only (grouped is rejected at startup).
         ENV_SAMPLE_LOGITS<<<n, BLOCK_SIZE, 0, stream>>>(
-#else
-        sample_logits<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
-#endif
             dec, p_logstd, pufferl->act_sizes,
             act_b.data, env->actions.data + (long)sub * act_cols,
             lp_b.data, val_b.data,
             pufferl->rng_states[buf] + off,
             mask_b.data, mask_stride);
+#else
+        int num_groups = pufferl->hypers.ppo_num_groups;
+        float* group_lp = NULL;
+        if (num_groups > 0) {
+            group_lp = puf_slice(rollouts.group_logprobs, t, sub, n).data;
+        }
+        sample_logits<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+            dec, p_logstd, pufferl->act_sizes,
+            act_b.data, env->actions.data + (long)sub * act_cols,
+            lp_b.data, val_b.data,
+            pufferl->rng_states[buf] + off,
+            mask_b.data, mask_stride,
+            group_lp, pufferl->ppo_group_ids_dev, num_groups,
+            pufferl->ppo_err);
+#endif
     }
 }
 
@@ -1295,6 +1401,7 @@ static void rollout_start(PuffeRL* p) {
 void rollout_finish(PuffeRL* p, double t0) {
     if (PUF_BACKEND == PUF_GPU) {
         cudaStreamSynchronize(p->streams[0]);
+        ppo_check_err(p->ppo_err, "rollout");
         float model_ms = 0.0f, env_ms = 0.0f, ms;
         cudaEvent_t* ev = p->profile.rollout_ev;
         if (p->profile.skip_rollout_time) {
@@ -1323,6 +1430,7 @@ void rollout_finish(PuffeRL* p, double t0) {
         int* state = &p->vec->worker_state[buf];
         while (__atomic_load_n(state, __ATOMIC_SEQ_CST) != BUF_WAITING) {}
     }
+    ppo_check_err(p->ppo_err, "rollout");
     float sec = (float)(wall_clock() - t0);
     p->profile.accum[PROF_ROLLOUT] += sec * 1000.0f;
     float eval_prof[NUM_PROF] = {0};
@@ -1522,6 +1630,13 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
     transpose_primary_102<<<grid_size(T * train_agents * mask_c), BLOCK_SIZE, 0, stream>>>(
         rollouts->action_mask.data, src.action_mask.data, T, B, mask_c,
         agents_per_buf, primary_start, primary_count);
+    int num_groups = hypers->ppo_num_groups;
+    if (num_groups > 0) {
+        transpose_primary_102<<<grid_size(T * train_agents * num_groups),
+            BLOCK_SIZE, 0, stream>>>(
+            rollouts->group_logprobs.data, src.group_logprobs.data,
+            T, B, num_groups, agents_per_buf, primary_start, primary_count);
+    }
 
     clamp_precision_kernel<<<grid_size(
         numel(rollouts->rewards.shape)), BLOCK_SIZE, 0, stream>>>(
@@ -1558,6 +1673,10 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         graph.mb_rewards = slice_rows(rollouts->rewards, dest_off, Nmb);
         graph.mb_values = slice_rows(rollouts->values, dest_off, Nmb);
         graph.mb_action_mask = slice_rows(rollouts->action_mask, dest_off, Nmb);
+        if (num_groups > 0) {
+            graph.mb_group_logprobs = slice_rows(
+                rollouts->group_logprobs, dest_off, Nmb);
+        }
         graph.mb_state = pufferl->train_state;
         DecoderWeights* dw_train = (DecoderWeights*)primary->weights.decoder;
         Prec p_logstd = {};
@@ -1568,7 +1687,9 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             pufferl->train_activs, graph.mb_obs, graph.mb_state,
             graph.mb_terminals, dest_off, graph, p_logstd,
             pufferl->act_sizes, pufferl->ppo_bufs.grad_logits.data,
-            pufferl->ppo_bufs.grad_values.data, stream);
+            pufferl->ppo_bufs.grad_values.data,
+            pufferl->ppo_bufs.active_heads.data, hypers->ppo_num_groups,
+            pufferl->ppo_err, stream);
         puff_advantage<<<adv_grid, ADV_THREADS, 0, stream>>>(
             graph.mb_gae_v.data, graph.mb_rewards.data,
             graph.mb_terminals.data,
@@ -1582,7 +1703,9 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             pufferl->act_sizes, pufferl->losses,
             hypers->clip_coef, hypers->vf_clip_coef, hypers->vf_coef,
             pufferl->ppo_bufs.ent_coef,
-            pufferl->ppo_bufs, pufferl->is_continuous, stream);
+            pufferl->ppo_bufs, pufferl->is_continuous,
+            hypers->ppo_clip_mode, pufferl->ppo_group_ids_dev,
+            hypers->ppo_num_groups, stream);
 
         Float grad_logits = pufferl->ppo_bufs.grad_logits;
         Float grad_logstd = pufferl->is_continuous
@@ -1673,6 +1796,7 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
     profile_end(hypers->profile);
 
     cudaStreamSynchronize(train_stream);
+    ppo_check_err(pufferl->ppo_err, "train");
 
     if (total_minibatches > 0 && !first) {
         float ms;
@@ -1909,6 +2033,44 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         && "mixed continuous/discrete action spaces not supported");
     bool is_continuous = n_cont > 0;
     pufferl->is_continuous = is_continuous;
+
+    // Grouped PPO config: validated BEFORE any allocation so bad mappings,
+    // modes, action spaces or shapes never reach the kernels.
+    {
+        char cfg_err[512];
+        int mode = PPO_CLIP_JOINT;
+        int num_groups = 0;
+        int ids[PPO_MAX_HEADS];
+        if (!ppo_group_config_validate(
+                puf_ini_get_str(ini, "train", "ppo_clip_mode"),
+                puf_ini_get_str(ini, "train", "ppo_group_ids"),
+                num_action_heads, act_sizes, is_continuous ? 1 : 0,
+                hypers.vtrace ? 1 : 0, PPO_MAX_HEAD_A,
+                &mode, ids, &num_groups, cfg_err, sizeof(cfg_err))) {
+            fprintf(stderr, "config error: %s\n", cfg_err);
+            exit(1);
+        }
+#ifdef ENV_SAMPLE_LOGITS
+        if (mode != PPO_CLIP_JOINT) {
+            fprintf(stderr, "config error: train.ppo_clip_mode=%s requires the "
+                "built-in sampler; this env overrides ENV_SAMPLE_LOGITS\n",
+                ppo_clip_mode_name(mode));
+            exit(1);
+        }
+#endif
+        hypers.ppo_clip_mode = mode;
+        hypers.ppo_num_groups = num_groups;
+        for (int i = 0; i < PPO_MAX_HEADS; i++) {
+            hypers.ppo_group_ids[i] =
+                i < num_action_heads && i < PPO_MAX_HEADS ? ids[i] : -1;
+        }
+        pufferl->hypers = hypers;
+        if (num_groups > 0) {
+            printf("PPO clip mode: %s (%d factor%s over %d head%s)\n",
+                ppo_clip_mode_name(mode), num_groups, num_groups == 1 ? "" : "s",
+                num_action_heads, num_action_heads == 1 ? "" : "s");
+        }
+    }
     vec->num_policies = num_policies;
     vec->policy_layout = (int*)calloc(1, (vec->num_policies + 1) * sizeof(int));
     vec->mask_size = act_n;
@@ -2031,7 +2193,8 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     pufferl->async_num_slots = async_slots;
     int rollout_horizon = async_slots * horizon;
     register_rollout_buffers(&pufferl->rollouts,
-        acts, rollout_horizon, total_agents, input_size, num_action_heads, act_n);
+        acts, rollout_horizon, total_agents, input_size, num_action_heads,
+        act_n, hypers.ppo_num_groups);
     // Carry path: per-slot initial RNN states. reset_every_horizon zeros train_state.
     if (!hypers.reset_every_horizon) {
         pufferl->rollouts.initial_states = {
@@ -2040,9 +2203,13 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     }
     register_train_buffers(pufferl->train_buf, acts, minibatch_segments, horizon);
     register_rollout_buffers(&pufferl->train_rollouts,
-        acts, pufferl->train_agents, horizon, input_size, num_action_heads, act_n);
+        acts, pufferl->train_agents, horizon, input_size, num_action_heads,
+        act_n, hypers.ppo_num_groups);
     register_ppo_buffers(pufferl->ppo_bufs, acts, minibatch_segments,
         hypers.horizon, decoder_output_size, is_continuous);
+    // One shared device error flag for the rollout sampler, the train cache
+    // kernel and the loss kernel, checked at every host sync boundary.
+    pufferl->ppo_err = pufferl->ppo_bufs.err;
     pufferl->train_state = {
         .shape = {num_layers, pufferl->train_agents, hidden_size}};
     alloc_register(acts, &pufferl->train_state);
@@ -2051,6 +2218,12 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     cudaMemset(pufferl->rng_offset, 0, (num_buffers + 1) * sizeof(long));
     cudaMalloc((void**)&pufferl->act_sizes, num_action_heads * sizeof(int));
     cudaMalloc((void**)&pufferl->losses, NUM_LOSSES * sizeof(float));
+    if (hypers.ppo_num_groups > 0) {
+        cudaMalloc((void**)&pufferl->ppo_group_ids_dev,
+            num_action_heads * sizeof(int));
+        cudaMemcpy(pufferl->ppo_group_ids_dev, hypers.ppo_group_ids,
+            num_action_heads * sizeof(int), cudaMemcpyHostToDevice);
+    }
 
     muon_init(&pufferl->muon, &primary->params_alloc, hypers.momentum, acts);
 
@@ -2109,7 +2282,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     // Post-create initialization
     cudaMemcpy(pufferl->act_sizes, act_sizes,
         num_action_heads*sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemset(pufferl->losses, 0, NUM_LOSSES * sizeof(float));
+    ppo_losses_reset(pufferl->losses, pufferl->default_stream);
     cudaMemcpy(pufferl->muon.lr, &hypers.lr, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemset(pufferl->muon.mb.data, 0, numel(pufferl->muon.mb.shape) * sizeof(float));
 
@@ -3597,11 +3770,29 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         float losses_host[NUM_LOSSES];
         cudaMemcpy(losses_host, pufferl->losses, sizeof(losses_host),
             cudaMemcpyDeviceToHost);
-        float inv_n = losses_host[LOSS_N] > 0 ? 1.0f / losses_host[LOSS_N] : 0.0f;
+        float inv_n = losses_host[PPO_ACC_COUNT] > 0
+            ? 1.0f / losses_host[PPO_ACC_COUNT] : 0.0f;
         for (int i = 0; i < LOSS_N; i++) {
             dict_set(&new_log, LOSS_NAMES[i], losses_host[i] * inv_n);
         }
-        cudaMemset(pufferl->losses, 0, NUM_LOSSES * sizeof(float));
+        // Always-on grouped/joint comparison diagnostics.
+        for (int i = 0; i < PPO_DIAG_N; i++) {
+            dict_set(&new_log, PPO_DIAG_NAMES[i],
+                losses_host[PPO_ACC_DIAG + i] * inv_n);
+        }
+        for (int i = 0; i < PPO_RANGE_N; i++) {
+            float v = losses_host[PPO_ACC_RANGE + i];
+            if (!isfinite(v)) {
+                v = 0.0f;
+            } else if (i == RANGE_NEG_LOGRATIO) {
+                v = -v;  // stored as max(-logratio)
+            }
+            dict_set(&new_log, PPO_RANGE_NAMES[i], v);
+        }
+        dict_set(&new_log, "ppo/clip_mode",
+            (double)pufferl->hypers.ppo_clip_mode);
+        ppo_losses_reset(pufferl->losses, pufferl->default_stream);
+        cudaStreamSynchronize(pufferl->default_stream);
 
         log_util(pufferl, &new_log);
 
