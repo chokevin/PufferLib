@@ -130,16 +130,24 @@ def factorized_ppo_loss(
     optimized_kl = (ratios - 1) - unit_logratios
     optimized_clip = (ratios - 1).abs() > clip_coef
     joint_kl = (joint_ratio - 1) - joint_logratio
-    active_entropy = _masked_mean(safe_entropies, active)
+    transition_optimized_kl = (
+        optimized_kl * unit_active
+    ).sum(-1) / unit_active.sum(-1).clamp_min(1)
+    transition_optimized_clip = (
+        optimized_clip * unit_active
+    ).sum(-1) / unit_active.sum(-1).clamp_min(1)
+    transition_entropy = safe_entropies.sum(-1) / active.sum(-1).clamp_min(1)
     metrics = {
         "ppo_active_stochastic_heads": _masked_mean(
             active_heads.to(old_logprobs.dtype), trainable),
         "ppo_active_stochastic_groups": _masked_mean(
             active_groups.to(old_logprobs.dtype), trainable),
-        "ppo_optimized_kl": _masked_mean(optimized_kl, unit_active),
+        "ppo_optimized_kl": _masked_mean(
+            transition_optimized_kl, trainable),
         "ppo_optimized_clipfrac": _masked_mean(
-            optimized_clip.to(old_logprobs.dtype), unit_active),
-        "ppo_optimized_entropy": active_entropy,
+            transition_optimized_clip.to(old_logprobs.dtype), trainable),
+        "ppo_optimized_entropy": _masked_mean(
+            transition_entropy, trainable),
         "ppo_joint_old_kl": _masked_mean(-joint_logratio, trainable),
         "ppo_joint_kl": _masked_mean(joint_kl, trainable),
         "ppo_joint_clipfrac": _masked_mean(
