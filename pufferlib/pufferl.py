@@ -160,9 +160,12 @@ def print_dashboard(args, model_size, flat_logs, clear=False, idx=[0],
     print('\033[0;0H' + capture.get())
 
 def validate_config(args):
+    from pufferlib.ppo import validate_ppo_clip_mode
+
     minibatch_size = args['train']['minibatch_size']
     horizon = args['train']['horizon']
     total_agents = args['vec']['total_agents']
+    validate_ppo_clip_mode(args['train'].setdefault('ppo_clip_mode', 'joint'))
     assert (minibatch_size % horizon) == 0, \
         f'minibatch_size {minibatch_size} must be divisible by horizon {horizon}'
     assert minibatch_size <= horizon * total_agents, \

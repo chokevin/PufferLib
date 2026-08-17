@@ -18,6 +18,12 @@ import pufferlib
 import pufferlib.pufferl
 from pufferlib.muon import Muon
 from pufferlib import _C
+from pufferlib.ppo import (
+    GROUPED_PPO_CAPABILITY,
+    GROUPED_PPO_CAPABILITY_VERSION,
+    factorized_ppo_loss,
+    validate_ppo_clip_mode,
+)
 if _C.precision_bytes != 4:
     raise RuntimeError(
         f'_C was compiled with bf16 precision (precision_bytes={_C.precision_bytes}). '
@@ -46,18 +52,31 @@ def _entropy(logits):
     p_log_p = logits * logits_to_probs(logits)
     return -p_log_p.sum(-1)
 
-def sample_logits(logits, action=None):
+def sample_logits(logits, action=None, action_mask=None, return_details=False):
     is_discrete = isinstance(logits, torch.Tensor)
     if isinstance(logits, torch.distributions.Normal):
         batch = logits.loc.shape[0]
         if action is None:
             action = logits.sample().view(batch, -1)
-        log_probs = logits.log_prob(action.view(batch, -1)).sum(1)
-        logits_entropy = logits.entropy().view(batch, -1).sum(1)
-        return action, log_probs, logits_entropy
+        head_logprobs = logits.log_prob(action.view(batch, -1))
+        head_entropy = logits.entropy().view(batch, -1)
+        result = (action, head_logprobs.sum(1), head_entropy.sum(1))
+        if return_details:
+            return (*result, head_logprobs, head_entropy)
+        return result
     elif is_discrete:
+        if action_mask is not None:
+            action_mask = action_mask.reshape(logits.shape)
+            logits = logits.masked_fill(action_mask == 0, -torch.inf)
         logits = logits.unsqueeze(0)
     else: # multi-discrete
+        if action_mask is not None:
+            sizes = [head.shape[-1] for head in logits]
+            masks = action_mask.reshape(-1, sum(sizes)).split(sizes, dim=-1)
+            logits = [
+                head.masked_fill(mask == 0, -torch.inf)
+                for head, mask in zip(logits, masks)
+            ]
         logits = torch.nn.utils.rnn.pad_sequence(
             [l.transpose(0,1) for l in logits],
             batch_first=False,
@@ -76,12 +95,19 @@ def sample_logits(logits, action=None):
         action = action.view(batch, -1).T
 
     logprob = _log_prob(normalized_logits, action)
-    logits_entropy = _entropy(normalized_logits).sum(0)
+    head_entropy = _entropy(normalized_logits)
+    logits_entropy = head_entropy.sum(0)
 
     if is_discrete:
-        return action.T, logprob.squeeze(0), logits_entropy.squeeze(0)
+        result = (action.T, logprob.squeeze(0), logits_entropy.squeeze(0))
+        if return_details:
+            return (*result, logprob.T, head_entropy.T)
+        return result
 
-    return action.T, logprob.sum(0), logits_entropy
+    result = (action.T, logprob.sum(0), logits_entropy)
+    if return_details:
+        return (*result, logprob.T, head_entropy.T)
+    return result
 
 class _CudaPtr:
     '''Wraps a raw CUDA pointer so torch.as_tensor can consume it via
@@ -114,8 +140,13 @@ def _cpu_tensor(ptr, shape, dtype):
     return torch.frombuffer(arr, dtype=dtype).reshape(shape)
 
 class PuffeRL:
+    grouped_ppo_capability = GROUPED_PPO_CAPABILITY
+    grouped_ppo_capability_version = GROUPED_PPO_CAPABILITY_VERSION
+
     def __init__(self, args, vec, policy, verbose=True):
         config = args['train']
+        self.ppo_clip_mode = validate_ppo_clip_mode(
+            config.get('ppo_clip_mode', 'joint'))
         device = 'cuda' if _C.gpu else 'cpu'
         self.device = device
 
@@ -147,12 +178,58 @@ class PuffeRL:
         vec.reset()
         horizon = config['horizon']
         num_atns = vec.num_atns
+        self.act_sizes = tuple(vec.act_sizes)
+        self.is_continuous = sum(self.act_sizes) == len(self.act_sizes)
+        if self.is_continuous and self.ppo_clip_mode != 'joint':
+            raise ValueError(
+                "non-joint train.ppo_clip_mode is only supported for discrete actions")
+        self.mask_size = int(getattr(vec, 'action_mask_size', 0))
+        self.vec_action_mask = None
+        if self.mask_size:
+            if self.gpu:
+                self.vec_action_mask = torch.as_tensor(_CudaPtr(
+                    vec.gpu_action_mask_ptr,
+                    (total_agents, self.mask_size), torch.uint8))
+            else:
+                self.vec_action_mask = _cpu_tensor(
+                    vec.action_mask_ptr,
+                    (total_agents, self.mask_size), torch.uint8)
+
+        adapter_version = int(getattr(vec, 'ppo_head_adapter_version', 0))
+        self.head_to_group = None
+        self.head_selectors = None
+        self.head_used_offsets = None
+        self.head_used_values = None
+        if adapter_version:
+            if adapter_version != GROUPED_PPO_CAPABILITY_VERSION:
+                raise ValueError(
+                    f"unsupported PPO head adapter version {adapter_version}; "
+                    f"expected {GROUPED_PPO_CAPABILITY_VERSION}")
+            self.head_to_group = torch.as_tensor(
+                vec.ppo_head_to_group, dtype=torch.long, device=device)
+            self.head_selectors = torch.as_tensor(
+                vec.ppo_head_selectors, dtype=torch.long, device=device)
+            self.head_used_offsets = torch.as_tensor(
+                vec.ppo_head_used_offsets, dtype=torch.long, device=device)
+            self.head_used_values = torch.as_tensor(
+                vec.ppo_head_used_values, dtype=torch.bool, device=device)
+        elif self.ppo_clip_mode != 'joint':
+            raise ValueError(
+                f"ppo_clip_mode={self.ppo_clip_mode!r} requires "
+                "puffer_ppo_head_adapter() from the environment binding")
 
         self.observations = torch.zeros(horizon, total_agents, vec.obs_size,
             dtype=obs_dtype, device=device)
         self.actions = torch.zeros(horizon, total_agents, num_atns, device=device)
         self.values = torch.zeros(horizon, total_agents, device=device)
         self.logprobs = torch.zeros(horizon, total_agents, device=device)
+        self.head_logprobs = torch.zeros(
+            horizon, total_agents, num_atns, device=device)
+        self.action_masks = None
+        if self.mask_size:
+            self.action_masks = torch.zeros(
+                horizon, total_agents, self.mask_size,
+                dtype=torch.uint8, device=device)
         self.rewards = torch.zeros(horizon, total_agents, device=device)
         self.terminals = torch.zeros(horizon, total_agents, device=device)
         self.ratio = torch.ones(total_agents, horizon, device=device)
@@ -219,7 +296,10 @@ class PuffeRL:
             prof.mark(1)
             with torch.no_grad():
                 logits, value, state = self.policy.forward_eval(o_device, self.state)
-                action, logprob, _ = sample_logits(logits)
+                action_mask = None if self.vec_action_mask is None else torch.as_tensor(
+                    self.vec_action_mask, device=device)
+                action, logprob, _, head_logprob, _ = sample_logits(
+                    logits, action_mask=action_mask, return_details=True)
             prof.mark(2)
 
             with torch.no_grad():
@@ -227,6 +307,9 @@ class PuffeRL:
                 self.observations[t] = o_device
                 self.actions[t] = action
                 self.logprobs[t] = logprob
+                self.head_logprobs[t] = head_logprob
+                if self.action_masks is not None:
+                    self.action_masks[t] = action_mask
                 self.rewards[t] = torch.as_tensor(r, device=device)
                 self.terminals[t] = torch.as_tensor(d, device=device).float()
                 self.values[t] = value.flatten()
@@ -274,9 +357,12 @@ class PuffeRL:
         obs = self.observations.transpose(0, 1).contiguous()
         act = self.actions.transpose(0, 1).contiguous()
         val = self.values.T.contiguous()
-        lp = self.logprobs.T.contiguous()
+        head_lp = self.head_logprobs.transpose(0, 1).contiguous()
+        masks = None if self.action_masks is None else \
+            self.action_masks.transpose(0, 1).contiguous()
         rew = self.rewards.T.contiguous().clamp(-1, 1)
         ter = self.terminals.T.contiguous()
+        num_atns = self.actions.shape[-1]
 
         P = Profile
         prof.mark(0)
@@ -297,33 +383,57 @@ class PuffeRL:
 
             mb_obs = obs[idx]
             mb_actions = act[idx]
-            mb_logprobs = lp[idx]
+            mb_head_logprobs = head_lp[idx]
+            mb_masks = None if masks is None else masks[idx]
             mb_values = val[idx]
             mb_returns = advantages[idx] + mb_values
             mb_advantages = advantages[idx]
 
             prof.mark(1)
             logits, newvalue = self.policy(mb_obs)
-            actions, newlogprob, entropy = sample_logits(logits, action=mb_actions)
+            actions, newlogprob, entropy, new_head_logprobs, head_entropy = sample_logits(
+                logits, action=mb_actions, action_mask=mb_masks,
+                return_details=True)
             prof.mark(2)
             prof.elapsed(P.TRAIN_FORWARD, 1, 2)
-
-            newlogprob = newlogprob.reshape(mb_logprobs.shape)
-            logratio = newlogprob - mb_logprobs
-            ratio = logratio.exp()
-            self.ratio[idx] = ratio.detach()
-
-            with torch.no_grad():
-                old_approx_kl = (-logratio).mean()
-                approx_kl = ((ratio - 1) - logratio).mean()
-                clipfrac = ((ratio - 1.0).abs() > config['clip_coef']).float().mean()
 
             adv = mb_advantages
             adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
 
-            pg_loss1 = -adv * ratio
-            pg_loss2 = -adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
-            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+            flat_actions = mb_actions.reshape(-1, num_atns).long()
+            if self.head_selectors is None:
+                head_used = torch.ones_like(flat_actions, dtype=torch.bool)
+            else:
+                selector_actions = flat_actions[:, self.head_selectors]
+                lookup = self.head_used_offsets[:-1] + selector_actions
+                head_used = self.head_used_values[lookup]
+
+            if mb_masks is None:
+                if self.is_continuous:
+                    legal_counts = torch.full_like(flat_actions, 2)
+                else:
+                    legal_counts = torch.as_tensor(
+                        self.act_sizes, device=device).expand(flat_actions.shape[0], -1)
+            else:
+                split_masks = mb_masks.reshape(
+                    -1, self.mask_size).split(self.act_sizes, dim=-1)
+                legal_counts = torch.stack(
+                    [mask.count_nonzero(-1) for mask in split_masks], dim=-1)
+
+            result = factorized_ppo_loss(
+                mb_head_logprobs.reshape(-1, num_atns),
+                new_head_logprobs.reshape(-1, num_atns),
+                head_entropy.reshape(-1, num_atns),
+                adv.reshape(-1),
+                head_used,
+                legal_counts,
+                self.head_to_group,
+                clip_coef,
+                self.ppo_clip_mode,
+            )
+            pg_loss = result.policy_loss
+            ratio = result.joint_ratio.reshape(mb_advantages.shape)
+            self.ratio[idx] = ratio.detach()
 
             newvalue = newvalue.view(mb_returns.shape)
             v_clipped = mb_values + torch.clamp(newvalue - mb_values, -vf_clip, vf_clip)
@@ -331,16 +441,24 @@ class PuffeRL:
             v_loss_clipped = (v_clipped - mb_returns) ** 2
             v_loss = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
-            entropy_loss = entropy.mean()
+            active = head_used & (legal_counts > 1)
+            entropy_loss = torch.where(
+                active, head_entropy.reshape(-1, num_atns),
+                torch.zeros((), device=device)
+            ).sum(-1).mean()
             loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
             val[idx] = newvalue.detach().float()
 
+            losses['policy'] += pg_loss
+            losses['value'] += v_loss
             losses['policy_loss'] += pg_loss
             losses['value_loss'] += v_loss
             losses['entropy'] += entropy_loss
-            losses['old_approx_kl'] += old_approx_kl
-            losses['approx_kl'] += approx_kl
-            losses['clipfrac'] += clipfrac
+            losses['old_approx_kl'] += result.metrics['ppo_joint_old_kl']
+            losses['approx_kl'] += result.metrics['ppo_joint_kl']
+            losses['clipfrac'] += result.metrics['ppo_joint_clipfrac']
+            for key, metric in result.metrics.items():
+                losses[key] += metric
             losses['importance'] += ratio.mean()
 
             loss.backward()
@@ -513,4 +631,3 @@ def load_policy(args, vec):
         policy.load_state_dict(state_dict)
 
     return policy
-

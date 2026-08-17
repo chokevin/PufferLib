@@ -323,6 +323,7 @@ struct PPOProfile {
     FloatTensor loss, losses_acc, ppo_partials;
     FloatTensor grad_logits_t, grad_values_t, adv_mean_t, adv_var_t, ent_coef_t;
     PrecisionTensor logits_t, actions_t, old_logprobs_t, advantages_t, prio_t, values_t, returns_t;
+    PrecisionTensor trainable_t;
     PrecisionTensor ratio_t, newvalue_t;
     IntTensor act_sizes_t;
     Allocator alloc;
@@ -345,12 +346,13 @@ PPOProfile* create_ppoloss(int N, int T, int A) {
     p->prio_t         = {.shape = {N}};
     p->values_t       = {.shape = {NT}};
     p->returns_t      = {.shape = {NT}};
+    p->trainable_t    = {.shape = {N}};
     p->ratio_t        = {.shape = {NT}};
     p->newvalue_t     = {.shape = {NT}};
     p->grad_logits_t  = {.shape = {N, T, A}};
     p->grad_values_t  = {.shape = {NT}};
     p->adv_mean_t     = {.shape = {1}};
-    p->adv_var_t      = {.shape = {1}};
+    p->adv_var_t      = {.shape = {3}};
     p->ent_coef_t     = {.shape = {1}};
     p->loss           = {.shape = {1}};
     p->losses_acc     = {.shape = {LOSS_N + 1}};
@@ -365,6 +367,7 @@ PPOProfile* create_ppoloss(int N, int T, int A) {
     alloc_register(&p->alloc, &p->prio_t);
     alloc_register(&p->alloc, &p->values_t);
     alloc_register(&p->alloc, &p->returns_t);
+    alloc_register(&p->alloc, &p->trainable_t);
     alloc_register(&p->alloc, &p->ratio_t);
     alloc_register(&p->alloc, &p->newvalue_t);
     alloc_register(&p->alloc, &p->grad_logits_t);
@@ -398,7 +401,8 @@ PPOProfile* create_ppoloss(int N, int T, int A) {
     float adv_var = adv_sq / NT - adv_mean * adv_mean;
     float_to_device(p->advantages_t.data, buf, NT);
     cudaMemcpy(p->adv_mean_t.data, &adv_mean, sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(p->adv_var_t.data, &adv_var, sizeof(float), cudaMemcpyHostToDevice);
+    float adv_stats[3] = {adv_var, adv_mean, (float)N};
+    cudaMemcpy(p->adv_var_t.data, adv_stats, sizeof(adv_stats), cudaMemcpyHostToDevice);
 
     // Fill logits (fused: A logit cols + 1 value col per row)
     for (int i = 0; i < NT * fused_cols; ++i) buf[i] = rand1() * 2.0f;
@@ -417,6 +421,8 @@ PPOProfile* create_ppoloss(int N, int T, int A) {
     // prio
     for (int i = 0; i < N; ++i) buf[i] = (float)rand() / RAND_MAX;
     float_to_device(p->prio_t.data, buf, N);
+    for (int i = 0; i < N; ++i) buf[i] = 1.0f;
+    float_to_device(p->trainable_t.data, buf, N);
     free(buf);
 
     // Wire up kernel args
@@ -430,6 +436,7 @@ PPOProfile* create_ppoloss(int N, int T, int A) {
         .adv_mean = p->adv_mean_t.data,
         .adv_var = p->adv_var_t.data,
         .act_sizes = p->act_sizes_t.data,
+        .ppo_clip_mode = PPO_CLIP_JOINT,
         .num_atns = 1,
         .clip_coef = 0.1f, .vf_clip_coef = 0.1f, .vf_coef = 0.5f, .ent_coef = p->ent_coef_t.data,
         .T_seq = T, .A_total = A, .N = N,
@@ -446,6 +453,7 @@ PPOProfile* create_ppoloss(int N, int T, int A) {
         .prio = p->prio_t.data,
         .values = p->values_t.data,
         .returns = p->returns_t.data,
+        .trainable = p->trainable_t.data,
     };
 
     return p;

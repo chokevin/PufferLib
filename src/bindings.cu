@@ -52,6 +52,14 @@ pybind11::dict puf_log(pybind11::object pufferl_obj) {
         losses_dict["old_kl"] = losses_host[LOSS_OLD_APPROX_KL] * inv_n;
         losses_dict["kl"] = losses_host[LOSS_APPROX_KL] * inv_n;
         losses_dict["clipfrac"] = losses_host[LOSS_CLIPFRAC] * inv_n;
+        losses_dict["ppo_active_stochastic_heads"] = losses_host[LOSS_PPO_ACTIVE_HEADS] * inv_n;
+        losses_dict["ppo_active_stochastic_groups"] = losses_host[LOSS_PPO_ACTIVE_GROUPS] * inv_n;
+        losses_dict["ppo_optimized_kl"] = losses_host[LOSS_PPO_OPTIMIZED_KL] * inv_n;
+        losses_dict["ppo_optimized_clipfrac"] = losses_host[LOSS_PPO_OPTIMIZED_CLIPFRAC] * inv_n;
+        losses_dict["ppo_optimized_entropy"] = losses_host[LOSS_PPO_OPTIMIZED_ENTROPY] * inv_n;
+        losses_dict["ppo_joint_old_kl"] = losses_host[LOSS_PPO_JOINT_OLD_KL] * inv_n;
+        losses_dict["ppo_joint_kl"] = losses_host[LOSS_PPO_JOINT_KL] * inv_n;
+        losses_dict["ppo_joint_clipfrac"] = losses_host[LOSS_PPO_JOINT_CLIPFRAC] * inv_n;
     }
     cudaMemset(pufferl.losses_puf.data, 0, numel(pufferl.losses_puf.shape) * sizeof(float));
     result["loss"] = losses_dict;
@@ -313,6 +321,13 @@ struct VecEnv {
     std::vector<int> act_sizes;
     std::string obs_dtype;
     size_t obs_elem_size;
+    int action_mask_size;
+    int ppo_head_adapter_version;
+    int ppo_num_groups;
+    std::vector<int> ppo_head_to_group;
+    std::vector<int> ppo_head_selectors;
+    std::vector<int> ppo_head_used_offsets;
+    std::vector<unsigned char> ppo_head_used_values;
     int gpu;
 };
 
@@ -342,6 +357,23 @@ std::unique_ptr<VecEnv> create_vec(py::dict args, int gpu) {
     }
     ve->obs_dtype     = std::string(get_obs_dtype());
     ve->obs_elem_size = get_obs_elem_size();
+    ve->action_mask_size = ve->vec->action_mask_size;
+    py::dict train_kwargs = args["train"].cast<py::dict>();
+    std::string ppo_clip_mode = train_kwargs.contains("ppo_clip_mode")
+        ? train_kwargs["ppo_clip_mode"].cast<std::string>() : "joint";
+    if (ppo_clip_mode != "joint" && ppo_clip_mode != "per_head"
+            && ppo_clip_mode != "group_sum" && ppo_clip_mode != "group_mean") {
+        throw std::runtime_error(
+            "train.ppo_clip_mode must be joint|per_head|group_sum|group_mean");
+    }
+    ExpandedPPOHeadAdapter adapter = expand_ppo_head_adapter(
+        ve->num_atns, ve->act_sizes.data(), ppo_clip_mode != "joint");
+    ve->ppo_head_adapter_version = adapter.version;
+    ve->ppo_num_groups = adapter.num_groups;
+    ve->ppo_head_to_group = std::move(adapter.head_to_group);
+    ve->ppo_head_selectors = std::move(adapter.head_selector);
+    ve->ppo_head_used_offsets = std::move(adapter.head_used_offsets);
+    ve->ppo_head_used_values = std::move(adapter.head_used_values);
     return ve;
 }
 
@@ -416,6 +448,16 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     hypers.max_grad_norm = get_config(train_kwargs, "max_grad_norm");
     // PPO
     hypers.clip_coef = get_config(train_kwargs, "clip_coef");
+    {
+        std::string mode = train_kwargs.contains("ppo_clip_mode")
+            ? train_kwargs["ppo_clip_mode"].cast<std::string>() : "joint";
+        if (mode == "joint") hypers.ppo_clip_mode = PPO_CLIP_JOINT;
+        else if (mode == "per_head") hypers.ppo_clip_mode = PPO_CLIP_PER_HEAD;
+        else if (mode == "group_sum") hypers.ppo_clip_mode = PPO_CLIP_GROUP_SUM;
+        else if (mode == "group_mean") hypers.ppo_clip_mode = PPO_CLIP_GROUP_MEAN;
+        else throw std::runtime_error(
+            "train.ppo_clip_mode must be joint|per_head|group_sum|group_mean");
+    }
     hypers.vf_clip_coef = get_config(train_kwargs, "vf_clip_coef");
     hypers.vf_coef = get_config(train_kwargs, "vf_coef");
     hypers.ent_coef = get_config(train_kwargs, "ent_coef");
@@ -511,6 +553,8 @@ PYBIND11_MODULE(_C, m) {
     m.attr("precision_bytes") = (int)sizeof(precision_t);
     m.attr("env_name") = PUFFER_STRINGIFY(ENV_NAME);
     m.attr("gpu") = 1;
+    m.attr("grouped_ppo_capability") = "pufferlib.grouped_ppo.v1";
+    m.attr("grouped_ppo_capability_version") = 1;
 
     // Core functions
     m.def("log", &puf_log);
@@ -552,6 +596,7 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("total_timesteps", &HypersT::total_timesteps)
         .def_readwrite("max_grad_norm", &HypersT::max_grad_norm)
         .def_readwrite("clip_coef", &HypersT::clip_coef)
+        .def_readwrite("ppo_clip_mode", &HypersT::ppo_clip_mode)
         .def_readwrite("vf_clip_coef", &HypersT::vf_clip_coef)
         .def_readwrite("vf_coef", &HypersT::vf_coef)
         .def_readwrite("ent_coef", &HypersT::ent_coef)
@@ -603,15 +648,24 @@ PYBIND11_MODULE(_C, m) {
         .def_readonly("act_sizes",     &VecEnv::act_sizes)
         .def_readonly("obs_dtype",     &VecEnv::obs_dtype)
         .def_readonly("obs_elem_size", &VecEnv::obs_elem_size)
+        .def_readonly("action_mask_size", &VecEnv::action_mask_size)
+        .def_readonly("ppo_head_adapter_version", &VecEnv::ppo_head_adapter_version)
+        .def_readonly("ppo_num_groups", &VecEnv::ppo_num_groups)
+        .def_readonly("ppo_head_to_group", &VecEnv::ppo_head_to_group)
+        .def_readonly("ppo_head_selectors", &VecEnv::ppo_head_selectors)
+        .def_readonly("ppo_head_used_offsets", &VecEnv::ppo_head_used_offsets)
+        .def_readonly("ppo_head_used_values", &VecEnv::ppo_head_used_values)
         .def_readonly("gpu",           &VecEnv::gpu)
         // GPU buffer pointers — wrap with torch.from_blob(..., device='cuda')
         .def_property_readonly("gpu_obs_ptr",       [](VecEnv& ve) { return (long long)ve.vec->gpu_observations; })
         .def_property_readonly("gpu_rewards_ptr",   [](VecEnv& ve) { return (long long)ve.vec->gpu_rewards; })
         .def_property_readonly("gpu_terminals_ptr", [](VecEnv& ve) { return (long long)ve.vec->gpu_terminals; })
+        .def_property_readonly("gpu_action_mask_ptr", [](VecEnv& ve) { return (long long)ve.vec->gpu_action_mask; })
         // CPU buffer pointers (same as gpu_ in CPU mode since they alias)
         .def_property_readonly("obs_ptr",       [](VecEnv& ve) { return (long long)ve.vec->observations; })
         .def_property_readonly("rewards_ptr",   [](VecEnv& ve) { return (long long)ve.vec->rewards; })
         .def_property_readonly("terminals_ptr", [](VecEnv& ve) { return (long long)ve.vec->terminals; })
+        .def_property_readonly("action_mask_ptr", [](VecEnv& ve) { return (long long)ve.vec->action_mask; })
         .def("reset", &vec_reset)
         .def("gpu_step", &gpu_vec_step_py)
         .def("cpu_step", &cpu_vec_step_py)

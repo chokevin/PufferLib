@@ -76,7 +76,7 @@ inline const char* puf_repr(const FloatTensor* t) {
 
 #define PPO_THREADS 256
 #define SELECT_COPY_THREADS 256
-#define MAX_ATN_HEADS 16
+#define MAX_ATN_HEADS 256
 
 
 #define BLOCK_SIZE 256

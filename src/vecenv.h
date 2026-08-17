@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +28,21 @@ typedef struct {
     int size;
     int capacity;
 } Dict;
+
+#define PUFFER_PPO_HEAD_ADAPTER_VERSION 1
+
+// Optional environment contract for factorized PPO. The callback is evaluated
+// once at startup for every valid selector value and copied to the accelerator.
+typedef int (*PufferPPOHeadUsedFn)(int head, int selector_action);
+typedef struct {
+    uint32_t struct_size;
+    uint32_t version;
+    int num_heads;
+    int num_groups;
+    const int* head_to_group;
+    const int* head_selector;
+    PufferPPOHeadUsedFn head_used;
+} PufferPPOHeadAdapter;
 
 static inline Dict* create_dict(int capacity) {
     Dict* dict = (Dict*)calloc(1, sizeof(Dict));
