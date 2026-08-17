@@ -47,13 +47,18 @@ def compile_program(directory, name, source, extra_args=()):
 
 def test_capability_markers_precede_environment_include_chain():
     pufferl = read("pufferl.cu")
+    algo = read("algo.cu")
     ocean = read("ocean.cu")
     decoder = read("custom_decoder.cuh")
 
+    strict_checkpoint_marker = "#define PUF_STRICT_CHECKPOINT_SIZE_V1 1"
+    assert pufferl.count(strict_checkpoint_marker) == 1
     order(pufferl,
-          "#define PUF_STRICT_CHECKPOINT_SIZE_V1 1",
+          strict_checkpoint_marker,
+          '#include "checkpoint.h"',
           "#include ENV_HEADER",
           '#include "algo.cu"')
+    order(algo, '#include "ocean.cu"')
     order(ocean,
           '#include "custom_decoder.cuh"',
           "#include ENV_ENCODER_HEADER")

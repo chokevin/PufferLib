@@ -34,6 +34,9 @@
 #include <time.h>
 #include <unistd.h>
 
+// Capabilities visible to project and environment headers.
+#define PUF_STRICT_CHECKPOINT_SIZE_V1 1
+
 // Project
 #include "checkpoint.h"
 #include "ini.h"
@@ -59,7 +62,6 @@ constexpr cublasComputeType_t CUBLAS_COMPUTE = CUBLAS_COMPUTE_32F;
 
 #define PUF_MAX_DIMS 8
 #define BLOCK_SIZE 256
-#define PUF_STRICT_CHECKPOINT_SIZE_V1 1
 int grid_size(int N) {
     return (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 }
