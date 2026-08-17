@@ -1562,7 +1562,7 @@ __global__ void ppo_loss_compute(
                 float mean = safe_continuous_mean(a.logits, logits_base + h);
                 float c_logstd = safe_continuous_logstd(a.logstd, h);
                 float c_action = finite_or_clamp(
-                    g.actions[nt * a.num_atns + h], -1.0e6f, 1.0e6f);
+                    g.actions[(long)nt * a.num_atns + h], -1.0e6f, 1.0e6f);
                 float lp, ent;
                 ppo_continuous_head(mean, c_logstd, c_action, &lp, &ent);
                 total_entropy += ent;
@@ -1570,7 +1570,7 @@ __global__ void ppo_loss_compute(
                 float var = std * std;
                 float diff = c_action - mean;
                 a.grad_logits[at_base + h] = d_new_logp * diff / var;
-                a.grad_logstd[nt * a.num_atns + h] =
+                a.grad_logstd[(long)nt * a.num_atns + h] =
                     d_new_logp * (diff * diff / var - 1.0f) + d_entropy_term;
             }
         } else if (joint) {
@@ -1580,14 +1580,14 @@ __global__ void ppo_loss_compute(
             int logits_offset = 0;
             for (int h = 0; h < a.num_atns; ++h) {
                 int A = a.act_sizes[h];
-                if (!ppo_head_consumed(g.actions + nt * a.num_atns, h)) {
+                if (!ppo_head_consumed(g.actions + (long)nt * a.num_atns, h)) {
                     for (int j = 0; j < A; ++j) {
                         a.grad_logits[at_base + logits_offset + j] = 0.0f;
                     }
                     logits_offset += A;
                     continue;
                 }
-                int act = (int)g.actions[nt * a.num_atns + h];
+                int act = (int)g.actions[(long)nt * a.num_atns + h];
                 float ent = 0.0f;
                 for (int j = 0; j < A; ++j) {
                     float logp = a.grad_logits[at_base + logits_offset + j];
@@ -1622,7 +1622,7 @@ __global__ void ppo_loss_compute(
             // one original transition, so no group can span a transition.
             // All mask/precision-dependent work happens here; the objective
             // itself is ppo_group_row_apply, shared with the host tests.
-            const float* act_row = g.actions + nt * a.num_atns;
+            const float* act_row = g.actions + (long)nt * a.num_atns;
             int legal_count[PPO_HEAD_CAP];
             int consumed[PPO_HEAD_CAP];
             int logits_offset = 0;
@@ -1661,7 +1661,7 @@ __global__ void ppo_loss_compute(
             in.legal_count = legal_count;
             in.consumed = consumed;
             in.actions = act_row;
-            in.old_group_lp = g.old_group_logprobs + nt * a.num_groups;
+            in.old_group_lp = g.old_group_logprobs + (long)nt * a.num_groups;
 #ifdef PUFFER_NETHACK
             in.head_lp_mix = head_lp_mix;
             in.head_grad_scale = head_grad_scale;

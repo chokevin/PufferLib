@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdint>
 #include <errno.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +61,28 @@ constexpr cublasComputeType_t CUBLAS_COMPUTE = CUBLAS_COMPUTE_32F;
 #define BLOCK_SIZE 256
 int grid_size(int N) {
     return (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+}
+
+static size_t checked_size_product(
+        int64_t a, int64_t b, size_t elem_size, const char* what) {
+    if (a < 0 || b < 0 || (a != 0 && (uint64_t)b > SIZE_MAX / (uint64_t)a)
+            || (uint64_t)a * (uint64_t)b > SIZE_MAX / elem_size) {
+        fprintf(stderr, "fatal: %s allocation size overflow\n", what);
+        exit(1);
+    }
+    return (size_t)a * (size_t)b * elem_size;
+}
+
+static int checked_launch_product(
+        int64_t a, int64_t b, int64_t c, const char* what) {
+    if (a < 0 || b < 0 || c < 0
+            || (a != 0 && (uint64_t)b > (uint64_t)INT_MAX / (uint64_t)a)
+            || (uint64_t)a * (uint64_t)b != 0
+                && (uint64_t)c > (uint64_t)INT_MAX / ((uint64_t)a * (uint64_t)b)) {
+        fprintf(stderr, "fatal: %s launch size exceeds INT_MAX\n", what);
+        exit(1);
+    }
+    return (int)(a * b * c);
 }
 
 // Exclusive env: -DENV_HEADER=ocean/<env>/<env>.h or .cu (--gpu). Never both.
@@ -237,7 +260,20 @@ void _alloc_register(Allocator* alloc,
     alloc->regs = (AllocEntry*)realloc(alloc->regs,
         (alloc->num_regs + 1) * sizeof(AllocEntry));
     alloc->regs[alloc->num_regs++] = {data_ptr, shape, elem_size};
-    long n = numel(shape);
+    long n = 1;
+    for (int i = 0; i < PUF_MAX_DIMS && shape[i] != 0; i++) {
+        if (shape[i] < 0 || (n != 0 && shape[i] > LONG_MAX / n)) {
+            fprintf(stderr, "fatal: tensor element count overflow\n");
+            exit(1);
+        }
+        n *= shape[i];
+    }
+    if (n > LONG_MAX - alloc->total_elems
+            || alloc->total_bytes > LONG_MAX - 15
+            || n > (LONG_MAX - ((alloc->total_bytes + 15) & ~15)) / elem_size) {
+        fprintf(stderr, "fatal: tensor allocation size overflow\n");
+        exit(1);
+    }
     alloc->total_elems += n;
     alloc->total_bytes = (alloc->total_bytes + 15) & ~15;
     alloc->total_bytes += n * elem_size;
@@ -672,6 +708,7 @@ __global__ void sample_logits(
         float* group_logprobs,                // (B, num_groups); NULL when joint
         const int* group_ids,                 // (NUM_ATNS,); NULL when joint
         int num_groups,
+        int clip_mode,
         int* err) {
     int B = dec_out.shape[0];
     int fused_cols = dec_out.shape[1];
@@ -688,10 +725,15 @@ __global__ void sample_logits(
     curandStatePhilox4_32_10_t state = rng_states[idx];
     int logits_base = idx * fused_cols;
     float total_log_prob = 0.0f;
+    bool per_head = clip_mode == PPO_CLIP_PER_HEAD;
     // Grouped modes accumulate old log-prob sums over ACTIVE member heads.
     float group_lp[PPO_GROUP_CAP];
     for (int gg = 0; gg < num_groups; gg++) {
-        group_lp[gg] = 0.0f;
+        if (per_head) {
+            group_logprobs[(long)idx * num_groups + gg] = 0.0f;
+        } else {
+            group_lp[gg] = 0.0f;
+        }
     }
 
     if (is_continuous) {
@@ -707,7 +749,7 @@ __global__ void sample_logits(
             float lp, ent;
             ppo_continuous_head(mean, log_std, stored, &lp, &ent);
             total_log_prob += lp;
-            int aidx = idx * num_atns + h;
+            long aidx = (long)idx * num_atns + h;
             actions[aidx] = stored;
             env_actions[aidx] = stored;
         }
@@ -760,12 +802,12 @@ __global__ void sample_logits(
                 }
             }
             // Float32 preserves large categorical IDs that BF16 cannot represent.
-            int aidx = idx * num_atns + h;
+            long aidx = (long)idx * num_atns + h;
             float action = (float)sampled;
             actions[aidx] = action;
             env_actions[aidx] = action;
 #if defined(PUFFER_NETHACK)
-            if (ppo_head_consumed(actions + idx * num_atns, h)) {
+            if (ppo_head_consumed(actions + (long)idx * num_atns, h)) {
                 if (eps > 0.0f) {
                     total_log_prob += logf((1.0f - eps)
                         * expf(cache[sampled] - logsumexp) + eps * inv_K);
@@ -774,28 +816,33 @@ __global__ void sample_logits(
                 }
             }
 #else
-            if (ppo_head_consumed(actions + idx * num_atns, h)) {
+            if (ppo_head_consumed(actions + (long)idx * num_atns, h)) {
                 total_log_prob += cache[sampled] - logsumexp;
             }
 #endif
             if (num_groups > 0
                     && ppo_head_active(
-                        ppo_head_consumed(actions + idx * num_atns, h), legal)) {
+                        ppo_head_consumed(
+                            actions + (long)idx * num_atns, h), legal)) {
                 float head_lp = cache[sampled] - logsumexp;
 #ifdef PUFFER_NETHACK
                 if (h == 0 && eps > 0.0f) {
                     head_lp = logf((1.0f - eps) * expf(head_lp) + eps * inv_K);
                 }
 #endif
-                group_lp[group_ids[h]] += head_lp;
+                if (per_head) {
+                    group_logprobs[(long)idx * num_groups + h] = head_lp;
+                } else {
+                    group_lp[group_ids[h]] += head_lp;
+                }
             }
             logits_offset += A;
         }
     }
 
-    if (num_groups > 0) {
+    if (num_groups > 0 && !per_head) {
         for (int gg = 0; gg < num_groups; gg++) {
-            group_logprobs[idx * num_groups + gg] = group_lp[gg];
+            group_logprobs[(long)idx * num_groups + gg] = group_lp[gg];
         }
     }
     logprobs[idx] = from_float(total_log_prob);
@@ -993,6 +1040,7 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
             pufferl->rng_states[buf] + off,
             mask_b.data, mask_stride,
             group_lp, pufferl->ppo_group_ids_dev, num_groups,
+            pufferl->hypers.ppo_clip_mode,
             pufferl->ppo_err);
 #endif
     }
@@ -1143,9 +1191,12 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
     vec->size = num_envs;
 
     size_t obs_bytes = total_agents * OBS_SIZE * sizeof(obs_t);
-    size_t mask_bytes = total_agents * vec->mask_size * sizeof(unsigned char);
+    size_t mask_bytes = checked_size_product(
+        total_agents, vec->mask_size, sizeof(unsigned char), "host action mask");
     cudaHostAlloc((void**)&vec->observations, obs_bytes, cudaHostAllocPortable);
-    cudaHostAlloc((void**)&vec->actions, total_agents * NUM_ATNS * sizeof(float),
+    size_t action_bytes = checked_size_product(
+        total_agents, NUM_ATNS, sizeof(float), "host action buffer");
+    cudaHostAlloc((void**)&vec->actions, action_bytes,
         cudaHostAllocPortable);
     cudaHostAlloc((void**)&vec->rewards, total_agents * sizeof(float),
         cudaHostAllocPortable);
@@ -1279,9 +1330,10 @@ static void* vec_thread_main(void* arg) {
             pufferl_forward(pufferl, buf, t, stream);
             cudaEventRecord(ev[MODEL_END], stream);
             cudaMemcpyAsync(
-                &vec->actions[agent_start * NUM_ATNS],
-                &pufferl->env.actions.data[agent_start * NUM_ATNS],
-                apb * NUM_ATNS * sizeof(float),
+                &vec->actions[(long)agent_start * NUM_ATNS],
+                &pufferl->env.actions.data[(long)agent_start * NUM_ATNS],
+                checked_size_product(
+                    apb, NUM_ATNS, sizeof(float), "action transfer"),
                 cudaMemcpyDeviceToHost, stream);
             cudaEventRecord(ev[COPY_END], stream);
             cudaStreamSynchronize(stream);
@@ -1489,7 +1541,7 @@ void vec_log(VecEnv* vec, Dict* out, int clear, int empty_schema) {
 }
 
 static Prec slice_rows(Prec p, int off, int n) {
-    int row = 1;
+    int64_t row = 1;
     for (int i = 1; i < PUF_MAX_DIMS && p.shape[i]; i++) {
         row *= (int)p.shape[i];
     }
@@ -1500,7 +1552,7 @@ static Prec slice_rows(Prec p, int off, int n) {
 }
 
 static Float slice_rows(Float p, int off, int n) {
-    int row = 1;
+    int64_t row = 1;
     for (int i = 1; i < PUF_MAX_DIMS && p.shape[i]; i++) {
         row *= (int)p.shape[i];
     }
@@ -1612,7 +1664,9 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
     transpose_primary_102<<<grid_size(T * train_agents * obs_size), BLOCK_SIZE, 0, stream>>>(
         rollouts->observations.data, src.observations.data, T, B, obs_size,
         agents_per_buf, primary_start, primary_count);
-    transpose_primary_102<<<grid_size(T * train_agents * num_atns), BLOCK_SIZE, 0, stream>>>(
+    int action_elems = checked_launch_product(
+        T, train_agents, num_atns, "action transpose");
+    transpose_primary_102<<<grid_size(action_elems), BLOCK_SIZE, 0, stream>>>(
         rollouts->actions.data, src.actions.data, T, B, num_atns,
         agents_per_buf, primary_start, primary_count);
     transpose_primary_102<<<grid_size(T * train_agents), BLOCK_SIZE, 0, stream>>>(
@@ -1632,7 +1686,9 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         agents_per_buf, primary_start, primary_count);
     int num_groups = hypers->ppo_num_groups;
     if (num_groups > 0) {
-        transpose_primary_102<<<grid_size(T * train_agents * num_groups),
+        int group_elems = checked_launch_product(
+            T, train_agents, num_groups, "group log-prob transpose");
+        transpose_primary_102<<<grid_size(group_elems),
             BLOCK_SIZE, 0, stream>>>(
             rollouts->group_logprobs.data, src.group_logprobs.data,
             T, B, num_groups, agents_per_buf, primary_start, primary_count);
@@ -2027,6 +2083,10 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         } else {
             n_disc++;
         }
+        if (act_sizes[i] < 0 || act_n > INT_MAX - act_sizes[i]) {
+            fprintf(stderr, "fatal: categorical action width overflow\n");
+            exit(1);
+        }
         act_n += act_sizes[i];
     }
     assert(!(n_cont > 0 && n_disc > 0)
@@ -2084,14 +2144,17 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .action_mask = {.shape = {total_agents, act_n}},
     };
     EnvBuf* env = &pufferl->env;
-    size_t mask_bytes = total_agents * act_n * sizeof(unsigned char);
+    size_t mask_bytes = checked_size_product(
+        total_agents, act_n, sizeof(unsigned char), "device action mask");
+    size_t action_bytes = checked_size_product(
+        total_agents, NUM_ATNS, sizeof(float), "device action buffer");
     cudaMalloc((void**)&env->obs.data, total_agents * OBS_SIZE * sizeof(obs_t));
-    cudaMalloc((void**)&env->actions.data, total_agents * NUM_ATNS * sizeof(float));
+    cudaMalloc((void**)&env->actions.data, action_bytes);
     cudaMalloc((void**)&env->rewards.data, total_agents * sizeof(float));
     cudaMalloc((void**)&env->terminals.data, total_agents * sizeof(float));
     cudaMalloc((void**)&env->action_mask.data, mask_bytes);
     cudaMemset(env->obs.data, 0, total_agents * OBS_SIZE * sizeof(obs_t));
-    cudaMemset(env->actions.data, 0, total_agents * NUM_ATNS * sizeof(float));
+    cudaMemset(env->actions.data, 0, action_bytes);
     cudaMemset(env->rewards.data, 0, total_agents * sizeof(float));
     cudaMemset(env->terminals.data, 0, total_agents * sizeof(float));
     cudaMemset(env->action_mask.data, 1, mask_bytes);
@@ -2216,13 +2279,15 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
 
     cudaMalloc((void**)&pufferl->rng_offset, (num_buffers + 1) * sizeof(long));
     cudaMemset(pufferl->rng_offset, 0, (num_buffers + 1) * sizeof(long));
-    cudaMalloc((void**)&pufferl->act_sizes, num_action_heads * sizeof(int));
+    size_t head_ids_bytes = checked_size_product(
+        num_action_heads, 1, sizeof(int), "PPO head metadata");
+    cudaMalloc((void**)&pufferl->act_sizes, head_ids_bytes);
     cudaMalloc((void**)&pufferl->losses, NUM_LOSSES * sizeof(float));
     if (hypers.ppo_num_groups > 0) {
         cudaMalloc((void**)&pufferl->ppo_group_ids_dev,
-            num_action_heads * sizeof(int));
+            head_ids_bytes);
         cudaMemcpy(pufferl->ppo_group_ids_dev, hypers.ppo_group_ids,
-            num_action_heads * sizeof(int), cudaMemcpyHostToDevice);
+            head_ids_bytes, cudaMemcpyHostToDevice);
     }
 
     muon_init(&pufferl->muon, &primary->params_alloc, hypers.momentum, acts);

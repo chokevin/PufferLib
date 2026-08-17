@@ -40,8 +40,8 @@
 
 // CUDA shape bounds. Grouped kernels keep fixed-size local arrays (no VLAs),
 // so heads and groups are checked against these at startup.
-#define PPO_MAX_HEADS 32
-#define PPO_MAX_GROUPS PPO_MAX_HEADS
+#define PPO_MAX_HEADS 256
+#define PPO_MAX_GROUPS 64
 #define PUFFER_GROUPED_PPO_CAPABILITY "pufferlib.grouped_ppo.v1"
 #define PUFFER_GROUPED_PPO_CAPABILITY_VERSION 1
 
@@ -138,8 +138,9 @@ static inline int ppo_group_ids_is_disabled(const char* raw) {
 // nonnegative decimal integer, and the id set must cover 0..max with no holes.
 // Arbitrary non-contiguous head orders are fine ("1,0,1,2" is dense).
 // Returns 1 on success, 0 on failure with a message in err.
-static inline int ppo_group_ids_parse(const char* raw, int num_atns,
-        int* ids, int* num_groups, char* err, int err_n) {
+static inline int ppo_ids_parse_dense(const char* raw, int num_atns,
+        int max_ids, const char* max_name, int* ids, int* num_groups,
+        char* err, int err_n) {
     if (!raw || num_atns <= 0) {
         snprintf(err, err_n, "train.ppo_group_ids: missing mapping");
         return 0;
@@ -161,8 +162,8 @@ static inline int ppo_group_ids_parse(const char* raw, int num_atns,
         long v = 0;
         while (*p >= '0' && *p <= '9') {
             v = v * 10 + (*p - '0');
-            if (v >= PPO_MAX_GROUPS) {
-                v = PPO_MAX_GROUPS;  // saturate: anything this large is invalid
+            if (v >= max_ids) {
+                v = max_ids;  // saturate: anything this large is invalid
             }
             digits++;
             p++;
@@ -179,10 +180,10 @@ static inline int ppo_group_ids_parse(const char* raw, int num_atns,
                 num_atns);
             return 0;
         }
-        if (v >= PPO_MAX_GROUPS) {
+        if (v >= max_ids) {
             snprintf(err, err_n,
                 "train.ppo_group_ids: id at position %d exceeds "
-                "PPO_MAX_GROUPS=%d", n, PPO_MAX_GROUPS);
+                "%s=%d", n, max_name, max_ids);
             return 0;
         }
         ids[n++] = (int)v;
@@ -214,8 +215,8 @@ static inline int ppo_group_ids_parse(const char* raw, int num_atns,
             max_id = ids[i];
         }
     }
-    int seen[PPO_MAX_GROUPS];
-    for (int g = 0; g <= max_id && g < PPO_MAX_GROUPS; g++) {
+    int seen[PPO_MAX_HEADS];
+    for (int g = 0; g <= max_id && g < max_ids; g++) {
         seen[g] = 0;
     }
     for (int i = 0; i < n; i++) {
@@ -230,12 +231,18 @@ static inline int ppo_group_ids_parse(const char* raw, int num_atns,
         }
     }
     *num_groups = max_id + 1;
-    if (*num_groups > PPO_MAX_GROUPS) {
+    if (*num_groups > max_ids) {
         snprintf(err, err_n, "train.ppo_group_ids: %d groups exceeds "
-            "PPO_MAX_GROUPS=%d", *num_groups, PPO_MAX_GROUPS);
+            "%s=%d", *num_groups, max_name, max_ids);
         return 0;
     }
     return 1;
+}
+
+static inline int ppo_group_ids_parse(const char* raw, int num_atns,
+        int* ids, int* num_groups, char* err, int err_n) {
+    return ppo_ids_parse_dense(raw, num_atns, PPO_MAX_GROUPS,
+        "PPO_MAX_GROUPS", ids, num_groups, err, err_n);
 }
 
 // Single startup validation entry point. Runs before any allocation.
@@ -315,8 +322,8 @@ static inline int ppo_group_config_validate(const char* mode_raw,
         if (!disabled) {
             int tmp[PPO_MAX_HEADS];
             int tmp_groups = 0;
-            if (!ppo_group_ids_parse(ids_raw, num_atns, tmp, &tmp_groups,
-                    err, err_n)) {
+            if (!ppo_ids_parse_dense(ids_raw, num_atns, PPO_MAX_HEADS,
+                    "PPO_MAX_HEADS", tmp, &tmp_groups, err, err_n)) {
                 return 0;
             }
             for (int h = 0; h < num_atns; h++) {
@@ -362,15 +369,7 @@ typedef struct {
     int active_groups;
 } PpoGroupStats;
 
-// Forward + backward for one original env-agent transition.
-//   logratio_sum[g]  sum over that group's ACTIVE members of (new_lp - old_lp)
-//   active_count[g]  number of active members in group g (0 -> inactive group)
-//   dlogp_out[g]     d(total loss)/d(new log-prob of any active member of g)
-// Returns a PpoErr code; nonzero means the caller must fail closed.
-PPO_HD int ppo_group_row(int mode, int num_groups,
-        const float* logratio_sum, const int* active_count,
-        float adv, float clip_coef, float inv_nt,
-        float* dlogp_out, PpoGroupStats* stats) {
+PPO_HD void ppo_group_stats_reset(PpoGroupStats* stats) {
     stats->pg_loss = 0.0f;
     stats->old_kl = 0.0f;
     stats->kl = 0.0f;
@@ -381,6 +380,18 @@ PPO_HD int ppo_group_row(int mode, int num_groups,
     stats->logratio_min = INFINITY;
     stats->ratio_max = -INFINITY;
     stats->active_groups = 0;
+}
+
+// Forward + backward for one original env-agent transition.
+//   logratio_sum[g]  sum over that group's ACTIVE members of (new_lp - old_lp)
+//   active_count[g]  number of active members in group g (0 -> inactive group)
+//   dlogp_out[g]     d(total loss)/d(new log-prob of any active member of g)
+// Returns a PpoErr code; nonzero means the caller must fail closed.
+PPO_HD int ppo_group_row(int mode, int num_groups,
+        const float* logratio_sum, const int* active_count,
+        float adv, float clip_coef, float inv_nt,
+        float* dlogp_out, PpoGroupStats* stats) {
+    ppo_group_stats_reset(stats);
 
     int active = 0;
     for (int g = 0; g < num_groups; g++) {
@@ -501,6 +512,123 @@ typedef struct {
     float inv_nt;
 } PpoGroupRowInput;
 
+// Singleton factors do not need group scratch. Keeping this path separate lets
+// per_head support PPO_MAX_HEADS without inflating explicit-group local arrays.
+PPO_HD int ppo_per_head_row_apply(const PpoGroupRowInput* in,
+        float* logps_inout, PpoGroupStats* stats, float* out_entropy,
+        int* out_active_heads) {
+    int nh = in->num_atns;
+    ppo_group_stats_reset(stats);
+    *out_entropy = 0.0f;
+    *out_active_heads = 0;
+    if (nh <= 0 || nh > PPO_MAX_HEADS || in->num_groups != nh) {
+        return PPO_ERR_SHAPE;
+    }
+
+    int n_active = 0;
+    int offset = 0;
+    for (int h = 0; h < nh; h++) {
+        int A = in->act_sizes[h];
+        if (A <= 0 || in->group_ids[h] != h) {
+            return PPO_ERR_SHAPE;
+        }
+        if (ppo_head_active(in->consumed[h], in->legal_count[h])) {
+            n_active++;
+        }
+        offset += A;
+    }
+    *out_active_heads = n_active;
+    if (n_active == 0) {
+        for (int i = 0; i < offset; i++) {
+            logps_inout[i] = 0.0f;
+        }
+        return PPO_ERR_NO_ACTIVE_FACTORS;
+    }
+
+    offset = 0;
+    for (int h = 0; h < nh; h++) {
+        int A = in->act_sizes[h];
+        if (ppo_head_active(in->consumed[h], in->legal_count[h])) {
+            int act = (int)in->actions[h];
+            if (act < 0 || act >= A) {
+                return PPO_ERR_ACTION_RANGE;
+            }
+            float lp = in->head_lp_mix
+                ? in->head_lp_mix[h] : logps_inout[offset + act];
+            float old_lp = in->old_group_lp[h];
+            if (!isfinite(lp) || !isfinite(old_lp) || !isfinite(lp - old_lp)) {
+                return PPO_ERR_NONFINITE;
+            }
+        }
+        offset += A;
+    }
+
+    float inv_active = 1.0f / (float)n_active;
+    float total_entropy = 0.0f;
+    offset = 0;
+    for (int h = 0; h < nh; h++) {
+        int A = in->act_sizes[h];
+        if (!ppo_head_active(in->consumed[h], in->legal_count[h])) {
+            for (int j = 0; j < A; j++) {
+                logps_inout[offset + j] = 0.0f;
+            }
+            offset += A;
+            continue;
+        }
+
+        int act = (int)in->actions[h];
+        float lp = in->head_lp_mix
+            ? in->head_lp_mix[h] : logps_inout[offset + act];
+        float logratio = lp - in->old_group_lp[h];
+        int count = 1;
+        float d_logp = 0.0f;
+        PpoGroupStats one;
+        int code = ppo_group_row(PPO_CLIP_PER_HEAD, 1, &logratio, &count,
+            in->adv, in->clip_coef, in->inv_nt * inv_active, &d_logp, &one);
+        if (code != PPO_ERR_NONE) {
+            return code;
+        }
+        stats->pg_loss += one.pg_loss;
+        stats->old_kl += one.old_kl;
+        stats->kl += one.kl;
+        stats->clipfrac += one.clipfrac;
+        stats->importance += one.importance;
+        stats->abs_logratio += one.abs_logratio;
+        stats->logratio_max = fmaxf(stats->logratio_max, one.logratio_max);
+        stats->logratio_min = fminf(stats->logratio_min, one.logratio_min);
+        stats->ratio_max = fmaxf(stats->ratio_max, one.ratio_max);
+
+        float ent = 0.0f;
+        for (int j = 0; j < A; j++) {
+            float logp = logps_inout[offset + j];
+            ent -= expf(logp) * logp;
+        }
+        total_entropy += ent;
+        if (in->head_grad_scale) {
+            d_logp *= in->head_grad_scale[h];
+        }
+        float d_ent = in->inv_nt * (-in->ent_coef) * inv_active;
+        for (int j = 0; j < A; j++) {
+            float logp = logps_inout[offset + j];
+            float p = expf(logp);
+            logps_inout[offset + j] =
+                ((j == act ? 1.0f : 0.0f) - p) * d_logp
+                + d_ent * p * (-ent - logp);
+        }
+        offset += A;
+    }
+
+    stats->pg_loss *= inv_active;
+    stats->old_kl *= inv_active;
+    stats->kl *= inv_active;
+    stats->clipfrac *= inv_active;
+    stats->importance *= inv_active;
+    stats->abs_logratio *= inv_active;
+    stats->active_groups = n_active;
+    *out_entropy = total_entropy * inv_active;
+    return PPO_ERR_NONE;
+}
+
 // Forward + backward of the grouped surrogate for one transition.
 // logps_inout holds per-action new log-probs on entry (A_total wide, heads
 // concatenated) and receives the logit gradients on exit. Inactive heads —
@@ -510,6 +638,10 @@ typedef struct {
 template <int CAP>
 PPO_HD int ppo_group_row_apply(const PpoGroupRowInput* in, float* logps_inout,
         PpoGroupStats* stats, float* out_entropy, int* out_active_heads) {
+    if (in->mode == PPO_CLIP_PER_HEAD) {
+        return ppo_per_head_row_apply(
+            in, logps_inout, stats, out_entropy, out_active_heads);
+    }
     float g_logratio[CAP];
     float g_dlogp[CAP];
     int g_count[CAP];
@@ -517,7 +649,9 @@ PPO_HD int ppo_group_row_apply(const PpoGroupRowInput* in, float* logps_inout,
     int ng = in->num_groups;
     *out_entropy = 0.0f;
     *out_active_heads = 0;
-    if (ng <= 0 || ng > CAP || nh <= 0) {
+    if ((in->mode != PPO_CLIP_GROUP_SUM
+            && in->mode != PPO_CLIP_GROUP_MEAN)
+            || ng <= 0 || ng > CAP || nh <= 0 || nh > PPO_MAX_HEADS) {
         return PPO_ERR_SHAPE;
     }
     for (int g = 0; g < ng; g++) {

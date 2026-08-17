@@ -62,6 +62,8 @@ def lib():
         ci, ci, fp, ip, cf, cf, cf, fp, fp, ip]
     lib.ppo_shim_mask_legal_count.argtypes = [fp, ci, ip]
     lib.ppo_shim_head_active.argtypes = [ci, ci]
+    lib.ppo_shim_max_heads.restype = ci
+    lib.ppo_shim_max_groups.restype = ci
     lib.ppo_shim_group_row_apply.argtypes = [
         ci, ci, ci, ip, ip, ip, ip, fp, fp, cf, cf, cf, cf, fp, fp, fp, ip, ip]
     return lib
@@ -144,6 +146,8 @@ def test_default_config_is_joint_with_disabled_sentinel(lib):
     assert mode == JOINT
     assert groups == 0, "joint must not allocate grouped buffers"
     assert ids == [-1, -1, -1, -1]
+    runtime = open(os.path.join(ROOT, "src", "pufferl.cu")).read()
+    assert "if (hypers.ppo_num_groups > 0)" in runtime
 
 
 def test_joint_rejects_an_explicit_mapping(lib):
@@ -158,6 +162,11 @@ def test_joint_rejects_an_explicit_mapping(lib):
 ])
 def test_clip_mode_parse(lib, mode, expected):
     assert lib.ppo_shim_clip_mode_parse(mode.encode()) == expected
+
+
+def test_cuda_shape_bounds_are_independent_and_exact(lib):
+    assert lib.ppo_shim_max_heads() == 256
+    assert lib.ppo_shim_max_groups() == 64
 
 
 @pytest.mark.parametrize("bad", ["", "Joint", "group", "grouped_sum", "0", "-1"])
@@ -201,7 +210,7 @@ def test_invalid_group_mappings_rejected(lib, ids, reason):
 
 
 def test_group_id_at_or_above_the_cuda_bound_is_rejected(lib):
-    cap = lib.ppo_shim_max_heads()
+    cap = lib.ppo_shim_max_groups()
     ids = ",".join(["0", "0", "1", str(cap)])
     ok, _, _, _, err = validate(lib, "group_sum", ids)
     assert ok == 0
@@ -263,6 +272,79 @@ def test_grouped_rejects_too_many_heads(lib):
                                 act_sizes=[2] * n)
     assert ok == 0
     assert "PPO_MAX_HEADS" in err
+
+
+def _kaggriculture_group_ids():
+    # Six heads per group, permuted so adjacent heads are not grouped together.
+    return [(h * 5) % 42 for h in range(252)]
+
+
+def test_kaggriculture_per_head_accepts_252_heads(lib):
+    n = 252
+    ok, mode, ids, groups, err = validate(
+        lib, "per_head", "-1", num_atns=n, act_sizes=[2] * n)
+    assert ok == 1, err
+    assert mode == PER_HEAD
+    assert ids == list(range(n))
+    assert groups == n
+
+    identity = ",".join(str(h) for h in range(n))
+    ok, _, ids, groups, err = validate(
+        lib, "per_head", identity, num_atns=n, act_sizes=[2] * n)
+    assert ok == 1, err
+    assert ids == list(range(n)) and groups == n
+
+
+@pytest.mark.parametrize("mode,expected", [
+    ("group_sum", GROUP_SUM), ("group_mean", GROUP_MEAN),
+])
+def test_kaggriculture_group_modes_accept_252_heads_42_groups(
+        lib, mode, expected):
+    mapping = _kaggriculture_group_ids()
+    ok, parsed, ids, groups, err = validate(
+        lib, mode, ",".join(map(str, mapping)),
+        num_atns=252, act_sizes=[2] * 252)
+    assert ok == 1, err
+    assert parsed == expected
+    assert ids == mapping
+    assert groups == 42
+    assert all(mapping.count(g) == 6 for g in range(42))
+
+
+def test_kaggriculture_rejects_non_dense_and_over_bound_mappings(lib):
+    mapping = _kaggriculture_group_ids()
+    non_dense = [18 if group == 17 else group for group in mapping]
+    ok, _, _, _, err = validate(
+        lib, "group_sum", ",".join(map(str, non_dense)),
+        num_atns=252, act_sizes=[2] * 252)
+    assert ok == 0
+    assert "not dense" in err
+
+    over_bound = list(mapping)
+    over_bound[0] = lib.ppo_shim_max_groups()
+    ok, _, _, _, err = validate(
+        lib, "group_mean", ",".join(map(str, over_bound)),
+        num_atns=252, act_sizes=[2] * 252)
+    assert ok == 0
+    assert "PPO_MAX_GROUPS" in err
+
+
+@pytest.mark.parametrize("mode", [PER_HEAD, GROUP_SUM, GROUP_MEAN])
+def test_kaggriculture_exact_shape_max_active_factors(lib, mode):
+    n = 252
+    mapping = list(range(n)) if mode == PER_HEAD \
+        else _kaggriculture_group_ids()
+    groups = n if mode == PER_HEAD else 42
+    logps = [math.log(0.5)] * (2 * n)
+    old_group_lp = [math.log(0.5)] * groups if mode == PER_HEAD \
+        else [6 * math.log(0.5)] * groups
+    got = apply_row(
+        lib, mode, [2] * n, mapping, [2] * n, [1] * n, [0.0] * n,
+        old_group_lp, logps, 1.0, 0.2, 0.0, 1.0)
+    assert got["code"] == ERR_NONE
+    assert got["active_heads"] == n
+    assert got["active_groups"] == groups
+    assert got["pg_loss"] == pytest.approx(-1.0, rel=1e-6)
 
 
 def test_joint_allows_continuous_and_vtrace(lib):

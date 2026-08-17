@@ -2,6 +2,8 @@
 // host C++ compiler. Not for execution.
 #pragma once
 #include <math.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,9 +74,13 @@ static inline float safe_continuous_logstd(const precision_t* l, int i) {
     return finite_or_clamp(to_float(l[i]), -20.0f, 2.0f);
 }
 
-// Env constants: a 4-head categorical build.
+// Env constants: a 4-head categorical build unless the syntax test overrides it.
+#ifndef NUM_ATNS
 #define NUM_ATNS 4
+#endif
+#ifndef ACT_SIZES
 #define ACT_SIZES {3, 2, 4, 2}
+#endif
 constexpr int PPO_THREADS = 256;
 
 // curand stubs for the sampler.

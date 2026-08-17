@@ -79,7 +79,7 @@ int ppo_shim_group_row_apply(int mode, int num_atns, int num_groups,
     in.inv_nt = inv_nt;
 
     PpoGroupStats st;
-    int code = ppo_group_row_apply<PPO_MAX_HEADS>(&in, logps_inout, &st,
+    int code = ppo_group_row_apply<PPO_MAX_GROUPS>(&in, logps_inout, &st,
         entropy_out, active_heads_out);
     stats_out[0] = st.pg_loss;
     stats_out[1] = st.old_kl;
@@ -96,6 +96,10 @@ int ppo_shim_group_row_apply(int mode, int num_atns, int num_groups,
 
 int ppo_shim_max_heads(void) {
     return PPO_MAX_HEADS;
+}
+
+int ppo_shim_max_groups(void) {
+    return PPO_MAX_GROUPS;
 }
 
 }  // extern "C"
