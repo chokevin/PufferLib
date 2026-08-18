@@ -62,7 +62,7 @@ constexpr cublasComputeType_t CUBLAS_COMPUTE = CUBLAS_COMPUTE_32F;
 
 #define PUF_MAX_DIMS 8
 #define BLOCK_SIZE 256
-int grid_size(int N) {
+int grid_size(int64_t N) {
     return (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 }
 
@@ -1600,38 +1600,38 @@ __global__ void transpose_102(float* dst, const float* src, int A, int B, int C)
 __global__ void transpose_primary_102(precision_t* dst, const precision_t* src,
         int T, int B, int C, int agents_per_buf,
         int primary_start, int primary_count) {
-    int train_agents = (B / agents_per_buf) * primary_count;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = T * train_agents * C;
+    int64_t train_agents = (int64_t)(B / agents_per_buf) * primary_count;
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)T * train_agents * C;
     if (idx >= total) {
         return;
     }
-    int t = idx / (train_agents * C);
-    int rem = idx % (train_agents * C);
-    int train_agent = rem / C;
-    int c = rem % C;
-    int buf = train_agent / primary_count;
-    int local = train_agent % primary_count;
-    int src_agent = buf * agents_per_buf + primary_start + local;
+    int64_t t = idx / (train_agents * C);
+    int64_t rem = idx % (train_agents * C);
+    int64_t train_agent = rem / C;
+    int64_t c = rem % C;
+    int64_t buf = train_agent / primary_count;
+    int64_t local = train_agent % primary_count;
+    int64_t src_agent = buf * agents_per_buf + primary_start + local;
     dst[(train_agent * T + t) * C + c] = src[(t * B + src_agent) * C + c];
 }
 
 __global__ void transpose_primary_102(float* dst, const float* src,
         int T, int B, int C, int agents_per_buf,
         int primary_start, int primary_count) {
-    int train_agents = (B / agents_per_buf) * primary_count;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = T * train_agents * C;
+    int64_t train_agents = (int64_t)(B / agents_per_buf) * primary_count;
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)T * train_agents * C;
     if (idx >= total) {
         return;
     }
-    int t = idx / (train_agents * C);
-    int rem = idx % (train_agents * C);
-    int train_agent = rem / C;
-    int c = rem % C;
-    int buf = train_agent / primary_count;
-    int local = train_agent % primary_count;
-    int src_agent = buf * agents_per_buf + primary_start + local;
+    int64_t t = idx / (train_agents * C);
+    int64_t rem = idx % (train_agents * C);
+    int64_t train_agent = rem / C;
+    int64_t c = rem % C;
+    int64_t buf = train_agent / primary_count;
+    int64_t local = train_agent % primary_count;
+    int64_t src_agent = buf * agents_per_buf + primary_start + local;
     dst[(train_agent * T + t) * C + c] = src[(t * B + src_agent) * C + c];
 }
 
@@ -1666,10 +1666,12 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
     int primary_start = pufferl->vec->policy_layout[0];
     int primary_count = pufferl->vec->policy_layout[1] - primary_start;
     int train_agents = pufferl->train_agents;
-    transpose_primary_102<<<grid_size(T * train_agents * obs_size), BLOCK_SIZE, 0, stream>>>(
+    transpose_primary_102<<<grid_size(
+        (int64_t)T * train_agents * obs_size), BLOCK_SIZE, 0, stream>>>(
         rollouts->observations.data, src.observations.data, T, B, obs_size,
         agents_per_buf, primary_start, primary_count);
-    transpose_primary_102<<<grid_size(T * train_agents * num_atns), BLOCK_SIZE, 0, stream>>>(
+    transpose_primary_102<<<grid_size(
+        (int64_t)T * train_agents * num_atns), BLOCK_SIZE, 0, stream>>>(
         rollouts->actions.data, src.actions.data, T, B, num_atns,
         agents_per_buf, primary_start, primary_count);
     transpose_primary_102<<<grid_size(T * train_agents), BLOCK_SIZE, 0, stream>>>(
@@ -1690,7 +1692,8 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
     transpose_primary_102<<<grid_size(T * train_agents), BLOCK_SIZE, 0, stream>>>(
         rollouts->values.data, src.values.data, T, B, 1,
         agents_per_buf, primary_start, primary_count);
-    transpose_primary_102<<<grid_size(T * train_agents * mask_c), BLOCK_SIZE, 0, stream>>>(
+    transpose_primary_102<<<grid_size(
+        (int64_t)T * train_agents * mask_c), BLOCK_SIZE, 0, stream>>>(
         rollouts->action_mask.data, src.action_mask.data, T, B, mask_c,
         agents_per_buf, primary_start, primary_count);
 

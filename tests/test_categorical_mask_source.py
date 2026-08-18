@@ -291,6 +291,23 @@ def test_mask_semantics_stay_zero_illegal_nonzero_legal():
     assert "unsigned char* action_mask;" in PUFFERL
 
 
+def test_primary_rollout_transpose_uses_64_bit_indexing():
+    assert "int grid_size(int64_t N)" in PUFFERL
+    for signature in (
+        "__global__ void transpose_primary_102(precision_t* dst",
+        "__global__ void transpose_primary_102(float* dst",
+    ):
+        transpose = body(PUFFERL, signature)
+        assert "int64_t train_agents" in transpose
+        assert "int64_t idx" in transpose
+        assert "int64_t total = (int64_t)T * train_agents * C;" in transpose
+        assert "int64_t src_agent" in transpose
+    assert "(int64_t)T * train_agents * obs_size" in PUFFERL
+    assert "(int64_t)T * train_agents * num_atns" in PUFFERL
+    assert "(int64_t)T * train_agents * mask_c" in PUFFERL
+    assert 128 * 8192 * 7477 > 2**31 - 1
+
+
 def test_environment_specific_gating_stays_caller_side():
     for hook in ("nethack_head_used", "nethack_verb_eps_for_mask",
                  "kg_puffer5_head_used"):
