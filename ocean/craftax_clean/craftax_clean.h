@@ -51,6 +51,9 @@ typedef struct {
     int item_map[NUM_LEVELS][MAP_SIZE][MAP_SIZE];
     int mob_map[NUM_LEVELS][MAP_SIZE][MAP_SIZE];
     unsigned char light_map[NUM_LEVELS][MAP_SIZE][MAP_SIZE];
+    uint64_t spawn_land[NUM_LEVELS][MAP_SIZE];
+    uint64_t spawn_grave[NUM_LEVELS][MAP_SIZE];
+    uint64_t spawn_water[NUM_LEVELS][MAP_SIZE];
     int down_ladders[NUM_LEVELS][2];
     int up_ladders[NUM_LEVELS][2];
     int chests_opened[NUM_LEVELS];
@@ -323,6 +326,43 @@ static inline uint32_t randint_u32_at(Rng key, uint64_t index, uint32_t minval, 
 
 static inline int randint_at(Rng key, uint64_t index, int minval, int maxval) {
     return (int)randint_u32_at(key, index, (uint32_t)minval, (uint32_t)maxval);
+}
+
+static inline void set_spawn_bit(uint64_t* row_bits, int col, bool on) {
+    uint64_t bit = 1ull << col;
+    if (on) {
+        *row_bits |= bit;
+    } else {
+        *row_bits &= ~bit;
+    }
+}
+
+static inline void refresh_spawn_cell(State* state, int level, int row, int col) {
+    int block = state->map[level][row][col];
+    set_spawn_bit(&state->spawn_land[level][row], col,
+        block == BLOCK_GRASS || block == BLOCK_PATH
+        || block == BLOCK_FIRE_GRASS || block == BLOCK_ICE_GRASS);
+    set_spawn_bit(&state->spawn_grave[level][row], col,
+        block == BLOCK_GRAVE || block == BLOCK_GRAVE2 || block == BLOCK_GRAVE3);
+    set_spawn_bit(&state->spawn_water[level][row], col, block == BLOCK_WATER);
+}
+
+static inline void set_block(State* state, int level, int row, int col, int block) {
+    state->map[level][row][col] = block;
+    refresh_spawn_cell(state, level, row, col);
+}
+
+static inline void refresh_spawn_maps(State* state) {
+    memset(state->spawn_land, 0, sizeof(state->spawn_land));
+    memset(state->spawn_grave, 0, sizeof(state->spawn_grave));
+    memset(state->spawn_water, 0, sizeof(state->spawn_water));
+    for (int level = 0; level < NUM_LEVELS; level++) {
+        for (int row = 0; row < MAP_SIZE; row++) {
+            for (int col = 0; col < MAP_SIZE; col++) {
+                refresh_spawn_cell(state, level, row, col);
+            }
+        }
+    }
 }
 
 static inline bool walkable(int block) {
@@ -993,6 +1033,7 @@ void generate_world_from_key(State* state, Rng rng) {
     state->boss_timestep_to_spawn_this_round = BOSS_SPAWN_TURNS;
     float cosine = cosf(3.14159265358979323846f * 0.3f);
     state->light_level = 1.0f - powf(fabsf(cosine), 3.0f);
+    refresh_spawn_maps(state);
 }
 
 void generate_world(State* state, int seed) {
@@ -1044,56 +1085,37 @@ static inline bool scatter_index(int index, int size, int* mapped) {
     return true;
 }
 
-static inline void scatter_mobs3(
+static inline void write_mob_obs(
+    float* obs,
     const State* state,
     const Mobs* mobs,
     int slots,
-    int mob_class,
-    uint8_t raw[OBS_ROWS][OBS_COLS][NUM_MOB_CLASSES][NUM_MOB_TYPES]
+    int channel
 ) {
+    int level = state->player_level;
     for (int i = 0; i < slots; i++) {
-        int type_id = mobs->type_id[i];
-        int local_row = mobs->position[i][0] - state->player_position[0] + OBS_ROWS / 2;
-        int local_col = mobs->position[i][1] - state->player_position[1] + OBS_COLS / 2;
-        int scatter_row;
-        int scatter_col;
-        if (!scatter_index(local_row, OBS_ROWS, &scatter_row)
-            || !scatter_index(local_col, OBS_COLS, &scatter_col)
-            || type_id < 0
-            || type_id >= NUM_MOB_TYPES) {
+        if (!mobs->mask[i]) {
             continue;
         }
-        bool on_screen = local_row >= 0 && local_row < OBS_ROWS
-            && local_col >= 0 && local_col < OBS_COLS;
-        if (mobs->mask[i] && on_screen) {
-            raw[scatter_row][scatter_col][mob_class][type_id] = 1u;
+        int type_id = mobs->type_id[i];
+        if (type_id < 0 || type_id >= NUM_MOB_TYPES) {
+            continue;
         }
-    }
-}
-
-static inline void set_packed_mobs(float* obs, int* obs_idx, const State* state, int row, int col) {
-    uint8_t raw[OBS_ROWS][OBS_COLS][NUM_MOB_CLASSES][NUM_MOB_TYPES];
-    memset(raw, 0, sizeof(raw));
-    int level = state->player_level;
-    scatter_mobs3(state, &state->melee_mobs[level], MAX_MELEE_MOBS, 0, raw);
-    scatter_mobs3(state, &state->passive_mobs[level], MAX_PASSIVE_MOBS, 1, raw);
-    scatter_mobs3(state, &state->ranged_mobs[level], MAX_RANGED_MOBS, 2, raw);
-    scatter_mobs3(state, &state->mob_projectiles[level], MAX_MOB_PROJECTILES, 3, raw);
-    scatter_mobs3(state, &state->player_projectiles[level], MAX_PLAYER_PROJECTILES, 4, raw);
-
-    int local_row = row - state->player_position[0] + OBS_ROWS / 2;
-    int local_col = col - state->player_position[1] + OBS_COLS / 2;
-    for (int cls = 0; cls < NUM_MOB_CLASSES; cls++) {
-        int found = -1;
-        if (local_row >= 0 && local_row < OBS_ROWS && local_col >= 0 && local_col < OBS_COLS) {
-            for (int type_id = 0; type_id < NUM_MOB_TYPES; type_id++) {
-                if (raw[local_row][local_col][cls][type_id]) {
-                    found = type_id;
-                    break;
-                }
-            }
+        int world_row = mobs->position[i][0];
+        int world_col = mobs->position[i][1];
+        int local_row = world_row - state->player_position[0] + OBS_ROWS / 2;
+        int local_col = world_col - state->player_position[1] + OBS_COLS / 2;
+        if (local_row < 0 || local_row >= OBS_ROWS
+            || local_col < 0 || local_col >= OBS_COLS) {
+            continue;
         }
-        obs[(*obs_idx)++] = (float)(found + 1);
+        if (world_row < 0 || world_row >= MAP_SIZE
+            || world_col < 0 || world_col >= MAP_SIZE
+            || state->light_map[level][world_row][world_col] <= 12) {
+            continue;
+        }
+        int base = (local_row * OBS_COLS + local_col) * OBS_TILE_CHANNELS;
+        obs[base + 3 + channel] = (float)(type_id + 1);
     }
 }
 
@@ -1101,41 +1123,38 @@ static inline bool boss_vulnerable(const State* state);
 
 void compute_observations(Craftax* env) {
     State* state = &env->state;
-    int obs_idx = 0;
+    float* obs = env->agents[0].observations;
+    const int map_obs = OBS_ROWS * OBS_COLS * OBS_TILE_CHANNELS;
+    memset(obs, 0, (size_t)map_obs * sizeof(float));
+
+    int level = state->player_level;
+    int row = state->player_position[0];
+    int col = state->player_position[1];
     const int row_radius = OBS_ROWS / 2;
     const int col_radius = OBS_COLS / 2;
 
-    int level = state->player_level;
-    int (*map)[MAP_SIZE] = state->map[level];
-    int (*item_map)[MAP_SIZE] = state->item_map[level];
-
-    int row = state->player_position[0];
-    int col = state->player_position[1];
-
-    // Packed symbolic cells: block, item+1, visibility, then one type+1
-    // value for melee, passive, ranged, mob projectile, player projectile.
     for (int r = -row_radius; r <= row_radius; r++) {
+        int obs_row = row + r;
+        bool row_in = obs_row >= 0 && obs_row < MAP_SIZE;
         for (int c = -col_radius; c <= col_radius; c++) {
-            int obs_row = row + r;
             int obs_col = col + c;
-            bool in_bounds = obs_row >= 0 && obs_row < MAP_SIZE
-                && obs_col >= 0 && obs_col < MAP_SIZE;
-            bool visible = in_bounds && state->light_map[level][obs_row][obs_col] > 12;
-            int block = visible ? map[obs_row][obs_col] : 0;
-            int item = visible ? item_map[obs_row][obs_col] + 1 : 0;
-
-            env->agents[0].observations[obs_idx++] = (float)block;
-            env->agents[0].observations[obs_idx++] = (float)item;
-            env->agents[0].observations[obs_idx++] = visible ? 1.0f : 0.0f;
-            if (visible) {
-                set_packed_mobs(env->agents[0].observations, &obs_idx, state, obs_row, obs_col);
-            } else {
-                for (int i = 0; i < NUM_MOB_CLASSES; i++) {
-                    env->agents[0].observations[obs_idx++] = 0.0f;
-                }
+            int base = ((r + row_radius) * OBS_COLS + (c + col_radius)) * OBS_TILE_CHANNELS;
+            if (row_in && obs_col >= 0 && obs_col < MAP_SIZE
+                && state->light_map[level][obs_row][obs_col] > 12) {
+                obs[base] = (float)state->map[level][obs_row][obs_col];
+                obs[base + 1] = (float)(state->item_map[level][obs_row][obs_col] + 1);
+                obs[base + 2] = 1.0f;
             }
         }
     }
+
+    write_mob_obs(obs, state, &state->melee_mobs[level], MAX_MELEE_MOBS, 0);
+    write_mob_obs(obs, state, &state->passive_mobs[level], MAX_PASSIVE_MOBS, 1);
+    write_mob_obs(obs, state, &state->ranged_mobs[level], MAX_RANGED_MOBS, 2);
+    write_mob_obs(obs, state, &state->mob_projectiles[level], MAX_MOB_PROJECTILES, 3);
+    write_mob_obs(obs, state, &state->player_projectiles[level], MAX_PLAYER_PROJECTILES, 4);
+
+    int obs_idx = map_obs;
 
     // Player inventory (normalized)
     env->agents[0].observations[obs_idx++] = sqrtf((float)state->inventory.wood) / 10.0f;

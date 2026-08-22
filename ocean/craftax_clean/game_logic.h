@@ -465,7 +465,7 @@ static inline void scatter_set_block(State* state, int level, int row, int col, 
         || !scatter_index(col, MAP_SIZE, &mapped_col)) {
         return;
     }
-    state->map[mapped_level][mapped_row][mapped_col] = block;
+    set_block(state, mapped_level, mapped_row, mapped_col, block);
 }
 
 static inline void move_mob_projectile_slot(State* state, int level, int slot) {
@@ -607,15 +607,17 @@ static inline int pick_kth(int count, Rng key) {
     return count - 1;
 }
 
-static inline bool spawn_terrain_ok(int block, bool boss, bool water_only) {
-    if (boss) {
-        return block == BLOCK_GRAVE || block == BLOCK_GRAVE2 || block == BLOCK_GRAVE3;
+static inline void occupy_mobs(const Mobs* mobs, int slots, uint64_t occupied[MAP_SIZE]) {
+    for (int i = 0; i < slots; i++) {
+        if (!mobs->mask[i]) {
+            continue;
+        }
+        int row = mobs->position[i][0];
+        int col = mobs->position[i][1];
+        if ((unsigned)row < MAP_SIZE && (unsigned)col < MAP_SIZE) {
+            occupied[row] |= 1ull << col;
+        }
     }
-    if (water_only) {
-        return block == BLOCK_WATER;
-    }
-    return block == BLOCK_GRASS || block == BLOCK_PATH
-        || block == BLOCK_FIRE_GRASS || block == BLOCK_ICE_GRASS;
 }
 
 static inline int collect_spawn_cells(
@@ -628,30 +630,40 @@ static inline int collect_spawn_cells(
     int* rows,
     int* cols
 ) {
+    const uint64_t* terrain = boss ? state->spawn_grave[level]: (water_only ? state->spawn_water[level] : state->spawn_land[level]);
+    uint64_t occupied[MAP_SIZE];
+    memset(occupied, 0, sizeof(occupied));
+    occupy_mobs(&state->passive_mobs[level], MAX_PASSIVE_MOBS, occupied);
+    occupy_mobs(&state->melee_mobs[level], MAX_MELEE_MOBS, occupied);
+    occupy_mobs(&state->ranged_mobs[level], MAX_RANGED_MOBS, occupied);
+
     int pr = state->player_position[0];
     int pc = state->player_position[1];
     int limit = MOB_DESPAWN_DISTANCE - 1;
     int count = 0;
     for (int dr = -limit; dr <= limit; dr++) {
+        int row = pr + dr;
+        if ((unsigned)row >= MAP_SIZE) {
+            continue;
+        }
+        uint64_t bits = terrain[row] & ~occupied[row];
+        if (!bits) {
+            continue;
+        }
         for (int dc = -limit; dc <= limit; dc++) {
             int distance2 = dr * dr + dc * dc;
             if (distance2 <= min_exclusive || distance2 >= max_exclusive) {
                 continue;
             }
-            int row = pr + dr;
             int col = pc + dc;
-            if (row < 0 || row >= MAP_SIZE || col < 0 || col >= MAP_SIZE) {
+            if ((unsigned)col >= MAP_SIZE) {
                 continue;
             }
-            if (state->mob_map[level][row][col]) {
-                continue;
+            if (bits & (1ull << col)) {
+                rows[count] = row;
+                cols[count] = col;
+                count++;
             }
-            if (!spawn_terrain_ok(state->map[level][row][col], boss, water_only)) {
-                continue;
-            }
-            rows[count] = row;
-            cols[count] = col;
-            count++;
         }
     }
     return count;
@@ -1264,15 +1276,15 @@ static inline void place_block(State* state, int action) {
     Inventory* inv = &state->inventory;
 
     if (action == ACTION_PLACE_TABLE && !occupied && inv->wood >= 2) {
-        state->map[level][row][col] = BLOCK_CRAFTING_TABLE;
+        set_block(state, level, row, col, BLOCK_CRAFTING_TABLE);
         inv->wood -= 2;
         state->achievements[ACH_PLACE_TABLE] = 1;
     } else if (action == ACTION_PLACE_FURNACE && !occupied && inv->stone >= 1) {
-        state->map[level][row][col] = BLOCK_FURNACE;
+        set_block(state, level, row, col, BLOCK_FURNACE);
         inv->stone -= 1;
         state->achievements[ACH_PLACE_FURNACE] = 1;
     } else if (action == ACTION_PLACE_STONE && (block == BLOCK_WATER || !occupied) && inv->stone >= 1) {
-        state->map[level][row][col] = BLOCK_STONE;
+        set_block(state, level, row, col, BLOCK_STONE);
         inv->stone -= 1;
         state->achievements[ACH_PLACE_STONE] = 1;
     } else if (action == ACTION_PLACE_TORCH && can_place_item_on(block) && state->item_map[level][row][col] == ITEM_NONE && inv->torches >= 1) {
@@ -1281,7 +1293,7 @@ static inline void place_block(State* state, int action) {
         inv->torches -= 1;
         state->achievements[ACH_PLACE_TORCH] = 1;
     } else if (action == ACTION_PLACE_PLANT && block == BLOCK_GRASS && state->item_map[level][row][col] == ITEM_NONE && inv->sapling >= 1) {
-        state->map[level][row][col] = BLOCK_PLANT;
+        set_block(state, level, row, col, BLOCK_PLANT);
         inv->sapling -= 1;
         add_growing_plant(state, row, col);
         state->achievements[ACH_PLACE_PLANT] = 1;
@@ -1371,38 +1383,44 @@ static inline void interact_facing_tile(State* state, int action, Rng rng) {
     }
 
     if (block == BLOCK_TREE || block == BLOCK_FIRE_TREE || block == BLOCK_ICE_SHRUB) {
-        state->map[level][row][col] = block == BLOCK_TREE ? BLOCK_GRASS :
-            (block == BLOCK_FIRE_TREE ? BLOCK_FIRE_GRASS : BLOCK_ICE_GRASS);
+        set_block(
+            state,
+            level,
+            row,
+            col,
+            block == BLOCK_TREE ? BLOCK_GRASS :
+                (block == BLOCK_FIRE_TREE ? BLOCK_FIRE_GRASS : BLOCK_ICE_GRASS)
+        );
         inv->wood += 1;
     } else if (block == BLOCK_STONE && inv->pickaxe >= 1) {
-        state->map[level][row][col] = BLOCK_PATH;
+        set_block(state, level, row, col, BLOCK_PATH);
         inv->stone += 1;
     } else if (block == BLOCK_COAL && inv->pickaxe >= 1) {
-        state->map[level][row][col] = BLOCK_PATH;
+        set_block(state, level, row, col, BLOCK_PATH);
         inv->coal += 1;
     } else if (block == BLOCK_IRON && inv->pickaxe >= 2) {
-        state->map[level][row][col] = BLOCK_PATH;
+        set_block(state, level, row, col, BLOCK_PATH);
         inv->iron += 1;
     } else if (block == BLOCK_DIAMOND && inv->pickaxe >= 3) {
-        state->map[level][row][col] = BLOCK_PATH;
+        set_block(state, level, row, col, BLOCK_PATH);
         inv->diamond += 1;
     } else if (block == BLOCK_SAPPHIRE && inv->pickaxe >= 4) {
-        state->map[level][row][col] = BLOCK_PATH;
+        set_block(state, level, row, col, BLOCK_PATH);
         inv->sapphire += 1;
     } else if (block == BLOCK_RUBY && inv->pickaxe >= 4) {
-        state->map[level][row][col] = BLOCK_PATH;
+        set_block(state, level, row, col, BLOCK_PATH);
         inv->ruby += 1;
     } else if (block == BLOCK_STALAGMITE && inv->pickaxe >= 1) {
-        state->map[level][row][col] = BLOCK_PATH;
+        set_block(state, level, row, col, BLOCK_PATH);
         inv->stone += 1;
     } else if (block == BLOCK_CRAFTING_TABLE || block == BLOCK_FURNACE) {
-        state->map[level][row][col] = BLOCK_PATH;
+        set_block(state, level, row, col, BLOCK_PATH);
     } else if (block == BLOCK_WATER || block == BLOCK_FOUNTAIN) {
         state->player_drink = clampi(state->player_drink + 1, 0, max_drink(state));
         state->player_thirst = 0.0f;
         state->achievements[ACH_COLLECT_DRINK] = 1;
     } else if (block == BLOCK_RIPE_PLANT) {
-        state->map[level][row][col] = BLOCK_PLANT;
+        set_block(state, level, row, col, BLOCK_PLANT);
         for (int i = 0; i < MAX_GROWING_PLANTS; i++) {
             if (state->growing_plants_positions[i][0] == row
                 && state->growing_plants_positions[i][1] == col) {
@@ -1414,7 +1432,7 @@ static inline void interact_facing_tile(State* state, int action, Rng rng) {
         state->player_hunger = 0.0f;
         state->achievements[ACH_EAT_PLANT] = 1;
     } else if (block == BLOCK_CHEST) {
-        state->map[level][row][col] = BLOCK_PATH;
+        set_block(state, level, row, col, BLOCK_PATH);
         add_chest_loot(state, chest_key);
         state->achievements[ACH_OPEN_CHEST] = 1;
     } else if (block == BLOCK_NECROMANCER && boss_vulnerable(state) && fighting_boss(state)) {
@@ -1578,7 +1596,7 @@ static inline void update_plants(State* state) {
         int row = jax_index(state->growing_plants_positions[plant][0], MAP_SIZE);
         int col = jax_index(state->growing_plants_positions[plant][1], MAP_SIZE);
         if (state->growing_plants_age[plant] >= 600) {
-            state->map[0][row][col] = BLOCK_RIPE_PLANT;
+            set_block(state, 0, row, col, BLOCK_RIPE_PLANT);
         }
     }
 }
