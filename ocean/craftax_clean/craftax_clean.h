@@ -130,10 +130,8 @@ typedef struct {
     bool window_ready;
 } Client;
 
-// Fast SplitMix64/MurmurHash3 RNG, matching ocean/craftax threefry.h.
-typedef struct {
-    uint32_t word[2];
-} Rng;
+// Random number generation
+typedef uint64_t Rng;
 
 struct Env {
     Client* client;
@@ -166,22 +164,30 @@ static void c_init(Craftax* env) {
     env->client = NULL;
 }
 
-// World generation
-
-// RNG functions to achieve parity with JAX version
-uint64_t rng_to_u64(Rng key) {
-    return ((uint64_t)key.word[1] << 32) | key.word[0];
-}
-
-Rng rng_from_u64(uint64_t x) {
-    return (Rng){{(uint32_t)x, (uint32_t)(x >> 32)}};
-}
-
 Rng rng_seed(uint32_t seed) {
-    return (Rng){{seed, seed ^ 0x9E3779B9u}};
+    return (uint64_t)seed | ((uint64_t)(seed ^ 0x9E3779B9u) << 32);
 }
 
-uint64_t rng_mix64(uint64_t x) {
+void rng_split(Rng key, Rng* left, Rng* right) {
+    *left = key * 6364136223846793005ULL + 1;
+    *right = *left * 6364136223846793005ULL + 1;
+}
+
+void rng_split_n(Rng key, Rng* out, int n) {
+    for (int i = 0; i < n; i++) {
+        key = key * 6364136223846793005ULL + 1;
+        out[i] = key;
+    }
+}
+
+Rng rng_key(Rng* rng) {
+    Rng draw;
+    rng_split(*rng, rng, &draw);
+    return draw;
+}
+
+uint64_t rng_hash(Rng key, uint64_t i) {
+    uint64_t x = key ^ i;
     x ^= x >> 33;
     x *= 0xff51afd7ed558ccdULL;
     x ^= x >> 33;
@@ -190,54 +196,29 @@ uint64_t rng_mix64(uint64_t x) {
     return x;
 }
 
-uint64_t rng_hash64(Rng key, uint64_t counter) {
-    return rng_mix64(rng_to_u64(key) ^ counter);
-}
-
-void rng_split(Rng key, Rng* left, Rng* right) {
-    uint64_t state = rng_to_u64(key);
-    uint64_t s1 = state * 6364136223846793005ULL + 1;
-    uint64_t s2 = s1 * 6364136223846793005ULL + 1;
-    *left = rng_from_u64(s1);
-    *right = rng_from_u64(s2);
-}
-
-void rng_split_n(Rng key, Rng* out, int count) {
-    uint64_t state = rng_to_u64(key);
-    for (int i = 0; i < count; i++) {
-        state = state * 6364136223846793005ULL + 1;
-        out[i] = rng_from_u64(state);
-    }
-}
-
-uint32_t rng_u32_at(Rng key, uint64_t index) {
-    uint64_t h = rng_hash64(key, index);
+uint32_t rng_u32(Rng key, uint64_t i) {
+    uint64_t h = rng_hash(key, i);
     return (uint32_t)h ^ (uint32_t)(h >> 32);
 }
 
-float rng_f32_at(Rng key, uint64_t index) {
-    uint32_t bits = rng_u32_at(key, index);
-    uint32_t float_bits = (bits >> 9u) | 0x3F800000u;
-    float value;
-    memcpy(&value, &float_bits, sizeof(value));
-    return value - 1.0f;
+float rng_f32(Rng key, uint64_t i) {
+    uint32_t bits = (rng_u32(key, i) >> 9u) | 0x3F800000u;
+    float v;
+    memcpy(&v, &bits, sizeof(v));
+    return v - 1.0f;
 }
 
-float rng_f32(Rng key) {
-    return rng_f32_at(key, 0u);
+int randint(Rng key, uint64_t i, int lo, int hi) {
+    uint32_t span = (uint32_t)hi > (uint32_t)lo ? (uint32_t)(hi - lo) : 1u;
+    if ((span & (span - 1)) == 0) {
+        return lo + (int)(rng_u32(key, i) & (span - 1));
+    }
+    return lo + (int)((rng_hash(key, i) >> 32) * (uint64_t)span >> 32);
 }
 
 void store_rng(State* state, Rng rng) {
-    state->state_rng[0] = rng.word[0];
-    state->state_rng[1] = rng.word[1];
-}
-
-Rng rng_key(Rng* rng) {
-    Rng next;
-    Rng draw;
-    rng_split(*rng, &next, &draw);
-    *rng = next;
-    return draw;
+    state->state_rng[0] = (uint32_t)rng;
+    state->state_rng[1] = (uint32_t)(rng >> 32);
 }
 
 static int choice_valid(Rng key, const bool* valid, int count) {
@@ -252,7 +233,7 @@ static int choice_valid(Rng key, const bool* valid, int count) {
     if (valid_count == 0) {
         return 0;
     }
-    float draw = (float)valid_count * (1.0f - rng_f32(key));
+    float draw = (float)valid_count * (1.0f - rng_f32(key, 0));
     float cumulative = 0.0f;
     for (int i = 0; i < count; i++) {
         if (valid[i]) {
@@ -263,20 +244,6 @@ static int choice_valid(Rng key, const bool* valid, int count) {
         }
     }
     return last_valid;
-}
-
-static uint32_t randint_u32_at(Rng key, uint64_t index, uint32_t minval, uint32_t maxval) {
-    uint32_t span = maxval > minval ? maxval - minval : 1u;
-    if ((span & (span - 1)) == 0) {
-        uint32_t bits = rng_u32_at(key, index);
-        return minval + (bits & (span - 1));
-    }
-    uint64_t h = rng_hash64(key, index);
-    return minval + (uint32_t)(((h >> 32) * (uint64_t)span) >> 32);
-}
-
-static int randint_at(Rng key, uint64_t index, int minval, int maxval) {
-    return (int)randint_u32_at(key, index, (uint32_t)minval, (uint32_t)maxval);
 }
 
 static void refresh_spawn_cell(State* state, int level, int row, int col) {
@@ -354,6 +321,7 @@ void generate_fractal(
     int lacunarity,
     float* out
 ) {
+    // Perlin noise for world generation
     size_t size = (size_t)rows * (size_t)cols;
     memset(out, 0, size * sizeof(float));
     int frequency = 1;
@@ -385,7 +353,7 @@ void generate_fractal(
                     for (int dc = 0; dc < 2; dc++) {
                         uint64_t index = (uint64_t)(grad_row + dr) * (uint64_t)width
                             + (uint64_t)(grad_col + dc);
-                        float angle = NOISE_PI2 * rng_f32_at(angle_key, index);
+                        float angle = NOISE_PI2 * rng_f32(angle_key, index);
                         gx[dr][dc] = cosf(angle);
                         gy[dr][dc] = sinf(angle);
                     }
@@ -536,7 +504,7 @@ static void generate_smooth_level(
                 block = config->inner_mountain_block;
             }
             if (tree_noise[idx] > config->tree_threshold_perlin
-                && rng_f32_at(tree_uniform_key, (uint64_t)idx) > config->tree_threshold_uniform
+                && rng_f32(tree_uniform_key, (uint64_t)idx) > config->tree_threshold_uniform
                 && block == config->tree_requirement_block) {
                 block = config->tree;
             }
@@ -556,7 +524,7 @@ static void generate_smooth_level(
             for (int col = 0; col < MAP_SIZE; col++) {
                 int idx = cell_index(row, col);
                 if (state->map[level][row][col] == config->ore_requirement_blocks[ore_index]
-                    && rng_f32_at(ore_key, (uint64_t)idx) < config->ore_chances[ore_index]) {
+                    && rng_f32(ore_key, (uint64_t)idx) < config->ore_chances[ore_index]) {
                     state->map[level][row][col] = config->ores[ore_index];
                 }
             }
@@ -655,8 +623,8 @@ static void generate_dungeon_level(
     room_size_key = keys3[2];
     (void)ignored;
     for (int room = 0; room < num_rooms; room++) {
-        room_sizes[room][0] = randint_at(room_size_key, (uint64_t)room * 2u, min_room_size, max_room_size);
-        room_sizes[room][1] = randint_at(room_size_key, (uint64_t)room * 2u + 1u, min_room_size, max_room_size);
+        room_sizes[room][0] = randint(room_size_key, (uint64_t)room * 2u, min_room_size, max_room_size);
+        room_sizes[room][1] = randint(room_size_key, (uint64_t)room * 2u + 1u, min_room_size, max_room_size);
     }
 
     Rng room_rng;
@@ -670,8 +638,8 @@ static void generate_dungeon_level(
         int room_col = (room_chunk / world_chunk_height) * chunk_size + max_room_size;
         Rng position_key;
         rng_split(room_rng, &room_rng, &position_key);
-        room_row += randint_at(position_key, 0, 0, chunk_size - min_room_size);
-        room_col += randint_at(position_key, 1, 0, chunk_size - min_room_size);
+        room_row += randint(position_key, 0, 0, chunk_size - min_room_size);
+        room_col += randint(position_key, 1, 0, chunk_size - min_room_size);
         room_positions[room_index][0] = room_row;
         room_positions[room_index][1] = room_col;
 
@@ -690,16 +658,16 @@ static void generate_dungeon_level(
 
         Rng chest_key;
         rng_split(room_rng, &room_rng, &chest_key);
-        int chest_row = randint_at(chest_key, 0, 1, room_sizes[room_index][0] - 1);
-        int chest_col = randint_at(chest_key, 1, 1, room_sizes[room_index][1] - 1);
+        int chest_row = randint(chest_key, 0, 1, room_sizes[room_index][0] - 1);
+        int chest_col = randint(chest_key, 1, 1, room_sizes[room_index][1] - 1);
         padded_map[room_row + chest_row][room_col + chest_col] = BLOCK_CHEST;
 
         Rng fountain_keys[3];
         rng_split_n(room_rng, fountain_keys, 3);
         room_rng = fountain_keys[0];
-        int fountain_row = randint_at(fountain_keys[1], 0, 1, room_sizes[room_index][0] - 1);
-        int fountain_col = randint_at(fountain_keys[1], 1, 1, room_sizes[room_index][1] - 1);
-        if (rng_f32(fountain_keys[2]) > 0.5f) {
+        int fountain_row = randint(fountain_keys[1], 0, 1, room_sizes[room_index][0] - 1);
+        int fountain_col = randint(fountain_keys[1], 1, 1, room_sizes[room_index][1] - 1);
+        if (rng_f32(fountain_keys[2], 0) > 0.5f) {
             padded_map[room_row + fountain_row][room_col + fountain_col] = config->fountain_block;
         }
     }
@@ -776,7 +744,7 @@ static void generate_dungeon_level(
     for (int row = 0; row < MAP_SIZE; row++) {
         for (int col = 0; col < MAP_SIZE; col++) {
             size_t idx = (size_t)cell_index(row, col);
-            bool rare = (1.0f - rng_f32_at(rare_key, idx)) > 0.9f;
+            bool rare = (1.0f - rng_f32(rare_key, idx)) > 0.9f;
             int wall_map = rare ? BLOCK_WALL_MOSS : BLOCK_WALL;
             bool rare_path = rare
                 && state->map[level][row][col] == BLOCK_PATH
@@ -824,7 +792,7 @@ static void permute_potions(Rng key, int out[6]) {
     (void)carry;
     uint32_t keys[6];
     for (int i = 0; i < 6; i++) {
-        keys[i] = rng_u32_at(sort_key, (uint64_t)i);
+        keys[i] = rng_u32(sort_key, (uint64_t)i);
         out[i] = i;
     }
     for (int i = 1; i < 6; i++) {
@@ -1493,7 +1461,7 @@ int floor_mob_type(int level, int mob_class) {
 }
 
 int pick_kth(int count, Rng key) {
-    float draw = (float)count * (1.0f - rng_f32(key));
+    float draw = (float)count * (1.0f - rng_f32(key, 0));
     float cumulative = 0.0f;
     for (int k = 0; k < count; k++) {
         cumulative += 1.0f;
@@ -1646,11 +1614,11 @@ void spawn_mobs(State* state, Rng rng) {
     state->ranged_mobs[level].type_id[ranged_slot] = ranged_type;
 
     bool try_passive = !boss && passive_count < MAX_PASSIVE_MOBS
-        && rng_f32(passive_prob) < chances[level][0];
+        && rng_f32(passive_prob, 0) < chances[level][0];
     bool try_melee = melee_count < MAX_MELEE_MOBS
-        && rng_f32(melee_prob) < melee_chance * (float)coeff;
+        && rng_f32(melee_prob, 0) < melee_chance * (float)coeff;
     bool try_ranged = ranged_count < MAX_RANGED_MOBS
-        && rng_f32(ranged_prob) < chances[level][2] * (float)coeff;
+        && rng_f32(ranged_prob, 0) < chances[level][2] * (float)coeff;
     if (!try_passive && !try_melee && !try_ranged) {
         return;
     }
@@ -1694,7 +1662,7 @@ void spawn_mobs(State* state, Rng rng) {
 }
 
 void choose_direction(Rng key, int count, int direction[2]) {
-    int choice = randint_at(key, 0u, 0, count);
+    int choice = randint(key, 0u, 0, count);
     direction[0] = 0;
     direction[1] = 0;
     if (choice == 0) {
@@ -1719,7 +1687,7 @@ int choose_player_axis(Rng key, int distance_row, int distance_col) {
         distance_col == maximum ? 1.0f / (float)total : 0.0f,
     };
     float sum = weights[0] + weights[1];
-    float draw = sum * (1.0f - rng_f32(key));
+    float draw = sum * (1.0f - rng_f32(key, 0));
     return (weights[0] >= draw || sum == 0.0f) ? 0 : 1;
 }
 
@@ -1753,7 +1721,7 @@ void move_melee_slot(State* state, int level, int slot, Rng* rng) {
         player_dir[1] = signi(state->player_position[1] - old_col);
     }
     int dist = distance_row + distance_col;
-    float chase_roll = rng_f32(rng_key(rng));
+    float chase_roll = rng_f32(rng_key(rng), 0);
     bool chase = (dist < 10 || fighting_boss(state)) && chase_roll < 0.75f;
     int proposed_row = chase ? old_row + player_dir[0] : old_row + random_dir[0];
     int proposed_col = chase ? old_col + player_dir[1] : old_col + random_dir[1];
@@ -1839,7 +1807,7 @@ void move_ranged_slot(State* state, int level, int slot, Rng* rng) {
         proposed_row = old_row - player_dir[0];
         proposed_col = old_col - player_dir[1];
     }
-    if (!(rng_f32(rng_key(rng)) > 0.85f)) {
+    if (!(rng_f32(rng_key(rng), 0) > 0.85f)) {
         proposed_row = old_row + random_dir[0];
         proposed_col = old_col + random_dir[1];
     }
@@ -2132,7 +2100,7 @@ int choose_weighted_key(Rng key, const float* weights, int count) {
     for (int i = 0; i < count; i++) {
         total += weights[i];
     }
-    float draw = total * (1.0f - rng_f32(key));
+    float draw = total * (1.0f - rng_f32(key, 0));
     float cumulative = 0.0f;
     for (int i = 0; i < count; i++) {
         cumulative += weights[i];
@@ -2146,25 +2114,25 @@ int choose_weighted_key(Rng key, const float* weights, int count) {
 void add_chest_loot(State* state, Rng rng) {
     Inventory* inv = &state->inventory;
     rng_key(&rng);
-    (void)randint_at(rng_key(&rng), 0u, 1, 6);
-    bool torch = rng_f32(rng_key(&rng)) < 0.6f;
-    int torches = randint_at(rng_key(&rng), 0u, 4, 8);
-    bool ore = rng_f32(rng_key(&rng)) < 0.6f;
+    (void)randint(rng_key(&rng), 0u, 1, 6);
+    bool torch = rng_f32(rng_key(&rng), 0) < 0.6f;
+    int torches = randint(rng_key(&rng), 0u, 4, 8);
+    bool ore = rng_f32(rng_key(&rng), 0) < 0.6f;
     const float ore_weights[5] = {0.3f, 0.3f, 0.15f, 0.125f, 0.125f};
     int ore_id = choose_weighted_key(rng_key(&rng), ore_weights, 5);
     Rng amount_key = rng_key(&rng);
-    int coal = randint_at(amount_key, 0u, 1, 4);
-    int iron = randint_at(amount_key, 0u, 1, 3);
-    int diamond = randint_at(amount_key, 0u, 1, 2);
-    int sapphire = randint_at(amount_key, 0u, 1, 2);
-    int ruby = randint_at(amount_key, 0u, 1, 2);
-    bool potion = rng_f32(rng_key(&rng)) < 0.5f;
-    int potion_id = randint_at(rng_key(&rng), 0u, 0, 6);
-    int potion_amount = randint_at(rng_key(&rng), 0u, 1, 3);
-    bool arrows = rng_f32(rng_key(&rng)) < 0.25f;
-    int arrow_amount = randint_at(rng_key(&rng), 0u, 1, 5);
-    bool tool = rng_f32(rng_key(&rng)) < 0.2f;
-    int tool_id = randint_at(rng_key(&rng), 0u, 0, 2);
+    int coal = randint(amount_key, 0u, 1, 4);
+    int iron = randint(amount_key, 0u, 1, 3);
+    int diamond = randint(amount_key, 0u, 1, 2);
+    int sapphire = randint(amount_key, 0u, 1, 2);
+    int ruby = randint(amount_key, 0u, 1, 2);
+    bool potion = rng_f32(rng_key(&rng), 0) < 0.5f;
+    int potion_id = randint(rng_key(&rng), 0u, 0, 6);
+    int potion_amount = randint(rng_key(&rng), 0u, 1, 3);
+    bool arrows = rng_f32(rng_key(&rng), 0) < 0.25f;
+    int arrow_amount = randint(rng_key(&rng), 0u, 1, 5);
+    bool tool = rng_f32(rng_key(&rng), 0) < 0.2f;
+    int tool_id = randint(rng_key(&rng), 0u, 0, 2);
     const float tool_weights[4] = {0.4f, 0.3f, 0.2f, 0.1f};
     int pickaxe = choose_weighted_key(rng_key(&rng), tool_weights, 4) + 1;
     int sword = choose_weighted_key(rng_key(&rng), tool_weights, 4) + 1;
@@ -2265,7 +2233,7 @@ void interact_facing_tile(State* state, int action, Rng rng) {
         state->boss_timestep_to_spawn_this_round = BOSS_SPAWN_TURNS;
         state->achievements[ACH_DAMAGE_NECROMANCER] = 1;
     }
-    if (block == BLOCK_GRASS && rng_f32(sapling_key) < 0.1f) inv->sapling += 1;
+    if (block == BLOCK_GRASS && rng_f32(sapling_key, 0) < 0.1f) inv->sapling += 1;
     state->chests_opened[level] |= block == BLOCK_CHEST;
 }
 
@@ -2294,7 +2262,7 @@ void read_book(State* state, int action, Rng rng) {
     float p1 = state->learned_spells[1] ? 0.0f : 1.0f;
     int spell = 0;
     if (p0 + p1 != 0.0f) {
-        float r = 1.0f - rng_f32(choice_key);
+        float r = 1.0f - rng_f32(choice_key, 0);
         spell = r <= (p0 / (p0 + p1)) ? 0 : 1;
     }
     if (reading) {
@@ -2671,7 +2639,7 @@ void update_log_state(Craftax* env) {
 // Reset function
 void reset_from_key(Craftax* env, Rng reset_key) {
     if (g_clean_reset_pool_size > 0) {
-        uint32_t idx = reset_key.word[0] % (uint32_t)g_clean_reset_pool_size;
+        uint32_t idx = (uint32_t)reset_key % (uint32_t)g_clean_reset_pool_size;
         memcpy(&env->state, &g_clean_reset_pool[idx], sizeof(State));
         return;
     }
