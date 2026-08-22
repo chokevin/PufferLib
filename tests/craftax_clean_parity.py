@@ -194,7 +194,6 @@ void replay_clean(
     env.agents[0].observations = live_obs;
 
     craftax_clean_set_reset_pool_size(0);
-    c_init(&env);
     puf_reset(&env);
     memcpy(obs_out, live_obs, OBS_SIZE * sizeof(float));
     *terminal_step = -1;

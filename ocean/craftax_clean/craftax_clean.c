@@ -56,8 +56,10 @@ int main(void) {
     env.rng = 1;
     env.seed = 1;
 
-    c_allocate(&env);
-    c_init(&env);
+    env.agents[0].observations = (obs_t*)calloc(OBS_SIZE, sizeof(obs_t));
+    env.agents[0].actions = (float*)calloc(1, sizeof(float));
+    env.agents[0].rewards = (float*)calloc(1, sizeof(float));
+    env.agents[0].terminals = (float*)calloc(1, sizeof(float));
     puf_reset(&env);
     env.agents[0].actions[0] = -1.0f;
 
