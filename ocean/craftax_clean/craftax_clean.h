@@ -17,6 +17,7 @@ typedef float obs_t;
 
 #define ACT_SIZES {NUM_ACTIONS}
 #define NUM_ATNS 1
+typedef Env Craftax;
 
 // Data structures 
 typedef struct {
@@ -152,8 +153,6 @@ struct Env {
     int achievements[NUM_ACHIEVEMENTS];
 };
 
-typedef Env Craftax;
-
 static void c_init(Craftax* env) {
     memset(&env->state, 0, sizeof(State));
     env->num_agents = 1;
@@ -168,19 +167,21 @@ static void c_init(Craftax* env) {
 }
 
 // World generation
-static inline uint64_t rng_to_u64(Rng key) {
+
+// RNG functions to achieve parity with JAX version
+uint64_t rng_to_u64(Rng key) {
     return ((uint64_t)key.word[1] << 32) | key.word[0];
 }
 
-static inline Rng rng_from_u64(uint64_t x) {
+Rng rng_from_u64(uint64_t x) {
     return (Rng){{(uint32_t)x, (uint32_t)(x >> 32)}};
 }
 
-static inline Rng rng_seed(uint32_t seed) {
+Rng rng_seed(uint32_t seed) {
     return (Rng){{seed, seed ^ 0x9E3779B9u}};
 }
 
-static inline uint64_t rng_mix64(uint64_t x) {
+uint64_t rng_mix64(uint64_t x) {
     x ^= x >> 33;
     x *= 0xff51afd7ed558ccdULL;
     x ^= x >> 33;
@@ -189,11 +190,11 @@ static inline uint64_t rng_mix64(uint64_t x) {
     return x;
 }
 
-static inline uint64_t rng_hash64(Rng key, uint64_t counter) {
+uint64_t rng_hash64(Rng key, uint64_t counter) {
     return rng_mix64(rng_to_u64(key) ^ counter);
 }
 
-static inline void rng_split(Rng key, Rng* left, Rng* right) {
+void rng_split(Rng key, Rng* left, Rng* right) {
     uint64_t state = rng_to_u64(key);
     uint64_t s1 = state * 6364136223846793005ULL + 1;
     uint64_t s2 = s1 * 6364136223846793005ULL + 1;
@@ -201,7 +202,7 @@ static inline void rng_split(Rng key, Rng* left, Rng* right) {
     *right = rng_from_u64(s2);
 }
 
-static inline void rng_split_n(Rng key, Rng* out, int count) {
+void rng_split_n(Rng key, Rng* out, int count) {
     uint64_t state = rng_to_u64(key);
     for (int i = 0; i < count; i++) {
         state = state * 6364136223846793005ULL + 1;
@@ -209,12 +210,12 @@ static inline void rng_split_n(Rng key, Rng* out, int count) {
     }
 }
 
-static inline uint32_t rng_u32_at(Rng key, uint64_t index) {
+uint32_t rng_u32_at(Rng key, uint64_t index) {
     uint64_t h = rng_hash64(key, index);
     return (uint32_t)h ^ (uint32_t)(h >> 32);
 }
 
-static inline float rng_f32_at(Rng key, uint64_t index) {
+float rng_f32_at(Rng key, uint64_t index) {
     uint32_t bits = rng_u32_at(key, index);
     uint32_t float_bits = (bits >> 9u) | 0x3F800000u;
     float value;
@@ -222,16 +223,16 @@ static inline float rng_f32_at(Rng key, uint64_t index) {
     return value - 1.0f;
 }
 
-static inline float rng_f32(Rng key) {
+float rng_f32(Rng key) {
     return rng_f32_at(key, 0u);
 }
 
-static inline void store_rng(State* state, Rng rng) {
+void store_rng(State* state, Rng rng) {
     state->state_rng[0] = rng.word[0];
     state->state_rng[1] = rng.word[1];
 }
 
-static inline Rng rng_key(Rng* rng) {
+Rng rng_key(Rng* rng) {
     Rng next;
     Rng draw;
     rng_split(*rng, &next, &draw);
@@ -239,7 +240,7 @@ static inline Rng rng_key(Rng* rng) {
     return draw;
 }
 
-static inline int choice_valid(Rng key, const bool* valid, int count) {
+static int choice_valid(Rng key, const bool* valid, int count) {
     int valid_count = 0;
     int last_valid = 0;
     for (int i = 0; i < count; i++) {
@@ -264,7 +265,7 @@ static inline int choice_valid(Rng key, const bool* valid, int count) {
     return last_valid;
 }
 
-static inline uint32_t randint_u32_at(Rng key, uint64_t index, uint32_t minval, uint32_t maxval) {
+static uint32_t randint_u32_at(Rng key, uint64_t index, uint32_t minval, uint32_t maxval) {
     uint32_t span = maxval > minval ? maxval - minval : 1u;
     if ((span & (span - 1)) == 0) {
         uint32_t bits = rng_u32_at(key, index);
@@ -274,11 +275,11 @@ static inline uint32_t randint_u32_at(Rng key, uint64_t index, uint32_t minval, 
     return minval + (uint32_t)(((h >> 32) * (uint64_t)span) >> 32);
 }
 
-static inline int randint_at(Rng key, uint64_t index, int minval, int maxval) {
+static int randint_at(Rng key, uint64_t index, int minval, int maxval) {
     return (int)randint_u32_at(key, index, (uint32_t)minval, (uint32_t)maxval);
 }
 
-static inline void refresh_spawn_cell(State* state, int level, int row, int col) {
+static void refresh_spawn_cell(State* state, int level, int row, int col) {
     int block = state->map[level][row][col];
     uint64_t bit = 1ull << col;
     uint64_t* land = &state->spawn_land[level][row];
@@ -291,12 +292,12 @@ static inline void refresh_spawn_cell(State* state, int level, int row, int col)
     *water = (*water & ~bit) | (block == BLOCK_WATER ? bit : 0);
 }
 
-static inline void set_block(State* state, int level, int row, int col, int block) {
+static void set_block(State* state, int level, int row, int col, int block) {
     state->map[level][row][col] = block;
     refresh_spawn_cell(state, level, row, col);
 }
 
-static inline void refresh_spawn_maps(State* state) {
+static void refresh_spawn_maps(State* state) {
     memset(state->spawn_land, 0, sizeof(state->spawn_land));
     memset(state->spawn_grave, 0, sizeof(state->spawn_grave));
     memset(state->spawn_water, 0, sizeof(state->spawn_water));
@@ -309,19 +310,12 @@ static inline void refresh_spawn_maps(State* state) {
     }
 }
 
-static inline void add_light(State* state, int level, int center_row, int center_col) {
-    static const float torch_light[9][9] = {
-        {0.0f, 0.0f, 0.10557288f, 0.17537886f, 0.19999999f, 0.17537886f, 0.10557288f, 0.0f, 0.0f},
-        {0.0f, 0.15147191f, 0.27888972f, 0.36754447f, 0.39999998f, 0.36754447f, 0.27888972f, 0.15147191f, 0.0f},
-        {0.10557288f, 0.27888972f, 0.43431455f, 0.55278647f, 0.6f, 0.55278647f, 0.43431455f, 0.27888972f, 0.10557288f},
-        {0.17537886f, 0.36754447f, 0.55278647f, 0.71715724f, 0.8f, 0.71715724f, 0.55278647f, 0.36754447f, 0.17537886f},
-        {0.19999999f, 0.39999998f, 0.6f, 0.8f, 1.0f, 0.8f, 0.6f, 0.39999998f, 0.19999999f},
-        {0.17537886f, 0.36754447f, 0.55278647f, 0.71715724f, 0.8f, 0.71715724f, 0.55278647f, 0.36754447f, 0.17537886f},
-        {0.10557288f, 0.27888972f, 0.43431455f, 0.55278647f, 0.6f, 0.55278647f, 0.43431455f, 0.27888972f, 0.10557288f},
-        {0.0f, 0.15147191f, 0.27888972f, 0.36754447f, 0.39999998f, 0.36754447f, 0.27888972f, 0.15147191f, 0.0f},
-        {0.0f, 0.0f, 0.10557288f, 0.17537886f, 0.19999999f, 0.17537886f, 0.10557288f, 0.0f, 0.0f},
-    };
+static float torch_light_at(int dr, int dc) {
+    float torch = 1.0f - sqrtf((float)(dr * dr + dc * dc)) / 5.0f;
+    return torch < 0.0f ? 0.0f : torch;
+}
 
+void add_light(State* state, int level, int center_row, int center_col) {
     for (int dr = -4; dr <= 4; dr++) {
         int row = center_row + dr;
         if (row < 0 || row >= MAP_SIZE) {
@@ -333,7 +327,7 @@ static inline void add_light(State* state, int level, int center_row, int center
                 continue;
             }
             float light = (float)state->light_map[level][row][col] / 255.0f
-                + torch_light[dr + 4][dc + 4];
+                + torch_light_at(dr, dc);
             if (light < 0.0f) {
                 light = 0.0f;
             }
@@ -345,15 +339,11 @@ static inline void add_light(State* state, int level, int center_row, int center
     }
 }
 
-#define MAP_CELLS (MAP_SIZE * MAP_SIZE)
-#define NOISE_PI2 6.28318530717958647692f
-#define NOISE_SQRT2 1.41421356237309504880f
-
-static inline float noise_interpolant(float t) {
+float noise_interpolant(float t) {
     return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
 }
 
-static inline void generate_perlin(
+void generate_perlin(
     Rng rng,
     int rows,
     int cols,
@@ -399,7 +389,7 @@ static inline void generate_perlin(
     }
 }
 
-static inline void generate_fractal(
+void generate_fractal(
     Rng rng,
     int rows,
     int cols,
@@ -446,7 +436,7 @@ static inline void generate_fractal(
     }
 }
 
-static inline void apply_ladder_light(
+void apply_ladder_light(
     unsigned char light_map[MAP_SIZE][MAP_SIZE],
     const int ladder_up[2],
     float default_light
@@ -461,17 +451,13 @@ static inline void apply_ladder_light(
     if (start_col < 0) start_col = 0;
     for (int row = 0; row < 9; row++) {
         for (int col = 0; col < 9; col++) {
-            float dr = (float)(row - 4);
-            float dc = (float)(col - 4);
-            float torch = 1.0f - sqrtf(dr * dr + dc * dc) / 5.0f;
-            if (torch < 0.0f) torch = 0.0f;
-            float light = torch * (1.0f - default_light) + default_light;
+            float light = torch_light_at(row - 4, col - 4) * (1.0f - default_light) + default_light;
             light_map[start_row + row][start_col + col] = (unsigned char)(light * 255.0f);
         }
     }
 }
 
-static inline void add_lava_light(
+void add_lava_light(
     unsigned char light_map[MAP_SIZE][MAP_SIZE],
     const bool lava_map[MAP_SIZE][MAP_SIZE],
     bool lava_emits_light
@@ -504,11 +490,11 @@ static inline void add_lava_light(
     }
 }
 
-static inline int cell_index(int row, int col) {
+int cell_index(int row, int col) {
     return row * MAP_SIZE + col;
 }
 
-static inline void generate_smooth_level(
+static void generate_smooth_level(
     State* state,
     int level,
     Rng rng,
@@ -647,7 +633,7 @@ static inline void generate_smooth_level(
     }
 }
 
-static inline void generate_dungeon_level(
+static void generate_dungeon_level(
     State* state,
     int level,
     Rng rng,
@@ -851,7 +837,7 @@ static inline void generate_dungeon_level(
         ITEM_LADDER_UP;
 }
 
-static inline void permute_potions(Rng key, int out[6]) {
+static void permute_potions(Rng key, int out[6]) {
     Rng carry;
     Rng sort_key;
     rng_split(key, &carry, &sort_key);
@@ -873,17 +859,6 @@ static inline void permute_potions(Rng key, int out[6]) {
         keys[j + 1] = key_value;
         out[j + 1] = value;
     }
-}
-
-static inline Rng worldgen_key_from_seed(uint32_t seed) {
-    Rng key = rng_seed(seed);
-    Rng carry;
-    Rng reset_key;
-    rng_split(key, &carry, &reset_key);
-    Rng reset_carry;
-    Rng world_key;
-    rng_split(reset_key, &reset_carry, &world_key);
-    return world_key;
 }
 
 void generate_world_from_key(State* state, Rng rng) {
@@ -952,15 +927,12 @@ void generate_world_from_key(State* state, Rng rng) {
     refresh_spawn_maps(state);
 }
 
-void generate_world(State* state, int seed) {
-    generate_world_from_key(state, worldgen_key_from_seed((uint32_t)seed));
-}
-
+// TODO: do we need this reset pool stuff?
 static int g_clean_reset_pool_size = 0;
 static State* g_clean_reset_pool = NULL;
 static int g_clean_reset_pool_ready = 0;
 
-static inline void craftax_clean_set_reset_pool_size(int n) {
+void craftax_clean_set_reset_pool_size(int n) {
     if (g_clean_reset_pool_ready) {
         return;
     }
@@ -981,15 +953,7 @@ static inline void craftax_clean_set_reset_pool_size(int n) {
     g_clean_reset_pool_ready = 1;
 }
 
-static inline bool scatter_index(int index, int size, int* mapped) {
-    if (index < -size || index >= size) {
-        return false;
-    }
-    *mapped = index < 0 ? index + size : index;
-    return true;
-}
-
-static inline void write_mob_obs(
+static void write_mob_obs(
     float* obs,
     const State* state,
     const Mobs* mobs,
@@ -1023,7 +987,7 @@ static inline void write_mob_obs(
     }
 }
 
-static inline int clampi(int value, int low, int high) {
+int clampi(int value, int low, int high) {
     if (value < low) {
         return low;
     }
@@ -1033,7 +997,7 @@ static inline int clampi(int value, int low, int high) {
     return value;
 }
 
-static inline float clampf(float value, float low, float high) {
+float clampf(float value, float low, float high) {
     if (value < low) {
         return low;
     }
@@ -1043,48 +1007,35 @@ static inline float clampf(float value, float low, float high) {
     return value;
 }
 
-static inline int max_health(const State* state) {
+int max_health(const State* state) {
     return 8 + state->player_strength;
 }
 
-static inline int max_food(const State* state) {
+int max_food(const State* state) {
     return 7 + 2 * state->player_dexterity;
 }
 
-static inline int max_drink(const State* state) {
+int max_drink(const State* state) {
     return 7 + 2 * state->player_dexterity;
 }
 
-static inline int max_energy(const State* state) {
+int max_energy(const State* state) {
     return 7 + 2 * state->player_dexterity;
 }
 
-static inline int max_mana(const State* state) {
+int max_mana(const State* state) {
     return 6 + 3 * state->player_intelligence;
 }
 
-static inline bool fighting_boss(const State* state) {
+bool fighting_boss(const State* state) {
     return state->player_level == NUM_LEVELS - 1;
 }
 
-static inline int jax_index(int index, int size) {
-    if (index < 0) {
-        index += size;
-    }
-    if (index < 0) {
-        return 0;
-    }
-    if (index >= size) {
-        return size - 1;
-    }
-    return index;
-}
-
-static inline bool boss_vulnerable(const State* state) {
+bool boss_vulnerable(const State* state) {
     if (state->boss_timestep_to_spawn_this_round > 0) {
         return false;
     }
-    int level = jax_index(state->player_level, NUM_LEVELS);
+    int level = state->player_level;
     for (int i = 0; i < MAX_MELEE_MOBS; i++) {
         if (state->melee_mobs[level].mask[i]) {
             return false;
@@ -1098,11 +1049,11 @@ static inline bool boss_vulnerable(const State* state) {
     return true;
 }
 
-static inline bool has_beaten_boss(const State* state) {
+bool has_beaten_boss(const State* state) {
     return state->boss_progress >= NUM_LEVELS - 1;
 }
 
-static inline void action_to_direction(int action, int direction[2]) {
+void action_to_direction(int action, int direction[2]) {
     direction[0] = 0;
     direction[1] = 0;
 
@@ -1117,7 +1068,7 @@ static inline void action_to_direction(int action, int direction[2]) {
     }
 }
 
-static inline bool is_solid_block(int block) {
+bool is_solid_block(int block) {
     switch (block) {
     case BLOCK_STONE:
     case BLOCK_TREE:
@@ -1148,14 +1099,14 @@ static inline bool is_solid_block(int block) {
     }
 }
 
-static inline bool mob_at(const State* state, int level, int row, int col) {
+bool mob_at(const State* state, int level, int row, int col) {
     if ((unsigned)row >= MAP_SIZE || (unsigned)col >= MAP_SIZE) {
         return false;
     }
     return (state->mob_bits[level][row] >> col) & 1ull;
 }
 
-static inline void set_mob_bit(State* state, int level, int row, int col, bool on) {
+void set_mob_bit(State* state, int level, int row, int col, bool on) {
     if ((unsigned)row >= MAP_SIZE || (unsigned)col >= MAP_SIZE) {
         return;
     }
@@ -1167,7 +1118,7 @@ static inline void set_mob_bit(State* state, int level, int row, int col, bool o
     }
 }
 
-static inline void move_mob_occupancy(
+void move_mob_occupancy(
     State* state, int level, int old_row, int old_col, int new_row, int new_col, bool keep
 ) {
     set_mob_bit(state, level, old_row, old_col, false);
@@ -1176,7 +1127,7 @@ static inline void move_mob_occupancy(
     }
 }
 
-static inline bool mobs_at(const Mobs* mobs, int slots, int row, int col, int* slot) {
+bool mobs_at(const Mobs* mobs, int slots, int row, int col, int* slot) {
     for (int i = 0; i < slots; i++) {
         if (mobs->mask[i]
             && mobs->position[i][0] == row
@@ -1188,12 +1139,12 @@ static inline bool mobs_at(const Mobs* mobs, int slots, int row, int col, int* s
     return false;
 }
 
-static inline bool valid_player_position(const State* state, int row, int col) {
+bool valid_player_position(const State* state, int row, int col) {
     if (row < 0 || row >= MAP_SIZE || col < 0 || col >= MAP_SIZE) {
         return false;
     }
 
-    int level = clampi(state->player_level, 0, NUM_LEVELS - 1);
+    int level = state->player_level;
     int block = state->map[level][row][col];
     if (is_solid_block(block)) {
         return false;
@@ -1204,7 +1155,7 @@ static inline bool valid_player_position(const State* state, int row, int col) {
     return !mob_at(state, level, row, col);
 }
 
-static inline Mobs* mobs_for_class(State* state, int level, int mob_class) {
+Mobs* mobs_for_class(State* state, int level, int mob_class) {
     if (mob_class == MOB_PASSIVE) {
         return &state->passive_mobs[level];
     }
@@ -1214,7 +1165,7 @@ static inline Mobs* mobs_for_class(State* state, int level, int mob_class) {
     return &state->melee_mobs[level];
 }
 
-static inline bool find_mob_at(
+bool find_mob_at(
     const State* state,
     int level,
     int row,
@@ -1237,7 +1188,7 @@ static inline bool find_mob_at(
     return false;
 }
 
-static inline bool mob_can_move_on(int mob_class, int type_id, int block) {
+bool mob_can_move_on(int mob_class, int type_id, int block) {
     static const bool blocked[NUM_MOB_TYPES][3][3] = {
         {{0,1,1},{0,1,1},{0,1,1}}, {{0,0,0},{0,1,1},{0,1,1}},
         {{0,1,1},{0,1,1},{0,1,1}}, {{0,1,1},{0,0,1},{0,1,1}},
@@ -1249,7 +1200,7 @@ static inline bool mob_can_move_on(int mob_class, int type_id, int block) {
     return !blocked[clampi(type_id,0,7)][clampi(mob_class,0,2)][terrain];
 }
 
-static inline bool valid_typed_mob_position(
+bool valid_typed_mob_position(
     const State* state,
     int level,
     int mob_class,
@@ -1271,7 +1222,7 @@ static inline bool valid_typed_mob_position(
     return !mob_at(state, level, row, col) || (row == old_row && col == old_col);
 }
 
-static inline float mob_base_health(int mob_class, int type_id) {
+float mob_base_health(int mob_class, int type_id) {
     static const float passive_health[NUM_MOB_TYPES] = {3, 4, 6, 8, 0, 0, 0, 0};
     static const float melee_health[NUM_MOB_TYPES] = {5, 7, 9, 11, 12, 20, 20, 24};
     static const float ranged_health[NUM_MOB_TYPES] = {3, 5, 6, 8, 12, 4, 14, 16};
@@ -1283,7 +1234,7 @@ static inline float mob_base_health(int mob_class, int type_id) {
 
 typedef struct { float physical, fire, ice; } Damage;
 
-static inline Damage player_attack_damage_vector(const State* state) {
+Damage player_attack_damage_vector(const State* state) {
     static const float base_damage[5] = {1, 2, 3, 5, 8};
     float base = base_damage[clampi(state->inventory.sword, 0, 4)];
     float physical = base * (1.0f + 0.25f * (float)(state->player_strength - 1));
@@ -1291,7 +1242,7 @@ static inline Damage player_attack_damage_vector(const State* state) {
     return (Damage){physical, state->sword_enchantment == 1 ? magic : 0, state->sword_enchantment == 2 ? magic : 0};
 }
 
-static inline Damage mob_damage_vector(int type, int mob_class) {
+Damage mob_damage_vector(int type, int mob_class) {
     static const float damage[NUM_MOB_TYPES][4][3] = {
         {{0,0,0},{2,0,0},{0,0,0},{2,0,0}}, {{0,0,0},{4,0,0},{0,0,0},{4,0,0}},
         {{0,0,0},{3,0,0},{0,0,0},{0,3,0}}, {{0,0,0},{5,0,0},{0,0,0},{0,0,3}},
@@ -1302,7 +1253,7 @@ static inline Damage mob_damage_vector(int type, int mob_class) {
     return (Damage){d[0], d[1], d[2]};
 }
 
-static inline float damage_to_mob(Damage damage, int type, int mob_class) {
+float damage_to_mob(Damage damage, int type, int mob_class) {
     static const float defense[NUM_MOB_TYPES][4][3] = {
         {{0,0,0},{0,0,0},{0,0,0},{0,0,0}},
         {{0,0,0},{0,0,0},{0,0,0},{0,0,0}},
@@ -1317,7 +1268,7 @@ static inline float damage_to_mob(Damage damage, int type, int mob_class) {
     return damage.physical * (1-d[0]) + damage.fire * (1-d[1]) + damage.ice * (1-d[2]);
 }
 
-static inline float damage_to_player(const State* state, Damage damage) {
+float damage_to_player(const State* state, Damage damage) {
     float physical_defense = 0, fire_defense = 0, ice_defense = 0;
     for (int i = 0; i < 4; i++) {
         physical_defense += 0.1f * state->inventory.armour[i];
@@ -1328,7 +1279,7 @@ static inline float damage_to_player(const State* state, Damage damage) {
     return coeff * (damage.physical * (1-physical_defense) + damage.fire * (1-fire_defense) + damage.ice * (1-ice_defense));
 }
 
-static inline int defeat_achievement(int mob_class, int type_id, int level) {
+int defeat_achievement(int mob_class, int type_id, int level) {
     (void)level;
     static const int achievements[3][8] = {
         {ACH_EAT_COW, ACH_EAT_BAT, ACH_EAT_SNAIL, 0,0,0,0,0},
@@ -1338,7 +1289,7 @@ static inline int defeat_achievement(int mob_class, int type_id, int level) {
     return achievements[clampi(mob_class, 0, 2)][clampi(type_id, 0, 7)];
 }
 
-static inline bool damage_mob_at(
+bool damage_mob_at(
     State* state, int level, int row, int col, float damage,
     bool can_eat, bool can_get_achievement
 ) {
@@ -1372,7 +1323,7 @@ static inline bool damage_mob_at(
     return true;
 }
 
-static inline bool attack_mob_at(State* state, int level, int row, int col, bool can_eat) {
+bool attack_mob_at(State* state, int level, int row, int col, bool can_eat) {
     int mob_class;
     int slot;
     if (!find_mob_at(state, level, row, col, &mob_class, &slot)) {
@@ -1387,13 +1338,13 @@ static inline bool attack_mob_at(State* state, int level, int row, int col, bool
     );
 }
 
-static inline float projectile_damage(int projectile_type, bool from_player) {
+float projectile_damage(int projectile_type, bool from_player) {
     (void)from_player;
     Damage d = mob_damage_vector(projectile_type, MOB_PROJECTILE);
     return d.physical + d.fire + d.ice;
 }
 
-static inline Damage player_projectile_damage(const State* state, int type) {
+Damage player_projectile_damage(const State* state, int type) {
     Damage damage = mob_damage_vector(type, MOB_PROJECTILE);
     bool arrow = type == PROJECTILE_ARROW || type == PROJECTILE_ARROW2;
     if (arrow && state->bow_enchantment == 1) damage.fire += damage.physical * 0.5f;
@@ -1404,7 +1355,7 @@ static inline Damage player_projectile_damage(const State* state, int type) {
     return damage;
 }
 
-static inline bool spawn_projectile(
+bool spawn_projectile(
     State* state,
     bool from_player,
     int projectile_type,
@@ -1413,7 +1364,7 @@ static inline bool spawn_projectile(
     int dir_row,
     int dir_col
 ) {
-    int level = clampi(state->player_level, 0, NUM_LEVELS - 1);
+    int level = state->player_level;
     Mobs* projectiles = from_player ? &state->player_projectiles[level] : &state->mob_projectiles[level];
     int (*directions)[MAX_PLAYER_PROJECTILES][2] =
         from_player ? state->player_projectile_directions : state->mob_projectile_directions;
@@ -1434,34 +1385,20 @@ static inline bool spawn_projectile(
     return false;
 }
 
-static inline int read_map_block(const State* state, int level, int row, int col) {
-    return state->map[jax_index(level, NUM_LEVELS)]
-        [jax_index(row, MAP_SIZE)]
-        [jax_index(col, MAP_SIZE)];
-}
-
-static inline bool projectile_in_mob(const State* state, int level, int row, int col) {
-    int map_level = jax_index(level, NUM_LEVELS);
-    int map_row = jax_index(row, MAP_SIZE);
-    int map_col = jax_index(col, MAP_SIZE);
+bool projectile_in_mob(const State* state, int level, int row, int col) {
     bool player_here = state->player_position[0] == row
         && state->player_position[1] == col;
-    return mob_at(state, map_level, map_row, map_col) || player_here;
+    return mob_at(state, level, row, col) || player_here;
 }
 
-static inline void scatter_set_block(State* state, int level, int row, int col, int block) {
-    int mapped_level;
-    int mapped_row;
-    int mapped_col;
-    if (!scatter_index(level, NUM_LEVELS, &mapped_level)
-        || !scatter_index(row, MAP_SIZE, &mapped_row)
-        || !scatter_index(col, MAP_SIZE, &mapped_col)) {
+void scatter_set_block(State* state, int level, int row, int col, int block) {
+    if ((unsigned)level >= NUM_LEVELS || (unsigned)row >= MAP_SIZE || (unsigned)col >= MAP_SIZE) {
         return;
     }
-    set_block(state, mapped_level, mapped_row, mapped_col, block);
+    set_block(state, level, row, col, block);
 }
 
-static inline void move_mob_projectile_slot(State* state, int level, int slot) {
+void move_mob_projectile_slot(State* state, int level, int slot) {
     Mobs* projectiles = &state->mob_projectiles[level];
     bool alive = projectiles->mask[slot];
     if (!alive) {
@@ -1475,7 +1412,7 @@ static inline void move_mob_projectile_slot(State* state, int level, int slot) {
         && proposed_col == state->player_position[1];
     bool proposed_in_bounds = proposed_row >= 0 && proposed_row < MAP_SIZE
         && proposed_col >= 0 && proposed_col < MAP_SIZE;
-    int proposed_block = read_map_block(state, level, proposed_row, proposed_col);
+    int proposed_block = proposed_in_bounds ? state->map[level][proposed_row][proposed_col] : 0;
     bool in_wall = is_solid_block(proposed_block) && proposed_block != BLOCK_WATER;
     bool in_mob = projectile_in_mob(state, level, proposed_row, proposed_col);
     bool keep_moving = proposed_in_bounds && !in_wall && !in_mob;
@@ -1501,7 +1438,7 @@ static inline void move_mob_projectile_slot(State* state, int level, int slot) {
     scatter_set_block(state, level, proposed_row, proposed_col, new_block);
 }
 
-static inline void move_player_projectile_slot(State* state, int level, int slot) {
+void move_player_projectile_slot(State* state, int level, int slot) {
     Mobs* projectiles = &state->player_projectiles[level];
     bool alive = projectiles->mask[slot];
     if (!alive) {
@@ -1548,7 +1485,7 @@ static inline void move_player_projectile_slot(State* state, int level, int slot
 
     bool proposed_in_bounds = proposed_row >= 0 && proposed_row < MAP_SIZE
         && proposed_col >= 0 && proposed_col < MAP_SIZE;
-    int proposed_block = read_map_block(state, level, proposed_row, proposed_col);
+    int proposed_block = proposed_in_bounds ? state->map[level][proposed_row][proposed_col] : 0;
     bool in_wall = is_solid_block(proposed_block) && proposed_block != BLOCK_WATER;
     bool keep = proposed_in_bounds && !in_wall && !hit_old && !hit_new && alive;
     projectiles->position[slot][0] = proposed_row;
@@ -1556,8 +1493,8 @@ static inline void move_player_projectile_slot(State* state, int level, int slot
     projectiles->mask[slot] = keep;
 }
 
-static inline void update_projectile_set(State* state, bool from_player) {
-    int level = jax_index(state->player_level, NUM_LEVELS);
+void update_projectile_set(State* state, bool from_player) {
+    int level = state->player_level;
     for (int i = 0; i < MAX_PLAYER_PROJECTILES; i++) {
         if (from_player) {
             move_player_projectile_slot(state, level, i);
@@ -1567,7 +1504,7 @@ static inline void update_projectile_set(State* state, bool from_player) {
     }
 }
 
-static inline int floor_mob_type(int level, int mob_class) {
+int floor_mob_type(int level, int mob_class) {
     static const int types[NUM_LEVELS][3] = {
         {0, 0, 0}, {2, 2, 2}, {1, 1, 1}, {2, 3, 3}, {2, 4, 4},
         {1, 5, 5}, {1, 6, 6}, {1, 7, 7}, {0, 0, 0},
@@ -1575,7 +1512,7 @@ static inline int floor_mob_type(int level, int mob_class) {
     return types[clampi(level, 0, NUM_LEVELS - 1)][clampi(mob_class, 0, 2)];
 }
 
-static inline int pick_kth(int count, Rng key) {
+int pick_kth(int count, Rng key) {
     float draw = (float)count * (1.0f - rng_f32(key));
     float cumulative = 0.0f;
     for (int k = 0; k < count; k++) {
@@ -1587,7 +1524,7 @@ static inline int pick_kth(int count, Rng key) {
     return count - 1;
 }
 
-static inline int collect_spawn_cells(
+int collect_spawn_cells(
     const State* state,
     int level,
     int min_exclusive,
@@ -1633,7 +1570,7 @@ static inline int collect_spawn_cells(
     return count;
 }
 
-static inline bool pick_spawn_cell(
+bool pick_spawn_cell(
     const int* rows,
     const int* cols,
     int count,
@@ -1650,7 +1587,7 @@ static inline bool pick_spawn_cell(
     return true;
 }
 
-static inline void spawn_into_slot(
+void spawn_into_slot(
     State* state,
     int level,
     Mobs* mobs,
@@ -1667,7 +1604,7 @@ static inline void spawn_into_slot(
     set_mob_bit(state, level, row, col, true);
 }
 
-static inline void count_and_empty(const Mobs* mobs, int slots, int* count, int* empty) {
+void count_and_empty(const Mobs* mobs, int slots, int* count, int* empty) {
     int n = 0;
     int first = 0;
     bool found = false;
@@ -1682,8 +1619,8 @@ static inline void count_and_empty(const Mobs* mobs, int slots, int* count, int*
     *empty = first;
 }
 
-static inline void spawn_mobs(State* state, Rng rng) {
-    int level = jax_index(state->player_level, NUM_LEVELS);
+void spawn_mobs(State* state, Rng rng) {
+    int level = state->player_level;
     bool boss = fighting_boss(state);
     int coeff = 1 + (state->monsters_killed[level] < MONSTERS_KILLED_TO_CLEAR_LEVEL ? 2 : 0);
     if (boss) {
@@ -1776,7 +1713,7 @@ static inline void spawn_mobs(State* state, Rng rng) {
     }
 }
 
-static inline void choose_direction(Rng key, int count, int direction[2]) {
+void choose_direction(Rng key, int count, int direction[2]) {
     int choice = randint_at(key, 0u, 0, count);
     direction[0] = 0;
     direction[1] = 0;
@@ -1791,7 +1728,7 @@ static inline void choose_direction(Rng key, int count, int direction[2]) {
     }
 }
 
-static inline int choose_player_axis(Rng key, int distance_row, int distance_col) {
+int choose_player_axis(Rng key, int distance_row, int distance_col) {
     int total = distance_row + distance_col;
     if (total == 0) {
         return 1;
@@ -1806,14 +1743,14 @@ static inline int choose_player_axis(Rng key, int distance_row, int distance_col
     return (weights[0] >= draw || sum == 0.0f) ? 0 : 1;
 }
 
-static inline int signi(int value) {
+int signi(int value) {
     if (value < 0) {
         return -1;
     }
     return value > 0 ? 1 : 0;
 }
 
-static inline void move_melee_slot(State* state, int level, int slot, Rng* rng) {
+void move_melee_slot(State* state, int level, int slot, Rng* rng) {
     Mobs* mobs = &state->melee_mobs[level];
     bool alive = mobs->mask[slot];
     if (!alive) {
@@ -1869,7 +1806,7 @@ static inline void move_melee_slot(State* state, int level, int slot, Rng* rng) 
     mobs->mask[slot] = keep;
 }
 
-static inline void move_passive_slot(State* state, int level, int slot, Rng* rng) {
+void move_passive_slot(State* state, int level, int slot, Rng* rng) {
     Mobs* mobs = &state->passive_mobs[level];
     bool alive = mobs->mask[slot];
     if (!alive) {
@@ -1893,7 +1830,7 @@ static inline void move_passive_slot(State* state, int level, int slot, Rng* rng
     mobs->mask[slot] = keep;
 }
 
-static inline void move_ranged_slot(State* state, int level, int slot, Rng* rng) {
+void move_ranged_slot(State* state, int level, int slot, Rng* rng) {
     Mobs* mobs = &state->ranged_mobs[level];
     bool alive = mobs->mask[slot];
     if (!alive) {
@@ -1949,8 +1886,8 @@ static inline void move_ranged_slot(State* state, int level, int slot, Rng* rng)
     mobs->mask[slot] = keep;
 }
 
-static inline void update_mobs(State* state, Rng rng) {
-    int level = jax_index(state->player_level, NUM_LEVELS);
+void update_mobs(State* state, Rng rng) {
+    int level = state->player_level;
     rng_key(&rng);
     move_melee_slot(state, level, 0, &rng);
     move_melee_slot(state, level, 1, &rng);
@@ -1968,7 +1905,7 @@ static inline void update_mobs(State* state, Rng rng) {
     update_projectile_set(state, true);
 }
 
-static inline void move_player(State* state, int action) {
+void move_player(State* state, int action) {
     int direction[2];
     action_to_direction(action, direction);
 
@@ -1984,7 +1921,7 @@ static inline void move_player(State* state, int action) {
     }
 }
 
-static inline int level_achievement(int level) {
+int level_achievement(int level) {
     switch (level) {
     case 1: return ACH_ENTER_DUNGEON;
     case 2: return ACH_ENTER_GNOMISH_MINES;
@@ -1998,8 +1935,8 @@ static inline int level_achievement(int level) {
     }
 }
 
-static inline void change_floor(State* state, int action) {
-    int level = clampi(state->player_level, 0, NUM_LEVELS - 1);
+void change_floor(State* state, int action) {
+    int level = state->player_level;
     int row = clampi(state->player_position[0], 0, MAP_SIZE - 1);
     int col = clampi(state->player_position[1], 0, MAP_SIZE - 1);
 
@@ -2035,7 +1972,7 @@ static inline void change_floor(State* state, int action) {
     }
 }
 
-static inline void level_up_attributes(State* state, int action) {
+void level_up_attributes(State* state, int action) {
     if (state->player_xp < 1) {
         return;
     }
@@ -2057,12 +1994,12 @@ static inline void level_up_attributes(State* state, int action) {
     }
 }
 
-static inline bool near_block(const State* state, int block_type) {
+bool near_block(const State* state, int block_type) {
     static const int offsets[8][2] = {
         {0, -1}, {0, 1}, {-1, 0}, {1, 0},
         {-1, -1}, {-1, 1}, {1, -1}, {1, 1},
     };
-    int level = clampi(state->player_level, 0, NUM_LEVELS - 1);
+    int level = state->player_level;
     for (int i = 0; i < 8; i++) {
         int row = state->player_position[0] + offsets[i][0];
         int col = state->player_position[1] + offsets[i][1];
@@ -2074,7 +2011,7 @@ static inline bool near_block(const State* state, int block_type) {
     return false;
 }
 
-static inline int first_armour_below(const Inventory* inventory, int threshold, int* count) {
+int first_armour_below(const Inventory* inventory, int threshold, int* count) {
     int first = 0;
     *count = 0;
     for (int i = 0; i < 4; i++) {
@@ -2087,7 +2024,7 @@ static inline int first_armour_below(const Inventory* inventory, int threshold, 
     return first;
 }
 
-static inline void craft_tools_and_items(State* state, int action) {
+void craft_tools_and_items(State* state, int action) {
     bool at_table = near_block(state, BLOCK_CRAFTING_TABLE);
     bool at_furnace = near_block(state, BLOCK_FURNACE);
     Inventory* inv = &state->inventory;
@@ -2153,12 +2090,12 @@ static inline void craft_tools_and_items(State* state, int action) {
     }
 }
 
-static inline bool can_place_item_on(int block) {
+bool can_place_item_on(int block) {
     return block == BLOCK_GRASS || block == BLOCK_SAND || block == BLOCK_PATH
         || block == BLOCK_FIRE_GRASS || block == BLOCK_ICE_GRASS;
 }
 
-static inline void add_growing_plant(State* state, int row, int col) {
+void add_growing_plant(State* state, int row, int col) {
     for (int i = 0; i < MAX_GROWING_PLANTS; i++) {
         if (!state->growing_plants_mask[i]) {
             state->growing_plants_positions[i][0] = row;
@@ -2170,7 +2107,7 @@ static inline void add_growing_plant(State* state, int row, int col) {
     }
 }
 
-static inline void place_block(State* state, int action) {
+void place_block(State* state, int action) {
     int direction[2];
     action_to_direction(state->player_direction, direction);
     int row = state->player_position[0] + direction[0];
@@ -2179,7 +2116,7 @@ static inline void place_block(State* state, int action) {
         return;
     }
 
-    int level = clampi(state->player_level, 0, NUM_LEVELS - 1);
+    int level = state->player_level;
     int block = state->map[level][row][col];
     bool occupied = is_solid_block(block) || state->item_map[level][row][col] != ITEM_NONE
         || mob_at(state, level, row, col);
@@ -2210,7 +2147,7 @@ static inline void place_block(State* state, int action) {
     }
 }
 
-static inline int choose_weighted_key(Rng key, const float* weights, int count) {
+int choose_weighted_key(Rng key, const float* weights, int count) {
     float total = 0.0f;
     for (int i = 0; i < count; i++) {
         total += weights[i];
@@ -2226,7 +2163,7 @@ static inline int choose_weighted_key(Rng key, const float* weights, int count) 
     return count - 1;
 }
 
-static inline void add_chest_loot(State* state, Rng rng) {
+void add_chest_loot(State* state, Rng rng) {
     Inventory* inv = &state->inventory;
     rng_key(&rng);
     (void)randint_at(rng_key(&rng), 0u, 1, 6);
@@ -2251,7 +2188,7 @@ static inline void add_chest_loot(State* state, Rng rng) {
     const float tool_weights[4] = {0.4f, 0.3f, 0.2f, 0.1f};
     int pickaxe = choose_weighted_key(rng_key(&rng), tool_weights, 4) + 1;
     int sword = choose_weighted_key(rng_key(&rng), tool_weights, 4) + 1;
-    int level = jax_index(state->player_level, NUM_LEVELS);
+    int level = state->player_level;
 
     if (torch) inv->torches += torches;
     if (ore && ore_id == 0) inv->coal += coal;
@@ -2269,7 +2206,7 @@ static inline void add_chest_loot(State* state, Rng rng) {
     }
 }
 
-static inline void interact_facing_tile(State* state, int action, Rng rng) {
+void interact_facing_tile(State* state, int action, Rng rng) {
     if (action != ACTION_DO) {
         return;
     }
@@ -2279,10 +2216,7 @@ static inline void interact_facing_tile(State* state, int action, Rng rng) {
     int row = state->player_position[0] + direction[0];
     int col = state->player_position[1] + direction[1];
     bool in_bounds = row >= 0 && row < MAP_SIZE && col >= 0 && col < MAP_SIZE;
-    int level = jax_index(state->player_level, NUM_LEVELS);
-    int read_row = jax_index(row, MAP_SIZE);
-    int read_col = jax_index(col, MAP_SIZE);
-    int block = state->map[level][read_row][read_col];
+    int level = state->player_level;
     Inventory* inv = &state->inventory;
 
     bool did_attack = attack_mob_at(state, level, row, col, true);
@@ -2291,6 +2225,7 @@ static inline void interact_facing_tile(State* state, int action, Rng rng) {
     if (did_attack || !in_bounds) {
         return;
     }
+    int block = state->map[level][row][col];
 
     if (block == BLOCK_TREE || block == BLOCK_FIRE_TREE || block == BLOCK_ICE_SHRUB) {
         set_block(
@@ -2354,7 +2289,7 @@ static inline void interact_facing_tile(State* state, int action, Rng rng) {
     state->chests_opened[level] |= block == BLOCK_CHEST;
 }
 
-static inline void drink_potion(State* state, int action) {
+void drink_potion(State* state, int action) {
     int potion = action - ACTION_DRINK_POTION_RED;
     if (potion < 0 || potion >= NUM_POTIONS || state->inventory.potions[potion] <= 0) {
         return;
@@ -2370,7 +2305,7 @@ static inline void drink_potion(State* state, int action) {
     state->achievements[ACH_DRINK_POTION] = 1;
 }
 
-static inline void read_book(State* state, int action, Rng rng) {
+void read_book(State* state, int action, Rng rng) {
     bool reading = action == ACTION_READ_BOOK && state->inventory.books > 0;
     Rng unused;
     Rng choice_key;
@@ -2389,13 +2324,16 @@ static inline void read_book(State* state, int action, Rng rng) {
     }
 }
 
-static inline void enchant_items(State* state, int action, Rng rng) {
+void enchant_items(State* state, int action, Rng rng) {
     int direction[2];
     action_to_direction(state->player_direction, direction);
-    int level = jax_index(state->player_level, NUM_LEVELS);
-    int row = jax_index(state->player_position[0] + direction[0], MAP_SIZE);
-    int col = jax_index(state->player_position[1] + direction[1], MAP_SIZE);
-    int block = state->map[level][row][col];
+    int level = state->player_level;
+    int row = state->player_position[0] + direction[0];
+    int col = state->player_position[1] + direction[1];
+    int block = 0;
+    if (row >= 0 && row < MAP_SIZE && col >= 0 && col < MAP_SIZE) {
+        block = state->map[level][row][col];
+    }
     int enchant = block == BLOCK_ENCHANTMENT_TABLE_FIRE ? 1 :
         (block == BLOCK_ENCHANTMENT_TABLE_ICE ? 2 : 0);
     int gems = enchant == 1 ? state->inventory.ruby : state->inventory.sapphire;
@@ -2440,7 +2378,7 @@ static inline void enchant_items(State* state, int action, Rng rng) {
     }
 }
 
-static inline void use_projectile_or_spell(State* state, int action) {
+void use_projectile_or_spell(State* state, int action) {
     int direction[2];
     action_to_direction(state->player_direction, direction);
     if (direction[0] == 0 && direction[1] == 0) {
@@ -2492,7 +2430,7 @@ static inline void use_projectile_or_spell(State* state, int action) {
     }
 }
 
-static inline void update_plants(State* state) {
+void update_plants(State* state) {
     for (int plant = 0; plant < MAX_GROWING_PLANTS; plant++) {
         if (!state->growing_plants_mask[plant]) {
             continue;
@@ -2503,15 +2441,15 @@ static inline void update_plants(State* state) {
             continue;
         }
 
-        int row = jax_index(state->growing_plants_positions[plant][0], MAP_SIZE);
-        int col = jax_index(state->growing_plants_positions[plant][1], MAP_SIZE);
+        int row = state->growing_plants_positions[plant][0];
+        int col = state->growing_plants_positions[plant][1];
         if (state->growing_plants_age[plant] >= 600) {
             set_block(state, 0, row, col, BLOCK_RIPE_PLANT);
         }
     }
 }
 
-static inline void update_intrinsics(State* state, int action) {
+void update_intrinsics(State* state, int action) {
     bool start_sleep = action == ACTION_SLEEP && state->player_energy < max_energy(state);
     state->is_sleeping = state->is_sleeping || start_sleep;
 
@@ -2584,7 +2522,7 @@ static inline void update_intrinsics(State* state, int action) {
     }
 }
 
-static inline void clip_inventory_and_intrinsics(State* state) {
+void clip_inventory_and_intrinsics(State* state) {
     state->inventory.wood = clampi(state->inventory.wood, 0, 99);
     state->inventory.stone = clampi(state->inventory.stone, 0, 99);
     state->inventory.coal = clampi(state->inventory.coal, 0, 99);
@@ -2613,7 +2551,7 @@ static inline void clip_inventory_and_intrinsics(State* state) {
     state->player_mana = clampi(state->player_mana, 0, max_mana(state));
 }
 
-static inline void calculate_inventory_achievements(State* state) {
+void calculate_inventory_achievements(State* state) {
     state->achievements[ACH_COLLECT_WOOD] |= state->inventory.wood > 0;
     state->achievements[ACH_COLLECT_STONE] |= state->inventory.stone > 0;
     state->achievements[ACH_COLLECT_COAL] |= state->inventory.coal > 0;
@@ -2635,20 +2573,20 @@ static inline void calculate_inventory_achievements(State* state) {
     state->achievements[ACH_MAKE_DIAMOND_SWORD] |= state->inventory.sword >= 4;
 }
 
-static inline void update_boss_logic(State* state) {
+void update_boss_logic(State* state) {
     state->achievements[ACH_DEFEAT_NECROMANCER] |= has_beaten_boss(state);
     if (fighting_boss(state)) {
         state->boss_timestep_to_spawn_this_round -= 1;
     }
 }
 
-static inline float calculate_light_level(int timestep) {
+float calculate_light_level(int timestep) {
     float progress = fmodf((float)timestep / (float)DAY_LENGTH, 1.0f) + 0.3f;
     float cosine = cosf(3.14159265358979323846f * progress);
     return 1.0f - powf(fabsf(cosine), 3.0f);
 }
 
-static inline bool is_game_over(const State* state) {
+bool is_game_over(const State* state) {
     return state->player_health <= 0.0f || state->timestep >= DEFAULT_MAX_TIMESTEPS;
 }
 
@@ -2744,14 +2682,14 @@ void compute_observations(Craftax* env) {
     }
 }
 
-static inline void update_log_state(Craftax* env) {
+void update_log_state(Craftax* env) {
     if (env->state.player_level > env->max_floor_accum) {
         env->max_floor_accum = env->state.player_level;
     }
 }
 
 // Reset function
-static inline void reset_from_key(Craftax* env, Rng reset_key) {
+void reset_from_key(Craftax* env, Rng reset_key) {
     if (g_clean_reset_pool_size > 0) {
         uint32_t idx = reset_key.word[0] % (uint32_t)g_clean_reset_pool_size;
         memcpy(&env->state, &g_clean_reset_pool[idx], sizeof(State));
