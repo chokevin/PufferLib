@@ -125,6 +125,46 @@ static inline bool is_solid_block(int block) {
     }
 }
 
+static inline bool mob_at(const State* state, int level, int row, int col) {
+    if ((unsigned)row >= MAP_SIZE || (unsigned)col >= MAP_SIZE) {
+        return false;
+    }
+    return (state->mob_bits[level][row] >> col) & 1ull;
+}
+
+static inline void set_mob_bit(State* state, int level, int row, int col, bool on) {
+    if ((unsigned)row >= MAP_SIZE || (unsigned)col >= MAP_SIZE) {
+        return;
+    }
+    uint64_t bit = 1ull << col;
+    if (on) {
+        state->mob_bits[level][row] |= bit;
+    } else {
+        state->mob_bits[level][row] &= ~bit;
+    }
+}
+
+static inline void move_mob_occupancy(
+    State* state, int level, int old_row, int old_col, int new_row, int new_col, bool keep
+) {
+    set_mob_bit(state, level, old_row, old_col, false);
+    if (keep) {
+        set_mob_bit(state, level, new_row, new_col, true);
+    }
+}
+
+static inline bool mobs_at(const Mobs* mobs, int slots, int row, int col, int* slot) {
+    for (int i = 0; i < slots; i++) {
+        if (mobs->mask[i]
+            && mobs->position[i][0] == row
+            && mobs->position[i][1] == col) {
+            *slot = i;
+            return true;
+        }
+    }
+    return false;
+}
+
 static inline bool valid_player_position(const State* state, int row, int col) {
     if (row < 0 || row >= MAP_SIZE || col < 0 || col >= MAP_SIZE) {
         return false;
@@ -138,11 +178,7 @@ static inline bool valid_player_position(const State* state, int row, int col) {
     if (block == BLOCK_WATER || block == BLOCK_LAVA) {
         return false;
     }
-    return state->mob_map[level][row][col] == 0;
-}
-
-static inline int mob_slot_count(int mob_class) {
-    return mob_class == MOB_RANGED ? MAX_RANGED_MOBS : 3;
+    return !mob_at(state, level, row, col);
 }
 
 static inline Mobs* mobs_for_class(State* state, int level, int mob_class) {
@@ -155,55 +191,39 @@ static inline Mobs* mobs_for_class(State* state, int level, int mob_class) {
     return &state->melee_mobs[level];
 }
 
-static inline int mob_map_code(int mob_class, int slot) {
-    return mob_class * 10 + slot + 1;
+static inline bool find_mob_at(
+    const State* state,
+    int level,
+    int row,
+    int col,
+    int* mob_class,
+    int* slot
+) {
+    if (mobs_at(&state->melee_mobs[level], MAX_MELEE_MOBS, row, col, slot)) {
+        *mob_class = MOB_MELEE;
+        return true;
+    }
+    if (mobs_at(&state->passive_mobs[level], MAX_PASSIVE_MOBS, row, col, slot)) {
+        *mob_class = MOB_PASSIVE;
+        return true;
+    }
+    if (mobs_at(&state->ranged_mobs[level], MAX_RANGED_MOBS, row, col, slot)) {
+        *mob_class = MOB_RANGED;
+        return true;
+    }
+    return false;
 }
 
-static inline void decode_mob_map_code(int code, int* mob_class, int* slot) {
-    int value = code - 1;
-    *mob_class = value / 10;
-    *slot = value % 10;
-}
-
-static inline bool mob_can_spawn_on(int mob_class, int type_id, int block);
-static inline bool mob_can_move_on(int mob_class, int type_id, int block);
-
-static inline void refresh_mob_map(State* state, int level) {
-    for (int row = 0; row < MAP_SIZE; row++) {
-        for (int col = 0; col < MAP_SIZE; col++) {
-            state->mob_map[level][row][col] = 0;
-        }
-    }
-
-    for (int mob_class = MOB_PASSIVE; mob_class <= MOB_RANGED; mob_class++) {
-        Mobs* mobs = mobs_for_class(state, level, mob_class);
-        int slots = mob_slot_count(mob_class);
-        for (int i = 0; i < slots; i++) {
-            if (!mobs->mask[i]) {
-                continue;
-            }
-            int row = mobs->position[i][0];
-            int col = mobs->position[i][1];
-            if (row >= 0 && row < MAP_SIZE && col >= 0 && col < MAP_SIZE) {
-                state->mob_map[level][row][col] = mob_map_code(mob_class, i);
-            }
-        }
-    }
-}
-
-static inline bool valid_mob_position(const State* state, int level, int row, int col, int old_row, int old_col) {
-    if (row < 0 || row >= MAP_SIZE || col < 0 || col >= MAP_SIZE) {
-        return false;
-    }
-    if (row == state->player_position[0] && col == state->player_position[1]) {
-        return false;
-    }
-    int block = state->map[level][row][col];
-    if (is_solid_block(block) || block == BLOCK_WATER || block == BLOCK_LAVA) {
-        return false;
-    }
-    int code = state->mob_map[level][row][col];
-    return code == 0 || (row == old_row && col == old_col);
+static inline bool mob_can_move_on(int mob_class, int type_id, int block) {
+    static const bool blocked[NUM_MOB_TYPES][3][3] = {
+        {{0,1,1},{0,1,1},{0,1,1}}, {{0,0,0},{0,1,1},{0,1,1}},
+        {{0,1,1},{0,1,1},{0,1,1}}, {{0,1,1},{0,0,1},{0,1,1}},
+        {{0,1,1},{0,1,1},{0,1,1}}, {{0,1,1},{0,1,1},{1,0,1}},
+        {{0,1,1},{0,1,1},{0,0,0}}, {{0,1,1},{0,1,1},{0,0,0}},
+    };
+    if (is_solid_block(block)) return false;
+    int terrain = block == BLOCK_WATER ? 1 : (block == BLOCK_LAVA ? 2 : 0);
+    return !blocked[clampi(type_id,0,7)][clampi(mob_class,0,2)][terrain];
 }
 
 static inline bool valid_typed_mob_position(
@@ -225,32 +245,7 @@ static inline bool valid_typed_mob_position(
     if (!mob_can_move_on(mob_class, type_id, state->map[level][row][col])) {
         return false;
     }
-    int code = state->mob_map[level][row][col];
-    return code == 0 || (row == old_row && col == old_col);
-}
-
-static inline bool mob_type_uses_water(int mob_class, int type_id) {
-    return mob_class == MOB_RANGED && type_id == 5;
-}
-
-static inline bool mob_can_move_on(int mob_class, int type_id, int block) {
-    static const bool blocked[NUM_MOB_TYPES][3][3] = {
-        {{0,1,1},{0,1,1},{0,1,1}}, {{0,0,0},{0,1,1},{0,1,1}},
-        {{0,1,1},{0,1,1},{0,1,1}}, {{0,1,1},{0,0,1},{0,1,1}},
-        {{0,1,1},{0,1,1},{0,1,1}}, {{0,1,1},{0,1,1},{1,0,1}},
-        {{0,1,1},{0,1,1},{0,0,0}}, {{0,1,1},{0,1,1},{0,0,0}},
-    };
-    if (is_solid_block(block)) return false;
-    int terrain = block == BLOCK_WATER ? 1 : (block == BLOCK_LAVA ? 2 : 0);
-    return !blocked[clampi(type_id,0,7)][clampi(mob_class,0,2)][terrain];
-}
-
-static inline bool mob_can_spawn_on(int mob_class, int type_id, int block) {
-    if (mob_class == MOB_RANGED && type_id == 5) return block == BLOCK_WATER;
-    if (mob_class == MOB_MELEE && type_id == 7)
-        return block == BLOCK_GRAVE || block == BLOCK_GRAVE2 || block == BLOCK_GRAVE3;
-    return block == BLOCK_GRASS || block == BLOCK_PATH
-        || block == BLOCK_FIRE_GRASS || block == BLOCK_ICE_GRASS;
+    return !mob_at(state, level, row, col) || (row == old_row && col == old_col);
 }
 
 static inline float mob_base_health(int mob_class, int type_id) {
@@ -261,29 +256,6 @@ static inline float mob_base_health(int mob_class, int type_id) {
     if (mob_class == MOB_PASSIVE) return passive_health[idx];
     if (mob_class == MOB_RANGED) return ranged_health[idx];
     return melee_health[idx];
-}
-
-static inline float mob_contact_damage(int mob_class, int type_id) {
-    static const float melee_damage[NUM_MOB_TYPES] = {1.0f, 1.25f, 1.5f, 1.5f, 2.0f, 2.25f, 2.5f, 3.0f};
-    static const float ranged_damage[NUM_MOB_TYPES] = {0.75f, 1.0f, 1.25f, 1.25f, 1.5f, 1.75f, 2.0f, 2.25f};
-    int idx = clampi(type_id, 0, NUM_MOB_TYPES - 1);
-    return mob_class == MOB_RANGED ? ranged_damage[idx] : melee_damage[idx];
-}
-
-static inline int mob_attack_cooldown(int mob_class, int type_id) {
-    (void)type_id;
-    return mob_class == MOB_RANGED ? 14 : 8;
-}
-
-static inline int mob_sight_range(int mob_class, int type_id) {
-    (void)type_id;
-    return mob_class == MOB_RANGED ? 8 : 10;
-}
-
-static inline float player_attack_damage(const State* state) {
-    static const float damage[5] = {1, 2, 3, 5, 8};
-    return damage[clampi(state->inventory.sword, 0, 4)]
-        * (1.0f + 0.25f * (float)(state->player_strength - 1));
 }
 
 typedef struct { float physical, fire, ice; } Damage;
@@ -347,16 +319,13 @@ static inline bool damage_mob_at(
     State* state, int level, int row, int col, float damage,
     bool can_eat, bool can_get_achievement
 ) {
-    int code = state->mob_map[level][row][col];
-    if (code == 0) {
-        return false;
-    }
-
     int mob_class;
     int slot;
-    decode_mob_map_code(code, &mob_class, &slot);
+    if (!find_mob_at(state, level, row, col, &mob_class, &slot)) {
+        return false;
+    }
     Mobs* mobs = mobs_for_class(state, level, mob_class);
-    if (slot < 0 || slot >= mob_slot_count(mob_class) || !mobs->mask[slot]) {
+    if (!mobs->mask[slot]) {
         return false;
     }
 
@@ -367,7 +336,7 @@ static inline bool damage_mob_at(
 
     int type_id = mobs->type_id[slot];
     mobs->mask[slot] = false;
-    state->mob_map[level][row][col] = 0;
+    set_mob_bit(state, level, row, col, false);
     state->monsters_killed[level] += mob_class == MOB_PASSIVE ? 0 : 1;
     if (can_get_achievement) {
         state->achievements[defeat_achievement(mob_class, type_id, level)] = 1;
@@ -381,10 +350,11 @@ static inline bool damage_mob_at(
 }
 
 static inline bool attack_mob_at(State* state, int level, int row, int col, bool can_eat) {
-    int code = state->mob_map[level][row][col];
-    if (!code) return false;
-    int mob_class, slot;
-    decode_mob_map_code(code, &mob_class, &slot);
+    int mob_class;
+    int slot;
+    if (!find_mob_at(state, level, row, col, &mob_class, &slot)) {
+        return false;
+    }
     Mobs* mobs = mobs_for_class(state, level, mob_class);
     Damage vector = player_attack_damage_vector(state);
     return damage_mob_at(
@@ -453,7 +423,7 @@ static inline bool projectile_in_mob(const State* state, int level, int row, int
     int map_col = jax_index(col, MAP_SIZE);
     bool player_here = state->player_position[0] == row
         && state->player_position[1] == col;
-    return state->mob_map[map_level][map_row][map_col] != 0 || player_here;
+    return mob_at(state, map_level, map_row, map_col) || player_here;
 }
 
 static inline void scatter_set_block(State* state, int level, int row, int col, int block) {
@@ -526,14 +496,9 @@ static inline void move_player_projectile_slot(State* state, int level, int slot
     }
 
     bool hit_old = false;
-    int code = 0;
-    if (old_row >= 0 && old_row < MAP_SIZE && old_col >= 0 && old_col < MAP_SIZE) {
-        code = state->mob_map[level][old_row][old_col];
-    }
-    if (code) {
-        int mob_class;
-        int mob_slot;
-        decode_mob_map_code(code, &mob_class, &mob_slot);
+    int mob_class;
+    int mob_slot;
+    if (find_mob_at(state, level, old_row, old_col, &mob_class, &mob_slot)) {
         Mobs* target = mobs_for_class(state, level, mob_class);
         hit_old = damage_mob_at(
             state, level, old_row, old_col,
@@ -549,15 +514,7 @@ static inline void move_player_projectile_slot(State* state, int level, int slot
         second.ice = 0.0f;
     }
     bool hit_new = false;
-    code = 0;
-    if (proposed_row >= 0 && proposed_row < MAP_SIZE
-        && proposed_col >= 0 && proposed_col < MAP_SIZE) {
-        code = state->mob_map[level][proposed_row][proposed_col];
-    }
-    if (code) {
-        int mob_class;
-        int mob_slot;
-        decode_mob_map_code(code, &mob_class, &mob_slot);
+    if (find_mob_at(state, level, proposed_row, proposed_col, &mob_class, &mob_slot)) {
         Mobs* target = mobs_for_class(state, level, mob_class);
         hit_new = damage_mob_at(
             state, level, proposed_row, proposed_col,
@@ -607,19 +564,6 @@ static inline int pick_kth(int count, Rng key) {
     return count - 1;
 }
 
-static inline void occupy_mobs(const Mobs* mobs, int slots, uint64_t occupied[MAP_SIZE]) {
-    for (int i = 0; i < slots; i++) {
-        if (!mobs->mask[i]) {
-            continue;
-        }
-        int row = mobs->position[i][0];
-        int col = mobs->position[i][1];
-        if ((unsigned)row < MAP_SIZE && (unsigned)col < MAP_SIZE) {
-            occupied[row] |= 1ull << col;
-        }
-    }
-}
-
 static inline int collect_spawn_cells(
     const State* state,
     int level,
@@ -630,12 +574,9 @@ static inline int collect_spawn_cells(
     int* rows,
     int* cols
 ) {
-    const uint64_t* terrain = boss ? state->spawn_grave[level]: (water_only ? state->spawn_water[level] : state->spawn_land[level]);
-    uint64_t occupied[MAP_SIZE];
-    memset(occupied, 0, sizeof(occupied));
-    occupy_mobs(&state->passive_mobs[level], MAX_PASSIVE_MOBS, occupied);
-    occupy_mobs(&state->melee_mobs[level], MAX_MELEE_MOBS, occupied);
-    occupy_mobs(&state->ranged_mobs[level], MAX_RANGED_MOBS, occupied);
+    const uint64_t* terrain = boss
+        ? state->spawn_grave[level]
+        : (water_only ? state->spawn_water[level] : state->spawn_land[level]);
 
     int pr = state->player_position[0];
     int pc = state->player_position[1];
@@ -646,7 +587,7 @@ static inline int collect_spawn_cells(
         if ((unsigned)row >= MAP_SIZE) {
             continue;
         }
-        uint64_t bits = terrain[row] & ~occupied[row];
+        uint64_t bits = terrain[row] & ~state->mob_bits[level][row];
         if (!bits) {
             continue;
         }
@@ -674,37 +615,33 @@ static inline bool pick_spawn_cell(
     const int* cols,
     int count,
     Rng key,
-    int skip_row_a,
-    int skip_col_a,
-    int skip_row_b,
-    int skip_col_b,
     int* out_row,
     int* out_col
 ) {
-    int valid = 0;
-    for (int i = 0; i < count; i++) {
-        bool skip = (rows[i] == skip_row_a && cols[i] == skip_col_a)
-            || (rows[i] == skip_row_b && cols[i] == skip_col_b);
-        valid += skip ? 0 : 1;
-    }
-    if (valid == 0) {
+    if (count <= 0) {
         return false;
     }
-    int chosen = pick_kth(valid, key);
-    for (int i = 0; i < count; i++) {
-        bool skip = (rows[i] == skip_row_a && cols[i] == skip_col_a)
-            || (rows[i] == skip_row_b && cols[i] == skip_col_b);
-        if (skip) {
-            continue;
-        }
-        if (chosen == 0) {
-            *out_row = rows[i];
-            *out_col = cols[i];
-            return true;
-        }
-        chosen--;
-    }
-    return false;
+    int chosen = pick_kth(count, key);
+    *out_row = rows[chosen];
+    *out_col = cols[chosen];
+    return true;
+}
+
+static inline void spawn_into_slot(
+    State* state,
+    int level,
+    Mobs* mobs,
+    int slot,
+    int mob_class,
+    int type_id,
+    int row,
+    int col
+) {
+    mobs->position[slot][0] = row;
+    mobs->position[slot][1] = col;
+    mobs->health[slot] = mob_base_health(mob_class, type_id);
+    mobs->mask[slot] = true;
+    set_mob_bit(state, level, row, col, true);
 }
 
 static inline void count_and_empty(const Mobs* mobs, int slots, int* count, int* empty) {
@@ -730,7 +667,6 @@ static inline void spawn_mobs(State* state, Rng rng) {
         coeff *= (state->boss_timestep_to_spawn_this_round >= 1) ? 1000 : 0;
     }
 
-    refresh_mob_map(state, level);
     static const float chances[NUM_LEVELS][4] = {
         {0.1f, 0.02f, 0.05f, 0.1f},
         {0.1f, 0.06f, 0.05f, 0.0f},
@@ -781,71 +717,38 @@ static inline void spawn_mobs(State* state, Rng rng) {
 
     int min_hostile = boss ? -1 : 81;
     int max_hostile = boss ? 37 : MOB_DESPAWN_DISTANCE * MOB_DESPAWN_DISTANCE;
-    int passive_rows[729];
-    int passive_cols[729];
-    int melee_rows[729];
-    int melee_cols[729];
-    int ranged_rows[729];
-    int ranged_cols[729];
-    int n_passive = 0;
-    int n_melee = 0;
-    int n_ranged = 0;
+    int spawn_rows[729];
+    int spawn_cols[729];
+    int row;
+    int col;
     if (try_passive) {
-        n_passive = collect_spawn_cells(state, level, 9, MOB_DESPAWN_DISTANCE * MOB_DESPAWN_DISTANCE, false, false, passive_rows, passive_cols);
-    }
-    if (try_melee) {
-        n_melee = collect_spawn_cells(state, level, min_hostile, max_hostile, boss, false, melee_rows, melee_cols);
-    }
-    if (try_ranged) {
-        n_ranged = collect_spawn_cells(state, level, min_hostile, max_hostile, boss, ranged_type == 5, ranged_rows, ranged_cols);
-    }
-
-    int placed_row_a = -1000;
-    int placed_col_a = -1000;
-    int placed_row_b = -1000;
-    int placed_col_b = -1000;
-    int placed = 0;
-
-    if (try_passive) {
-        int row;
-        int col;
-        if (pick_spawn_cell(passive_rows, passive_cols, n_passive, passive_pos, placed_row_a, placed_col_a, placed_row_b, placed_col_b, &row, &col)) {
-            Mobs* mobs = &state->passive_mobs[level];
-            mobs->position[passive_slot][0] = row;
-            mobs->position[passive_slot][1] = col;
-            mobs->health[passive_slot] = mob_base_health(MOB_PASSIVE, passive_type);
-            mobs->mask[passive_slot] = true;
-            state->mob_map[level][row][col] = mob_map_code(MOB_PASSIVE, passive_slot);
-            if (placed == 0) { placed_row_a = row; placed_col_a = col; }
-            else { placed_row_b = row; placed_col_b = col; }
-            placed++;
+        int n = collect_spawn_cells(
+            state, level, 9, MOB_DESPAWN_DISTANCE * MOB_DESPAWN_DISTANCE,
+            false, false, spawn_rows, spawn_cols);
+        if (pick_spawn_cell(spawn_rows, spawn_cols, n, passive_pos, &row, &col)) {
+            spawn_into_slot(
+                state, level, &state->passive_mobs[level],
+                passive_slot, MOB_PASSIVE, passive_type, row, col);
         }
     }
     if (try_melee) {
-        int row;
-        int col;
-        if (pick_spawn_cell(melee_rows, melee_cols, n_melee, melee_pos, placed_row_a, placed_col_a, placed_row_b, placed_col_b, &row, &col)) {
-            Mobs* mobs = &state->melee_mobs[level];
-            mobs->position[melee_slot][0] = row;
-            mobs->position[melee_slot][1] = col;
-            mobs->health[melee_slot] = mob_base_health(MOB_MELEE, melee_type);
-            mobs->mask[melee_slot] = true;
-            state->mob_map[level][row][col] = mob_map_code(MOB_MELEE, melee_slot);
-            if (placed == 0) { placed_row_a = row; placed_col_a = col; }
-            else { placed_row_b = row; placed_col_b = col; }
-            placed++;
+        int n = collect_spawn_cells(
+            state, level, min_hostile, max_hostile,
+            boss, false, spawn_rows, spawn_cols);
+        if (pick_spawn_cell(spawn_rows, spawn_cols, n, melee_pos, &row, &col)) {
+            spawn_into_slot(
+                state, level, &state->melee_mobs[level],
+                melee_slot, MOB_MELEE, melee_type, row, col);
         }
     }
     if (try_ranged) {
-        int row;
-        int col;
-        if (pick_spawn_cell(ranged_rows, ranged_cols, n_ranged, ranged_pos, placed_row_a, placed_col_a, placed_row_b, placed_col_b, &row, &col)) {
-            Mobs* mobs = &state->ranged_mobs[level];
-            mobs->position[ranged_slot][0] = row;
-            mobs->position[ranged_slot][1] = col;
-            mobs->health[ranged_slot] = mob_base_health(MOB_RANGED, ranged_type);
-            mobs->mask[ranged_slot] = true;
-            state->mob_map[level][row][col] = mob_map_code(MOB_RANGED, ranged_slot);
+        int n = collect_spawn_cells(
+            state, level, min_hostile, max_hostile,
+            boss, ranged_type == 5, spawn_rows, spawn_cols);
+        if (pick_spawn_cell(spawn_rows, spawn_cols, n, ranged_pos, &row, &col)) {
+            spawn_into_slot(
+                state, level, &state->ranged_mobs[level],
+                ranged_slot, MOB_RANGED, ranged_type, row, col);
         }
     }
 }
@@ -936,12 +839,7 @@ static inline void move_melee_slot(State* state, int level, int slot, Rng* rng) 
     Rng unused;
     rng_split(*rng, &unused, rng);
 
-    if (alive) {
-        state->mob_map[level][old_row][old_col] = 0;
-    }
-    if (keep) {
-        state->mob_map[level][new_row][new_col] = mob_map_code(MOB_MELEE, slot);
-    }
+    move_mob_occupancy(state, level, old_row, old_col, new_row, new_col, keep);
     mobs->position[slot][0] = new_row;
     mobs->position[slot][1] = new_col;
     mobs->attack_cooldown[slot] = new_cooldown;
@@ -966,12 +864,7 @@ static inline void move_passive_slot(State* state, int level, int slot, Rng* rng
     int new_col = valid ? proposed_col : old_col;
     int dist = abs(state->player_position[0] - old_row) + abs(state->player_position[1] - old_col);
     bool keep = alive && dist < MOB_DESPAWN_DISTANCE;
-    if (alive) {
-        state->mob_map[level][old_row][old_col] = 0;
-    }
-    if (keep) {
-        state->mob_map[level][new_row][new_col] = mob_map_code(MOB_PASSIVE, slot);
-    }
+    move_mob_occupancy(state, level, old_row, old_col, new_row, new_col, keep);
     mobs->position[slot][0] = new_row;
     mobs->position[slot][1] = new_col;
     mobs->mask[slot] = keep;
@@ -1026,12 +919,7 @@ static inline void move_ranged_slot(State* state, int level, int slot, Rng* rng)
     int new_row = valid ? proposed_row : old_row;
     int new_col = valid ? proposed_col : old_col;
     bool keep = alive && (dist < MOB_DESPAWN_DISTANCE || fighting_boss(state));
-    if (alive) {
-        state->mob_map[level][old_row][old_col] = 0;
-    }
-    if (keep) {
-        state->mob_map[level][new_row][new_col] = mob_map_code(MOB_RANGED, slot);
-    }
+    move_mob_occupancy(state, level, old_row, old_col, new_row, new_col, keep);
     mobs->position[slot][0] = new_row;
     mobs->position[slot][1] = new_col;
     mobs->attack_cooldown[slot] = new_cooldown;
@@ -1040,7 +928,6 @@ static inline void move_ranged_slot(State* state, int level, int slot, Rng* rng)
 
 static inline void update_mobs(State* state, Rng rng) {
     int level = jax_index(state->player_level, NUM_LEVELS);
-    refresh_mob_map(state, level);
     rng_key(&rng);
     move_melee_slot(state, level, 0, &rng);
     move_melee_slot(state, level, 1, &rng);
@@ -1272,7 +1159,7 @@ static inline void place_block(State* state, int action) {
     int level = clampi(state->player_level, 0, NUM_LEVELS - 1);
     int block = state->map[level][row][col];
     bool occupied = is_solid_block(block) || state->item_map[level][row][col] != ITEM_NONE
-        || state->mob_map[level][row][col] != 0;
+        || mob_at(state, level, row, col);
     Inventory* inv = &state->inventory;
 
     if (action == ACTION_PLACE_TABLE && !occupied && inv->wood >= 2) {

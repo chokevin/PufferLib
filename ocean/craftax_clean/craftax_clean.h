@@ -49,8 +49,8 @@ typedef struct {
 typedef struct {
     int map[NUM_LEVELS][MAP_SIZE][MAP_SIZE];
     int item_map[NUM_LEVELS][MAP_SIZE][MAP_SIZE];
-    int mob_map[NUM_LEVELS][MAP_SIZE][MAP_SIZE];
     unsigned char light_map[NUM_LEVELS][MAP_SIZE][MAP_SIZE];
+    uint64_t mob_bits[NUM_LEVELS][MAP_SIZE];
     uint64_t spawn_land[NUM_LEVELS][MAP_SIZE];
     uint64_t spawn_grave[NUM_LEVELS][MAP_SIZE];
     uint64_t spawn_water[NUM_LEVELS][MAP_SIZE];
@@ -109,7 +109,6 @@ typedef struct {
     int achievements[NUM_ACHIEVEMENTS];
     uint32_t state_rng[2];
     int timestep;
-    int fractal_noise_angles[4];
 } State;
 
 struct Log {
@@ -203,10 +202,6 @@ static inline uint64_t rng_hash64(Rng key, uint64_t counter) {
     return rng_mix64(rng_to_u64(key) ^ counter);
 }
 
-static inline Rng rng_counter(Rng key, uint32_t count_hi, uint32_t count_lo) {
-    return rng_from_u64(rng_hash64(key, ((uint64_t)count_hi << 32) | count_lo));
-}
-
 static inline void rng_split(Rng key, Rng* left, Rng* right) {
     uint64_t state = rng_to_u64(key);
     uint64_t s1 = state * 6364136223846793005ULL + 1;
@@ -228,10 +223,6 @@ static inline uint32_t rng_u32_at(Rng key, uint64_t index) {
     return (uint32_t)h ^ (uint32_t)(h >> 32);
 }
 
-static inline uint32_t rng_u32(Rng key) {
-    return rng_u32_at(key, 0u);
-}
-
 static inline float rng_f32_at(Rng key, uint64_t index) {
     uint32_t bits = rng_u32_at(key, index);
     uint32_t float_bits = (bits >> 9u) | 0x3F800000u;
@@ -242,10 +233,6 @@ static inline float rng_f32_at(Rng key, uint64_t index) {
 
 static inline float rng_f32(Rng key) {
     return rng_f32_at(key, 0u);
-}
-
-static inline Rng load_rng(const State* state) {
-    return (Rng){{state->state_rng[0], state->state_rng[1]}};
 }
 
 static inline void store_rng(State* state, Rng rng) {
@@ -259,34 +246,6 @@ static inline Rng rng_key(Rng* rng) {
     rng_split(*rng, &next, &draw);
     *rng = next;
     return draw;
-}
-
-static inline int rand_range(Rng* rng, int low, int high) {
-    uint32_t span = (uint32_t)(high - low + 1);
-    if (span == 0) {
-        return low;
-    }
-    return low + (int)(rng_u32_at(rng_key(rng), 0u) % span);
-}
-
-static inline float rand_unit(Rng* rng) {
-    return rng_f32(rng_key(rng));
-}
-
-static inline int weighted_choice(Rng* rng, const float* weights, int count) {
-    float total = 0.0f;
-    for (int i = 0; i < count; i++) {
-        total += weights[i];
-    }
-    float draw = total * (1.0f - rand_unit(rng));
-    float cumulative = 0.0f;
-    for (int i = 0; i < count; i++) {
-        cumulative += weights[i];
-        if (cumulative >= draw) {
-            return i;
-        }
-    }
-    return count - 1;
 }
 
 static inline int choice_valid(Rng key, const bool* valid, int count) {
@@ -328,23 +287,17 @@ static inline int randint_at(Rng key, uint64_t index, int minval, int maxval) {
     return (int)randint_u32_at(key, index, (uint32_t)minval, (uint32_t)maxval);
 }
 
-static inline void set_spawn_bit(uint64_t* row_bits, int col, bool on) {
-    uint64_t bit = 1ull << col;
-    if (on) {
-        *row_bits |= bit;
-    } else {
-        *row_bits &= ~bit;
-    }
-}
-
 static inline void refresh_spawn_cell(State* state, int level, int row, int col) {
     int block = state->map[level][row][col];
-    set_spawn_bit(&state->spawn_land[level][row], col,
-        block == BLOCK_GRASS || block == BLOCK_PATH
-        || block == BLOCK_FIRE_GRASS || block == BLOCK_ICE_GRASS);
-    set_spawn_bit(&state->spawn_grave[level][row], col,
-        block == BLOCK_GRAVE || block == BLOCK_GRAVE2 || block == BLOCK_GRAVE3);
-    set_spawn_bit(&state->spawn_water[level][row], col, block == BLOCK_WATER);
+    uint64_t bit = 1ull << col;
+    uint64_t* land = &state->spawn_land[level][row];
+    uint64_t* grave = &state->spawn_grave[level][row];
+    uint64_t* water = &state->spawn_water[level][row];
+    *land = (*land & ~bit) | ((block == BLOCK_GRASS || block == BLOCK_PATH
+        || block == BLOCK_FIRE_GRASS || block == BLOCK_ICE_GRASS) ? bit : 0);
+    *grave = (*grave & ~bit) | ((block == BLOCK_GRAVE || block == BLOCK_GRAVE2
+        || block == BLOCK_GRAVE3) ? bit : 0);
+    *water = (*water & ~bit) | (block == BLOCK_WATER ? bit : 0);
 }
 
 static inline void set_block(State* state, int level, int row, int col, int block) {
@@ -363,27 +316,6 @@ static inline void refresh_spawn_maps(State* state) {
             }
         }
     }
-}
-
-static inline bool walkable(int block) {
-    return block == BLOCK_GRASS
-        || block == BLOCK_PATH
-        || block == BLOCK_FIRE_GRASS
-        || block == BLOCK_ICE_GRASS
-        || block == BLOCK_SAND
-        || block == BLOCK_GRAVEL
-        || block == BLOCK_FOUNTAIN
-        || block == BLOCK_ENCHANTMENT_TABLE_FIRE
-        || block == BLOCK_ENCHANTMENT_TABLE_ICE
-        || block == BLOCK_GRAVE
-        || block == BLOCK_GRAVE2
-        || block == BLOCK_GRAVE3
-        || block == BLOCK_NECROMANCER
-        || block == BLOCK_NECROMANCER_VULNERABLE;
-}
-
-static inline void init_mobs(Mobs* mobs) {
-    memset(mobs, 0, sizeof(*mobs));
 }
 
 static inline void add_light(State* state, int level, int center_row, int center_col) {
@@ -655,7 +587,6 @@ static inline void generate_smooth_level(
             state->map[level][row][col] = block;
             state->item_map[level][row][col] = ITEM_NONE;
             state->light_map[level][row][col] = (unsigned char)(config->default_light * 255.0f);
-            state->mob_map[level][row][col] = 0;
         }
     }
 
@@ -868,7 +799,6 @@ static inline void generate_dungeon_level(
                 padded_map[row + max_room_size][col + max_room_size];
             state->item_map[level][row][col] =
                 padded_item[row + max_room_size][col + max_room_size];
-            state->mob_map[level][row][col] = 0;
         }
     }
 
@@ -985,18 +915,13 @@ void generate_world_from_key(State* state, Rng rng) {
     }
 
     for (int level = 0; level < NUM_LEVELS; level++) {
-        init_mobs(&state->melee_mobs[level]);
-        init_mobs(&state->passive_mobs[level]);
-        init_mobs(&state->ranged_mobs[level]);
-        init_mobs(&state->mob_projectiles[level]);
-        init_mobs(&state->player_projectiles[level]);
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < MAX_MELEE_MOBS; i++) {
             state->melee_mobs[level].health[i] = 1.0f;
             state->passive_mobs[level].health[i] = 1.0f;
             state->mob_projectiles[level].health[i] = 1.0f;
             state->player_projectiles[level].health[i] = 1.0f;
         }
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < MAX_RANGED_MOBS; i++) {
             state->ranged_mobs[level].health[i] = 1.0f;
         }
         for (int projectile = 0; projectile < MAX_MOB_PROJECTILES; projectile++) {
@@ -1065,18 +990,6 @@ static inline void craftax_clean_set_reset_pool_size(int n) {
     g_clean_reset_pool_ready = 1;
 }
 
-static inline void set_one_hot(float* obs, int* obs_idx, int index, int count) {
-    if (index < 0) {
-        index = 0;
-    }
-    if (index >= count) {
-        index = count - 1;
-    }
-    for (int i = 0; i < count; i++) {
-        obs[(*obs_idx)++] = i == index ? 1.0f : 0.0f;
-    }
-}
-
 static inline bool scatter_index(int index, int size, int* mapped) {
     if (index < -size || index >= size) {
         return false;
@@ -1119,7 +1032,7 @@ static inline void write_mob_obs(
     }
 }
 
-static inline bool boss_vulnerable(const State* state);
+#include "game_logic.h"
 
 void compute_observations(Craftax* env) {
     State* state = &env->state;
@@ -1157,70 +1070,61 @@ void compute_observations(Craftax* env) {
     int obs_idx = map_obs;
 
     // Player inventory (normalized)
-    env->agents[0].observations[obs_idx++] = sqrtf((float)state->inventory.wood) / 10.0f;
-    env->agents[0].observations[obs_idx++] = sqrtf((float)state->inventory.stone) / 10.0f;
-    env->agents[0].observations[obs_idx++] = sqrtf((float)state->inventory.coal) / 10.0f;
-    env->agents[0].observations[obs_idx++] = sqrtf((float)state->inventory.iron) / 10.0f;
-    env->agents[0].observations[obs_idx++] = sqrtf((float)state->inventory.diamond) / 10.0f;
-    env->agents[0].observations[obs_idx++] = sqrtf((float)state->inventory.sapphire) / 10.0f;
-    env->agents[0].observations[obs_idx++] = sqrtf((float)state->inventory.ruby) / 10.0f;
-    env->agents[0].observations[obs_idx++] = sqrtf((float)state->inventory.sapling) / 10.0f;
-    env->agents[0].observations[obs_idx++] = sqrtf((float)state->inventory.torches) / 10.0f;
-    env->agents[0].observations[obs_idx++] = sqrtf((float)state->inventory.arrows) / 10.0f;
-    env->agents[0].observations[obs_idx++] = (float)state->inventory.books / 2.0f;
-    env->agents[0].observations[obs_idx++] = (float)state->inventory.pickaxe / 4.0f;
-    env->agents[0].observations[obs_idx++] = (float)state->inventory.sword / 4.0f;
-    env->agents[0].observations[obs_idx++] = (float)state->sword_enchantment;
-    env->agents[0].observations[obs_idx++] = (float)state->bow_enchantment;
-    env->agents[0].observations[obs_idx++] = (float)state->inventory.bow;
+    obs[obs_idx++] = sqrtf((float)state->inventory.wood) / 10.0f;
+    obs[obs_idx++] = sqrtf((float)state->inventory.stone) / 10.0f;
+    obs[obs_idx++] = sqrtf((float)state->inventory.coal) / 10.0f;
+    obs[obs_idx++] = sqrtf((float)state->inventory.iron) / 10.0f;
+    obs[obs_idx++] = sqrtf((float)state->inventory.diamond) / 10.0f;
+    obs[obs_idx++] = sqrtf((float)state->inventory.sapphire) / 10.0f;
+    obs[obs_idx++] = sqrtf((float)state->inventory.ruby) / 10.0f;
+    obs[obs_idx++] = sqrtf((float)state->inventory.sapling) / 10.0f;
+    obs[obs_idx++] = sqrtf((float)state->inventory.torches) / 10.0f;
+    obs[obs_idx++] = sqrtf((float)state->inventory.arrows) / 10.0f;
+    obs[obs_idx++] = (float)state->inventory.books / 2.0f;
+    obs[obs_idx++] = (float)state->inventory.pickaxe / 4.0f;
+    obs[obs_idx++] = (float)state->inventory.sword / 4.0f;
+    obs[obs_idx++] = (float)state->sword_enchantment;
+    obs[obs_idx++] = (float)state->bow_enchantment;
+    obs[obs_idx++] = (float)state->inventory.bow;
     for (int i = 0; i < NUM_POTIONS; i++) {
-        env->agents[0].observations[obs_idx++] =
-            sqrtf((float)state->inventory.potions[i]) / 10.0f;
+        obs[obs_idx++] = sqrtf((float)state->inventory.potions[i]) / 10.0f;
     }
-    
-    // Player intrinsic values (normalized)
-    env->agents[0].observations[obs_idx++] = state->player_health / 10.0f;
-    env->agents[0].observations[obs_idx++] = (float)state->player_food / 10.0f;
-    env->agents[0].observations[obs_idx++] = (float)state->player_drink / 10.0f;
-    env->agents[0].observations[obs_idx++] = (float)state->player_energy / 10.0f;
-    env->agents[0].observations[obs_idx++] = (float)state->player_mana / 10.0f;
-    env->agents[0].observations[obs_idx++] = (float)state->player_xp / 10.0f;
-    env->agents[0].observations[obs_idx++] = (float)state->player_dexterity / 10.0f;
-    env->agents[0].observations[obs_idx++] = (float)state->player_strength / 10.0f;
-    env->agents[0].observations[obs_idx++] = (float)state->player_intelligence / 10.0f;
 
-    // One-hot encoded player direction (has 4 categories)
+    obs[obs_idx++] = state->player_health / 10.0f;
+    obs[obs_idx++] = (float)state->player_food / 10.0f;
+    obs[obs_idx++] = (float)state->player_drink / 10.0f;
+    obs[obs_idx++] = (float)state->player_energy / 10.0f;
+    obs[obs_idx++] = (float)state->player_mana / 10.0f;
+    obs[obs_idx++] = (float)state->player_xp / 10.0f;
+    obs[obs_idx++] = (float)state->player_dexterity / 10.0f;
+    obs[obs_idx++] = (float)state->player_strength / 10.0f;
+    obs[obs_idx++] = (float)state->player_intelligence / 10.0f;
+
     int direction_index = state->player_direction - ACTION_LEFT;
     for (int i = 0; i < 4; i++) {
-        env->agents[0].observations[obs_idx++] = i == direction_index ? 1.0f : 0.0f;
+        obs[obs_idx++] = i == direction_index ? 1.0f : 0.0f;
     }
-
     for (int i = 0; i < 4; i++) {
-        env->agents[0].observations[obs_idx++] = (float)state->inventory.armour[i] / 2.0f;
+        obs[obs_idx++] = (float)state->inventory.armour[i] / 2.0f;
     }
-
     for (int i = 0; i < 4; i++) {
-        env->agents[0].observations[obs_idx++] = (float)state->armour_enchantments[i];
+        obs[obs_idx++] = (float)state->armour_enchantments[i];
     }
 
-    // Special values
-    env->agents[0].observations[obs_idx++] = state->light_level;
-    env->agents[0].observations[obs_idx++] = state->is_sleeping ? 1.0f : 0.0f;
-    env->agents[0].observations[obs_idx++] = state->is_resting ? 1.0f : 0.0f;
-    env->agents[0].observations[obs_idx++] = state->learned_spells[0] ? 1.0f : 0.0f;
-    env->agents[0].observations[obs_idx++] = state->learned_spells[1] ? 1.0f : 0.0f;
-    env->agents[0].observations[obs_idx++] = (float)state->player_level / 10.0f;
-    env->agents[0].observations[obs_idx++] =
-        state->monsters_killed[level] >= MONSTERS_KILLED_TO_CLEAR_LEVEL ? 1.0f : 0.0f;
-    env->agents[0].observations[obs_idx++] = boss_vulnerable(state) ? 1.0f : 0.0f;
+    obs[obs_idx++] = state->light_level;
+    obs[obs_idx++] = state->is_sleeping ? 1.0f : 0.0f;
+    obs[obs_idx++] = state->is_resting ? 1.0f : 0.0f;
+    obs[obs_idx++] = state->learned_spells[0] ? 1.0f : 0.0f;
+    obs[obs_idx++] = state->learned_spells[1] ? 1.0f : 0.0f;
+    obs[obs_idx++] = (float)state->player_level / 10.0f;
+    obs[obs_idx++] = state->monsters_killed[level] >= MONSTERS_KILLED_TO_CLEAR_LEVEL ? 1.0f : 0.0f;
+    obs[obs_idx++] = boss_vulnerable(state) ? 1.0f : 0.0f;
 
     if (obs_idx != OBS_SIZE) {
         fprintf(stderr, "craftax_clean: encoded %d values, expected %d\n", obs_idx, OBS_SIZE);
         abort();
     }
-} 
-
-#include "game_logic.h"
+}
 
 static inline void c_update_log_state(Craftax* env) {
     if (env->state.player_level > env->max_floor_accum) {
@@ -1233,14 +1137,12 @@ static inline void reset_from_key(Craftax* env, Rng reset_key) {
     if (g_clean_reset_pool_size > 0) {
         uint32_t idx = reset_key.word[0] % (uint32_t)g_clean_reset_pool_size;
         memcpy(&env->state, &g_clean_reset_pool[idx], sizeof(State));
-        refresh_mob_map(&env->state, env->state.player_level);
         return;
     }
     Rng unused;
     Rng world_key;
     rng_split(reset_key, &unused, &world_key);
     generate_world_from_key(&env->state, world_key);
-    refresh_mob_map(&env->state, env->state.player_level);
 }
 
 void c_reset(Craftax* env) {
@@ -1261,7 +1163,6 @@ void c_reset(Craftax* env) {
         rng_split(initial, &env->env_rng, &discard);
         int idx = (int)(env->seed % (uint64_t)g_clean_reset_pool_size);
         memcpy(&env->state, &g_clean_reset_pool[idx], sizeof(State));
-        refresh_mob_map(&env->state, env->state.player_level);
         compute_observations(env);
         c_update_log_state(env);
         return;
@@ -1603,10 +1504,12 @@ static Color craftax_clean_mob_tint(int mob_class, int type_id) {
     return tints[clampi(type_id, 0, NUM_MOB_TYPES - 1)];
 }
 
-static void craftax_clean_draw_mob_marker(State* state, int level, int code, int x, int y) {
+static void craftax_clean_draw_mob_marker(State* state, int level, int row, int col, int x, int y) {
     int mob_class;
     int slot;
-    decode_mob_map_code(code, &mob_class, &slot);
+    if (!find_mob_at(state, level, row, col, &mob_class, &slot)) {
+        return;
+    }
 
     int tex_id = TEX_MOB_ZOMBIE;
     if (mob_class == MOB_PASSIVE) {
@@ -1617,11 +1520,7 @@ static void craftax_clean_draw_mob_marker(State* state, int level, int code, int
         tex_id = TEX_MOB_SKELETON;
     }
 
-    int type_id = 0;
-    Mobs* mobs = mobs_for_class(state, level, mob_class);
-    if (slot >= 0 && slot < mob_slot_count(mob_class)) {
-        type_id = mobs->type_id[slot];
-    }
+    int type_id = mobs_for_class(state, level, mob_class)->type_id[slot];
     craftax_clean_draw_tile_tinted(tex_id, x, y, craftax_clean_mob_tint(mob_class, type_id));
 }
 
@@ -1731,9 +1630,8 @@ void c_render(Craftax* env) {
                 if (item > ITEM_NONE && item < NUM_ITEM_TYPES) {
                     craftax_clean_draw_tile(TEX_ITEM_BASE + item, dst_x, dst_y, 1.0f);
                 }
-                int mob_code = env->state.mob_map[level][wr][wc];
-                if (mob_code != 0) {
-                    craftax_clean_draw_mob_marker(&env->state, level, mob_code, dst_x, dst_y);
+                if (mob_at(&env->state, level, wr, wc)) {
+                    craftax_clean_draw_mob_marker(&env->state, level, wr, wc, dst_x, dst_y);
                 }
             }
         }
