@@ -343,52 +343,6 @@ float noise_interpolant(float t) {
     return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
 }
 
-void generate_perlin(
-    Rng rng,
-    int rows,
-    int cols,
-    int res_rows,
-    int res_cols,
-    float* out
-) {
-    Rng unused;
-    Rng angle_key;
-    rng_split(rng, &unused, &angle_key);
-    int cell_rows = rows / res_rows;
-    int cell_cols = cols / res_cols;
-    int width = res_cols + 1;
-
-    for (int row = 0; row < rows; row++) {
-        int grad_row = row / cell_rows;
-        float local_row = (float)(row - grad_row * cell_rows) / (float)cell_rows;
-        float interp_row = noise_interpolant(local_row);
-        for (int col = 0; col < cols; col++) {
-            int grad_col = col / cell_cols;
-            float local_col = (float)(col - grad_col * cell_cols) / (float)cell_cols;
-            float interp_col = noise_interpolant(local_col);
-            float gx[2][2];
-            float gy[2][2];
-            for (int dr = 0; dr < 2; dr++) {
-                for (int dc = 0; dc < 2; dc++) {
-                    uint64_t index = (uint64_t)(grad_row + dr) * (uint64_t)width
-                        + (uint64_t)(grad_col + dc);
-                    float angle = NOISE_PI2 * rng_f32_at(angle_key, index);
-                    gx[dr][dc] = cosf(angle);
-                    gy[dr][dc] = sinf(angle);
-                }
-            }
-            float n00 = local_row * gx[0][0] + local_col * gy[0][0];
-            float n10 = (local_row - 1.0f) * gx[1][0] + local_col * gy[1][0];
-            float n01 = local_row * gx[0][1] + (local_col - 1.0f) * gy[0][1];
-            float n11 = (local_row - 1.0f) * gx[1][1] + (local_col - 1.0f) * gy[1][1];
-            float n0 = n00 * (1.0f - interp_row) + interp_row * n10;
-            float n1 = n01 * (1.0f - interp_row) + interp_row * n11;
-            out[(size_t)row * (size_t)cols + (size_t)col] =
-                NOISE_SQRT2 * ((1.0f - interp_col) * n0 + interp_col * n1);
-        }
-    }
-}
-
 void generate_fractal(
     Rng rng,
     int rows,
@@ -404,23 +358,49 @@ void generate_fractal(
     memset(out, 0, size * sizeof(float));
     int frequency = 1;
     float amplitude = 1.0f;
-    float perlin[MAP_CELLS];
     for (int octave = 0; octave < octaves; octave++) {
         Rng next_rng;
         Rng noise_key;
         rng_split(rng, &next_rng, &noise_key);
         rng = next_rng;
-        generate_perlin(
-            noise_key,
-            rows,
-            cols,
-            frequency * res_rows,
-            frequency * res_cols,
-            perlin
-        );
-        for (size_t i = 0; i < size; i++) {
-            out[i] += amplitude * perlin[i];
+
+        Rng unused;
+        Rng angle_key;
+        rng_split(noise_key, &unused, &angle_key);
+        int cell_rows = rows / (frequency * res_rows);
+        int cell_cols = cols / (frequency * res_cols);
+        int width = frequency * res_cols + 1;
+
+        for (int row = 0; row < rows; row++) {
+            int grad_row = row / cell_rows;
+            float local_row = (float)(row - grad_row * cell_rows) / (float)cell_rows;
+            float interp_row = noise_interpolant(local_row);
+            for (int col = 0; col < cols; col++) {
+                int grad_col = col / cell_cols;
+                float local_col = (float)(col - grad_col * cell_cols) / (float)cell_cols;
+                float interp_col = noise_interpolant(local_col);
+                float gx[2][2];
+                float gy[2][2];
+                for (int dr = 0; dr < 2; dr++) {
+                    for (int dc = 0; dc < 2; dc++) {
+                        uint64_t index = (uint64_t)(grad_row + dr) * (uint64_t)width
+                            + (uint64_t)(grad_col + dc);
+                        float angle = NOISE_PI2 * rng_f32_at(angle_key, index);
+                        gx[dr][dc] = cosf(angle);
+                        gy[dr][dc] = sinf(angle);
+                    }
+                }
+                float n00 = local_row * gx[0][0] + local_col * gy[0][0];
+                float n10 = (local_row - 1.0f) * gx[1][0] + local_col * gy[1][0];
+                float n01 = local_row * gx[0][1] + (local_col - 1.0f) * gy[0][1];
+                float n11 = (local_row - 1.0f) * gx[1][1] + (local_col - 1.0f) * gy[1][1];
+                float n0 = n00 * (1.0f - interp_row) + interp_row * n10;
+                float n1 = n01 * (1.0f - interp_row) + interp_row * n11;
+                out[(size_t)row * (size_t)cols + (size_t)col] += amplitude
+                    * NOISE_SQRT2 * ((1.0f - interp_col) * n0 + interp_col * n1);
+            }
         }
+
         frequency *= lacunarity;
         amplitude *= persistence;
     }
