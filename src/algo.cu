@@ -1140,6 +1140,9 @@ constexpr int ppo_max_head_classes() {
     return m > 0 ? m : 1;
 }
 constexpr int PPO_MAX_HEAD_A = ppo_max_head_classes();
+constexpr int PPO_NARROW_MAX_HEAD_A = 32;
+constexpr bool PPO_WIDE_CATEGORICAL =
+    PPO_MAX_HEAD_A > PPO_NARROW_MAX_HEAD_A;
 
 // Fused loss function. PPO clipped loss + value + entropy
 // buffers + args are quite complex. We do the entire
@@ -1194,39 +1197,7 @@ void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_t
     cudaMalloc((void**)&bufs.ent_coef, sizeof(float));
 }
 
-// Discrete only. mask is always present (env mask or synthetic all-ones).
-__device__ __forceinline__ float load_logit_masked(
-        const precision_t* __restrict__ logits, int logits_base,
-        int logits_offset, int a,
-        const precision_t* __restrict__ mask, int mask_base) {
-    float l = to_float(logits[logits_base + logits_offset + a]);
-    float m = to_float(mask[mask_base + logits_offset + a]);
-    if (m == 0.0f) {
-        l = -1e4f;
-    }
-    return l;
-}
-
-// Shared by sample_logits + ppo_loss. Fills cache[0..A) (sized PPO_MAX_HEAD_A).
-__device__ __forceinline__ float ppo_discrete_logsumexp(
-        const precision_t* __restrict__ logits, int logits_base,
-        int logits_offset, int A,
-        const precision_t* __restrict__ mask, int mask_base,
-        float* __restrict__ cache) {
-    float max_logit = -INFINITY;
-    float sum = 0.0f;
-    for (int a = 0; a < A; ++a) {
-        float l = load_logit_masked(
-            logits, logits_base, logits_offset, a, mask, mask_base);
-        cache[a] = l;
-        if (l > max_logit) {
-            sum *= __expf(max_logit - l);
-            max_logit = l;
-        }
-        sum += __expf(l - max_logit);
-    }
-    return max_logit + __logf(sum);
-}
+#include "categorical.cuh"
 
 __device__ __forceinline__ void ppo_continuous_head(
         float mean, float log_std, float action,
@@ -1281,32 +1252,52 @@ __global__ void cache_imp_and_v(
         int logits_offset = 0;
         for (int h = 0; h < NUM_ATNS; ++h) {
             int A = act_sizes[h];
-            float cache[PPO_MAX_HEAD_A];
-            float lse = ppo_discrete_logsumexp(
-                logits, logits_base, logits_offset, A,
-                action_mask, at_base, cache);
-            for (int a = 0; a < A; ++a) {
-                logps[at_base + logits_offset + a] = cache[a] - lse;
+            float action = actions[idx * NUM_ATNS + h];
+            int act = ppo_discrete_validate_action(
+                action, A, action_mask, at_base, logits_offset);
+            float selected_logp = 0.0f;
+            if constexpr (!PPO_WIDE_CATEGORICAL) {
+                float cache[PPO_MAX_HEAD_A];
+                float lse = ppo_discrete_logsumexp(
+                    logits, logits_base, logits_offset, A,
+                    action_mask, at_base, cache);
+                for (int a = 0; a < A; ++a) {
+                    logps[at_base + logits_offset + a] = cache[a] - lse;
+                }
+                selected_logp = cache[act] - lse;
+            } else {
+                float lse = ppo_discrete_logsumexp(
+                    logits, logits_base, logits_offset, A,
+                    action_mask, at_base, nullptr);
+                for (int a = 0; a < A; ++a) {
+                    int out = at_base + logits_offset + a;
+                    logps[out] = ppo_discrete_mask_allows(
+                        action_mask, at_base, logits_offset, a)
+                        ? ppo_discrete_load_logit(
+                            logits, logits_base, logits_offset, a) - lse
+                        : -INFINITY;
+                }
+                selected_logp = ppo_discrete_load_logit(
+                    logits, logits_base, logits_offset, act) - lse;
             }
 #if defined(PUFFER_NETHACK)
             int used = nethack_head_used(verb, h);
             if (used) {
-                int act = (int)actions[idx * NUM_ATNS + h];
                 if (h == 0) {
                     float mix = 1.0f;
                     new_lp += nethack_verb_train_logp(
                         action_mask + at_base + logits_offset, A,
-                        cache[act] - lse, &mix);
+                        selected_logp, &mix);
                 } else {
-                    new_lp += cache[act] - lse;
+                    new_lp += selected_logp;
                 }
             }
 #elif defined(KG_HEAD_GATING_SELECTOR_VALUES)
             if (kg_puffer5_head_used(actions + idx * NUM_ATNS, h)) {
-                new_lp += cache[(int)actions[idx * NUM_ATNS + h]] - lse;
+                new_lp += selected_logp;
             }
 #else
-            new_lp += cache[(int)actions[idx * NUM_ATNS + h]] - lse;
+            new_lp += selected_logp;
 #endif
             logits_offset += A;
         }
@@ -1426,9 +1417,15 @@ __global__ void ppo_loss_compute(
                     continue;
                 }
 #endif
-                int act = (int)g.actions[nt * a.num_atns + h];
+                int act = ppo_discrete_validate_action(
+                    g.actions[nt * a.num_atns + h], A,
+                    a.action_mask, at_base, logits_offset);
                 float ent = 0.0f;
                 for (int j = 0; j < A; ++j) {
+                    if (!ppo_discrete_mask_allows(
+                            a.action_mask, at_base, logits_offset, j)) {
+                        continue;
+                    }
                     float logp = a.grad_logits[at_base + logits_offset + j];
                     ent -= __expf(logp) * logp;
                 }
@@ -1446,6 +1443,11 @@ __global__ void ppo_loss_compute(
                 float d_logp = d_new_logp;
 #endif
                 for (int j = 0; j < A; ++j) {
+                    if (!ppo_discrete_mask_allows(
+                            a.action_mask, at_base, logits_offset, j)) {
+                        a.grad_logits[at_base + logits_offset + j] = 0.0f;
+                        continue;
+                    }
                     float logp = a.grad_logits[at_base + logits_offset + j];
                     float p = __expf(logp);
                     a.grad_logits[at_base + logits_offset + j] =

@@ -590,7 +590,7 @@ __global__ void rng_init(curandStatePhilox4_32_10_t* states, uint64_t seed, int 
 }
 
 // Action logits and value share one row: [logits..., value]. logstd empty ⇒ discrete.
-// Discrete: always-cache logsumexp + inverse-CDF; mask always present (all-ones if env has none).
+// Discrete: cached inverse-CDF for narrow heads, bounded rescans for wide heads.
 // Continuous: ignores mask.
 __global__ void sample_logits(
         Prec dec_out,              // (B, logits_dim + 1)
@@ -641,9 +641,7 @@ __global__ void sample_logits(
         int mask_base = idx * mask_stride;
         for (int h = 0; h < num_atns; h++) {
             int A = act_sizes[h];
-            float cache[PPO_MAX_HEAD_A];
-            float logsumexp = ppo_discrete_logsumexp(
-                logits, logits_base, logits_offset, A, action_mask, mask_base, cache);
+            float logsumexp = 0.0f;
 #ifdef PUFFER_NETHACK
             float inv_K = 0.0f;
             float eps = h == 0 ? nethack_verb_eps_load(
@@ -651,33 +649,82 @@ __global__ void sample_logits(
 #endif
             float rand_val = curand_uniform(&state);
             float cumsum = 0.0f;
-            int sampled = A - 1;
-            for (int a = 0; a < A; a++) {
+            int sampled = -1;
+            float sampled_logp = 0.0f;
+            if constexpr (!PPO_WIDE_CATEGORICAL) {
+                float cache[PPO_MAX_HEAD_A];
+                logsumexp = ppo_discrete_logsumexp(
+                    logits, logits_base, logits_offset, A,
+                    action_mask, mask_base, cache);
+                for (int a = 0; a < A; a++) {
+                    if (!ppo_discrete_mask_allows(
+                            action_mask, mask_base, logits_offset, a)) {
+                        continue;
+                    }
+                    float prob = __expf(cache[a] - logsumexp);
 #ifdef PUFFER_NETHACK
-                if (eps > 0.0f) {
-                    cumsum += nethack_verb_eps_mix(expf(cache[a] - logsumexp),
-                        action_mask[mask_base + logits_offset + a], eps, inv_K);
-                } else
+                    if (eps > 0.0f) {
+                        prob = nethack_verb_eps_mix(prob,
+                            action_mask[mask_base + logits_offset + a],
+                            eps, inv_K);
+                    }
 #endif
-                {
-                    cumsum += expf(cache[a] - logsumexp);
-                }
-                if (rand_val < cumsum) {
-                    sampled = a;
-                    break;
-                }
-            }
-            // CDF fall-through (float rounding) lands on A - 1, which may be
-            // masked; snap to the last legal action. A legitimate A - 1 pick
-            // is always legal, so the snap is an exact no-op for it.
-            if (sampled == A - 1) {
-                for (int a = A - 1; a >= 0; a--) {
-                    if (to_float(action_mask[mask_base + logits_offset + a]) != 0.0f) {
+                    cumsum += prob;
+                    if (rand_val < cumsum) {
                         sampled = a;
+                        sampled_logp = cache[a] - logsumexp;
                         break;
                     }
                 }
+                if (sampled < 0) {
+                    for (int a = A - 1; a >= 0; a--) {
+                        if (ppo_discrete_mask_allows(
+                                action_mask, mask_base, logits_offset, a)) {
+                            sampled = a;
+                            sampled_logp = cache[a] - logsumexp;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                logsumexp = ppo_discrete_logsumexp(
+                    logits, logits_base, logits_offset, A,
+                    action_mask, mask_base, nullptr);
+                for (int a = 0; a < A; a++) {
+                    if (!ppo_discrete_mask_allows(
+                            action_mask, mask_base, logits_offset, a)) {
+                        continue;
+                    }
+                    float logp = ppo_discrete_load_logit(
+                        logits, logits_base, logits_offset, a) - logsumexp;
+                    float prob = __expf(logp);
+#ifdef PUFFER_NETHACK
+                    if (eps > 0.0f) {
+                        prob = nethack_verb_eps_mix(prob,
+                            action_mask[mask_base + logits_offset + a],
+                            eps, inv_K);
+                    }
+#endif
+                    cumsum += prob;
+                    if (rand_val < cumsum) {
+                        sampled = a;
+                        sampled_logp = logp;
+                        break;
+                    }
+                }
+                if (sampled < 0) {
+                    for (int a = A - 1; a >= 0; a--) {
+                        if (ppo_discrete_mask_allows(
+                                action_mask, mask_base, logits_offset, a)) {
+                            sampled = a;
+                            sampled_logp = ppo_discrete_load_logit(
+                                logits, logits_base, logits_offset, a) - logsumexp;
+                            break;
+                        }
+                    }
+                }
             }
+            assert(sampled >= 0 && "categorical sampler found no legal action");
             // Float32 preserves large categorical IDs that BF16 cannot represent.
             int aidx = idx * num_atns + h;
             float action = (float)sampled;
@@ -689,17 +736,17 @@ __global__ void sample_logits(
             if (used) {
                 if (eps > 0.0f) {
                     total_log_prob += logf((1.0f - eps)
-                        * expf(cache[sampled] - logsumexp) + eps * inv_K);
+                        * expf(sampled_logp) + eps * inv_K);
                 } else {
-                    total_log_prob += cache[sampled] - logsumexp;
+                    total_log_prob += sampled_logp;
                 }
             }
 #elif defined(KG_HEAD_GATING_SELECTOR_VALUES)
             if (kg_puffer5_head_used(actions + idx * num_atns, h)) {
-                total_log_prob += cache[sampled] - logsumexp;
+                total_log_prob += sampled_logp;
             }
 #else
-            total_log_prob += cache[sampled] - logsumexp;
+            total_log_prob += sampled_logp;
 #endif
             logits_offset += A;
         }
