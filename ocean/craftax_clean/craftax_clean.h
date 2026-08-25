@@ -200,6 +200,7 @@ struct Env {
     int achievements[NUM_ACHIEVEMENTS];
     State* reset_pool;
     int reset_pool_size;
+    int use_action_mask;
 };
 
 Rng rng_seed(uint32_t seed) {
@@ -1610,6 +1611,72 @@ int choose_weighted_key(Rng key, const float* weights, int count) {
     return count - 1;
 }
 
+void compute_action_mask(Craftax* env) {
+    unsigned char* m = env->agents[0].action_mask;
+    if (m == NULL) {
+        return;
+    }
+    if (!env->use_action_mask) {
+        memset(m, 1, ATN_DIM);
+        return;
+    }
+    const State* s = &env->state;
+    const Inventory* inv = &s->inventory;
+    memset(m, 0, ATN_DIM);
+    m[ACTION_NOOP] = 1;
+    if (s->is_sleeping || s->is_resting) {
+        return;
+    }
+    m[ACTION_LEFT] = m[ACTION_RIGHT] = m[ACTION_UP] = m[ACTION_DOWN] = m[ACTION_DO] = 1;
+    m[ACTION_SLEEP] = s->player_energy < max_energy(s);
+    m[ACTION_REST] = s->player_health < max_health(s);
+    m[ACTION_PLACE_STONE] = m[ACTION_PLACE_FURNACE] = inv->stone > 0;
+    m[ACTION_PLACE_TABLE] = inv->wood >= 2;
+    m[ACTION_PLACE_PLANT] = inv->sapling > 0;
+    m[ACTION_PLACE_TORCH] = inv->torches > 0;
+    m[ACTION_MAKE_WOOD_PICKAXE] = inv->wood > 0 && inv->pickaxe < 1;
+    m[ACTION_MAKE_STONE_PICKAXE] = inv->wood > 0 && inv->stone > 0 && inv->pickaxe < 2;
+    m[ACTION_MAKE_IRON_PICKAXE] = inv->wood > 0 && inv->stone > 0 && inv->iron > 0
+        && inv->coal > 0 && inv->pickaxe < 3;
+    m[ACTION_MAKE_DIAMOND_PICKAXE] = inv->wood > 0 && inv->diamond >= 3 && inv->pickaxe < 4;
+    m[ACTION_MAKE_WOOD_SWORD] = inv->wood > 0 && inv->sword < 1;
+    m[ACTION_MAKE_STONE_SWORD] = inv->wood > 0 && inv->stone > 0 && inv->sword < 2;
+    m[ACTION_MAKE_IRON_SWORD] = inv->wood > 0 && inv->stone > 0 && inv->iron > 0
+        && inv->coal > 0 && inv->sword < 3;
+    m[ACTION_MAKE_DIAMOND_SWORD] = inv->wood > 0 && inv->diamond >= 2 && inv->sword < 4;
+    m[ACTION_MAKE_ARROW] = inv->wood > 0 && inv->stone > 0 && inv->arrows < 99;
+    m[ACTION_MAKE_TORCH] = inv->wood > 0 && inv->coal > 0 && inv->torches < 99;
+    int missing_iron = 0;
+    int missing_diamond = 0;
+    int armour = 0;
+    for (int k = 0; k < 4; k++) {
+        missing_iron += inv->armour[k] < 1;
+        missing_diamond += inv->armour[k] < 2;
+        armour += inv->armour[k];
+    }
+    m[ACTION_MAKE_IRON_ARMOUR] = missing_iron && inv->iron >= 3 && inv->coal >= 3;
+    m[ACTION_MAKE_DIAMOND_ARMOUR] = missing_diamond && inv->diamond >= 3;
+    int item = s->item_map[s->player_level][s->player_position[0]][s->player_position[1]];
+    m[ACTION_DESCEND] = item == ITEM_LADDER_DOWN
+        && s->monsters_killed[s->player_level] >= MONSTERS_KILLED_TO_CLEAR_LEVEL
+        && s->player_level < NUM_LEVELS - 1;
+    m[ACTION_ASCEND] = item == ITEM_LADDER_UP && s->player_level > 0;
+    m[ACTION_SHOOT_ARROW] = inv->bow > 0 && inv->arrows > 0;
+    m[ACTION_CAST_FIREBALL] = s->learned_spells[0] && s->player_mana >= 2;
+    m[ACTION_CAST_ICEBALL] = s->learned_spells[1] && s->player_mana >= 2;
+    for (int k = 0; k < NUM_POTIONS; k++) {
+        m[ACTION_DRINK_POTION_RED + k] = inv->potions[k] > 0;
+    }
+    m[ACTION_READ_BOOK] = inv->books > 0;
+    int enchant = s->player_mana >= 9 && (inv->ruby > 0 || inv->sapphire > 0);
+    m[ACTION_ENCHANT_SWORD] = enchant && inv->sword > 0;
+    m[ACTION_ENCHANT_ARMOUR] = enchant && armour > 0;
+    m[ACTION_ENCHANT_BOW] = enchant && inv->bow > 0;
+    m[ACTION_LEVEL_UP_DEXTERITY] = s->player_xp > 0 && s->player_dexterity < MAX_ATTRIBUTE;
+    m[ACTION_LEVEL_UP_STRENGTH] = s->player_xp > 0 && s->player_strength < MAX_ATTRIBUTE;
+    m[ACTION_LEVEL_UP_INTELLIGENCE] = s->player_xp > 0 && s->player_intelligence < MAX_ATTRIBUTE;
+}
+
 void compute_observations(Craftax* env) {
     State* state = &env->state;
     float* obs = env->agents[0].observations;
@@ -1714,6 +1781,7 @@ void compute_observations(Craftax* env) {
     obs[obs_idx++] = state->monsters_killed[level] >= MONSTERS_KILLED_TO_CLEAR_LEVEL ? 1.0f : 0.0f;
     obs[obs_idx++] = boss_vulnerable(state) ? 1.0f : 0.0f;
 
+    compute_action_mask(env);
 }
 
 void update_log_state(Craftax* env) {
@@ -2628,11 +2696,14 @@ void puf_step(Craftax* env) {
 void puf_init(Env* env, Dict* kwargs) {
     env->num_agents = 1;
     env->agents[0].policy = 0;
-    env->agents[0].action_mask = NULL;
+    env->agents[0].action_mask = NULL;  // trainer wires mask after puf_init
+    env->use_action_mask = 1;
     uint64_t seed_offset = 0;
     for (int i = 0; i < kwargs->size; i++) {
         if (strcmp(kwargs->items[i].key, "seed_offset") == 0) {
             seed_offset = (uint64_t)kwargs->items[i].value;
+        } else if (strcmp(kwargs->items[i].key, "action_mask") == 0) {
+            env->use_action_mask = kwargs->items[i].value != 0.0;
         }
     }
     env->seed = seed_offset + env->rng;
@@ -3077,10 +3148,13 @@ void puf_render(Craftax* env) {
     for (int action = 0; action < ATN_DIM; action++) {
         int y = 48 + action * 15;
         bool selected = action == taken_action;
+        bool legal = env->agents[0].action_mask == NULL
+            || env->agents[0].action_mask[action];
         if (selected) {
             DrawRectangle(panel_x + 6, y - 2, ACTION_PANEL_W - 12, 15, (Color){0, 210, 220, 255});
         }
-        Color text_color = selected ? BLACK : (Color){220, 230, 230, 255};
+        Color text_color = selected ? BLACK
+            : (legal ? (Color){220, 230, 230, 255} : (Color){80, 90, 90, 255});
         DrawText(craftax_clean_action_keys[action], panel_x + 12, y, 10, text_color);
         DrawText(TextFormat("%02d %s", action, craftax_clean_action_names[action]),
             panel_x + 78, y, 10, text_color);
