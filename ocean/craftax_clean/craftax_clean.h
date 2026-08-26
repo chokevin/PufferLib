@@ -1836,7 +1836,9 @@ void puf_step(Craftax* env) {
 
     // Sleep and rest last one tick: the agent must emit the action again to continue.
     state->is_sleeping = (action == ACTION_SLEEP
-        && state->player_energy < max_energy(state)); state->is_resting = (action == ACTION_REST&& state->player_health < max_health(state));
+        && state->player_energy < max_energy(state));
+    state->is_resting = (action == ACTION_REST
+        && state->player_health < max_health(state));
 
     CLEAN_ZONE(0);
     int level = state->player_level;
