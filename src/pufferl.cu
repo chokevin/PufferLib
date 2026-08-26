@@ -486,9 +486,8 @@ enum {
     NUM_EV,
     EV_T = ENV_END + 1,
     TE_S = 0,
+    TE_MID,
     TE_E,
-    TE_MS,
-    TE_FE,
     NUM_TE,
 };
 
@@ -515,7 +514,7 @@ const char* LOSS_NAMES[] = {
 };
 
 typedef struct {
-    cudaEvent_t events[2][NUM_TE];  // per async slot; recorded inside the train graph
+    unsigned long long* stamps;  // device [2 * NUM_TE]; globaltimer ns
     cudaEvent_t* rollout_ev;  // GPU [EV_T * horizon]; null on CPU
     float accum[NUM_PROF];
     int skip_rollout_time;
@@ -1433,12 +1432,19 @@ __global__ void clamp_precision_kernel(precision_t* dst, float lo, float hi, int
     }
 }
 
+// 1-thread graph node. cudaEventElapsedTime does not timestamp in-graph events.
+__global__ void puf_stamp(unsigned long long* dst) {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    *dst = t;
+}
+
 static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         cudaStream_t stream) {
     Hypers* hypers = &pufferl->hypers;
     RolloutBuf* rollouts = &pufferl->train_rollouts;
-    cudaEvent_t* ev = pufferl->profile.events[slot];
-    cudaEventRecord(ev[TE_S], stream);
+    unsigned long long* st = pufferl->profile.stamps + slot * NUM_TE;
+    puf_stamp<<<1, 1, 0, stream>>>(st + TE_S);
 
     int T = src.observations.shape[0];
     int B = src.observations.shape[1];
@@ -1473,8 +1479,7 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             numel(pufferl->train_state.shape) * sizeof(precision_t),
             cudaMemcpyDeviceToDevice, stream);
     }
-    cudaEventRecord(ev[TE_E], stream);
-    cudaEventRecord(ev[TE_MS], stream);
+    puf_stamp<<<1, 1, 0, stream>>>(st + TE_MID);
 
     int batch_size = hypers->total_agents * hypers->horizon;
     int mb_segs = hypers->minibatch_size / hypers->horizon;
@@ -1541,7 +1546,7 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
                 primary->param.data, primary->master_weights.data, n);
         }
     }
-    cudaEventRecord(ev[TE_FE], stream);
+    puf_stamp<<<1, 1, 0, stream>>>(st + TE_E);
 }
 
 void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
@@ -1582,42 +1587,40 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
     int total_minibatches = hypers->replay_ratio * batch_size / hypers->minibatch_size;
     bool first = hypers->cudagraphs && pufferl->train_cudagraph[slot] == NULL;
     profile_begin("train_forward_backward", hypers->profile);
-    if (hypers->cudagraphs && !first) {
+    if (first) {
+        double t_cap = wall_clock();
+        assert(cudaStreamBeginCapture(
+            train_stream, cudaStreamCaptureModeThreadLocal)
+            == cudaSuccess && "cudaStreamBeginCapture failed");
+        train_epoch_gpu(pufferl, src, slot, train_stream);
+        cudaGraph_t graph;
+        assert(cudaStreamEndCapture(train_stream, &graph)
+            == cudaSuccess && "cudaStreamEndCapture failed");
+        assert(cudaGraphInstantiate(
+            &pufferl->train_cudagraph[slot], graph, 0)
+            == cudaSuccess && "cudaGraphInstantiate failed");
+        cudaGraphDestroy(graph);
+        double dt = wall_clock() - t_cap;
+        pufferl->start_time += dt;
+        pufferl->last_log_time += dt;
+    }
+    if (hypers->cudagraphs) {
         cudaGraphLaunch(pufferl->train_cudagraph[slot], train_stream);
     } else {
-        double t_cap = 0;
-        if (first) {
-            t_cap = wall_clock();
-            assert(cudaStreamBeginCapture(
-                train_stream, cudaStreamCaptureModeThreadLocal)
-                == cudaSuccess && "cudaStreamBeginCapture failed");
-        }
         train_epoch_gpu(pufferl, src, slot, train_stream);
-        if (first) {
-            cudaGraph_t graph;
-            assert(cudaStreamEndCapture(train_stream, &graph)
-                == cudaSuccess && "cudaStreamEndCapture failed");
-            assert(cudaGraphInstantiate(
-                &pufferl->train_cudagraph[slot], graph, 0)
-                == cudaSuccess && "cudaGraphInstantiate failed");
-            cudaGraphDestroy(graph);
-            double dt = wall_clock() - t_cap;
-            pufferl->start_time += dt;
-            pufferl->last_log_time += dt;
-            cudaGraphLaunch(pufferl->train_cudagraph[slot], train_stream);
-        }
     }
     profile_end(hypers->profile);
 
     cudaStreamSynchronize(train_stream);
 
-    if (total_minibatches > 0 && !first) {
-        float ms;
-        cudaEvent_t* ev = pufferl->profile.events[slot];
-        cudaEventElapsedTime(&ms, ev[TE_S], ev[TE_E]);
-        pufferl->profile.accum[PROF_TRAIN_MISC] += ms;
-        cudaEventElapsedTime(&ms, ev[TE_MS], ev[TE_FE]);
-        pufferl->profile.accum[PROF_TRAIN_MODEL] += ms;
+    if (total_minibatches > 0) {
+        unsigned long long h[NUM_TE];
+        cudaMemcpy(h, pufferl->profile.stamps + slot * NUM_TE,
+            sizeof(h), cudaMemcpyDeviceToHost);
+        pufferl->profile.accum[PROF_TRAIN_MISC] +=
+            (float)(h[TE_MID] - h[TE_S]) * 1e-6f;
+        pufferl->profile.accum[PROF_TRAIN_MODEL] +=
+            (float)(h[TE_E] - h[TE_MID]) * 1e-6f;
     }
     pufferl->epoch += 1;
 }
@@ -1874,12 +1877,8 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     env_setup(pufferl, vec, &vec_kwargs, env_kwargs);
     pufferl->vec = vec;
 
-    for (int s = 0; s < 2; s++) {
-        for (int i = 0; i < NUM_TE; i++) {
-            assert(cudaEventCreate(&pufferl->profile.events[s][i])
-                == cudaSuccess);
-        }
-    }
+    cudaMalloc((void**)&pufferl->profile.stamps,
+        2 * NUM_TE * sizeof(unsigned long long));
     if (PUF_BACKEND == PUF_GPU) {
         int H = hypers.horizon;
         pufferl->profile.rollout_ev = (cudaEvent_t*)calloc(
@@ -2075,17 +2074,13 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
 
 // OS reclaims memory/CUDA context on exit. This is the intended design.
 // All memory is allocated up front and static across training.
+// Skip cudaDeviceSynchronize/ncclCommDestroy: captured NCCL graphs deadlock DP.
 void close_pufferl(PuffeRL* p) {
-    cudaDeviceSynchronize();
     if (p->hypers.profile) {
         cudaProfilerStop();
     }
     nvmlShutdown();
     env_close(p->vec);
-    cudaDeviceSynchronize();
-    if (p->nccl_comm != NULL) {
-        ncclCommDestroy(p->nccl_comm);
-    }
 }
 
 // Dashboard
@@ -2691,8 +2686,12 @@ void run_sweep(Ini* ini, const char* exe_path) {
                 for (int j = 0; j < space->num; j++) {
                     float val = puf_ini_get(ini, params[j].section, params[j].key);
                     float norm = space_normalize(&space->spaces[j], val);
-                    assert(isfinite(norm) && norm >= -1.0f && norm <= 1.0f
-                        && "default sweep value outside its sweep range");
+                    if (!(isfinite(norm) && norm >= -1.0f && norm <= 1.0f)) {
+                        fprintf(stderr,
+                            "default sweep value outside its sweep range: %s.%s\n",
+                            params[j].section, params[j].key);
+                        exit(1);
+                    }
                     samples[j] = norm;
                 }
             } else {
@@ -3268,8 +3267,10 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     return result;
 }
 
-// Fork DP workers before CUDA initialization. Sweep trials occupy contiguous GPU
-// blocks; rank 0 owns the last GPU and writes TrainResult to base.result_fd.
+// Fork DP workers before any CUDA/NCCL call (those start runtime threads;
+// fork after that SIGSEGVs children and rank 0 hangs in ncclCommInitRank).
+// Rank 0 generates the NCCL id after fork and pipes it. Sweep trials occupy
+// contiguous GPU blocks; rank 0 owns the last GPU and writes TrainResult.
 TrainResult launch_train(Ini* ini) {
     int mb = puf_ini_get(ini, "train", "minibatch_size");
     int horizon = puf_ini_get(ini, "train", "horizon");
@@ -3286,11 +3287,9 @@ TrainResult launch_train(Ini* ini) {
     assert(horizon % ADV_VEC_WIDTH == 0
         && "train.horizon must be a multiple of ADV_VEC_WIDTH (4 float / 8 bf16)");
 
-    ncclUniqueId nccl_id;
-    ncclUniqueId* nccl_ptr = NULL;
+    int nccl_pipe[2] = {-1, -1};
     if (world_size > 1) {
-        ncclGetUniqueId(&nccl_id);
-        nccl_ptr = &nccl_id;
+        assert(pipe(nccl_pipe) == 0 && "pipe failed");
     }
 
     int n_workers = world_size - 1;
@@ -3299,19 +3298,42 @@ TrainResult launch_train(Ini* ini) {
         pid_t pid = fork();
         assert(pid >= 0 && "fork failed");
         if (pid == 0) {
+            close(nccl_pipe[1]);
+            ncclUniqueId nccl_id;
+            assert(read(nccl_pipe[0], &nccl_id, sizeof(nccl_id)) == (ssize_t)sizeof(nccl_id)
+                && "failed to read ncclUniqueId");
             assert(freopen("/dev/null", "w", stdout) == stdout);
             TrainContext child = {
                 .rank = rank,
                 .world_size = world_size,
                 .gpu_id = gpu_offset + rank - 1,
                 .artifact_owner = 0,
-                .nccl_id = nccl_ptr,
+                .nccl_id = &nccl_id,
             };
             run_train(ini, &child);
+            // Rank 0 may still be in post-train eval. Stay alive until it
+            // closes the pipe; exiting earlier aborts NCCL and poisons rank 0
+            // CUDA graphs (cudaGraphLaunch fails in pufferl_forward).
+            char b;
+            ssize_t n = read(nccl_pipe[0], &b, 1);
+            assert(n >= 0);
+            close(nccl_pipe[0]);
             puf_ini_free(ini);
             exit(0);
         }
         pids[rank - 1] = pid;
+    }
+
+    ncclUniqueId nccl_id;
+    ncclUniqueId* nccl_ptr = NULL;
+    if (world_size > 1) {
+        close(nccl_pipe[0]);
+        ncclGetUniqueId(&nccl_id);
+        for (int i = 0; i < n_workers; i++) {
+            assert(write(nccl_pipe[1], &nccl_id, sizeof(nccl_id)) == (ssize_t)sizeof(nccl_id)
+                && "failed to write ncclUniqueId");
+        }
+        nccl_ptr = &nccl_id;
     }
 
     TrainContext host = {
@@ -3322,6 +3344,9 @@ TrainResult launch_train(Ini* ini) {
         .nccl_id = nccl_ptr,
     };
     TrainResult result = run_train(ini, &host);
+    if (world_size > 1) {
+        close(nccl_pipe[1]);
+    }
     for (int i = 0; i < n_workers; i++) {
         int status = 0;
         waitpid(pids[i], &status, 0);
@@ -3349,11 +3374,13 @@ int main(int argc, char** argv) {
             argv[0]);
         exit(1);
     }
-    int total_gpus = 0;
-    assert(cudaGetDeviceCount(&total_gpus) == cudaSuccess && total_gpus >= 1
-        && "no CUDA devices available");
-
     const char* mode = argv[1];
+    // Train forks DP workers; CUDA before that fork SIGSEGVs the children.
+    if (strcmp(mode, "train") != 0) {
+        int total_gpus = 0;
+        assert(cudaGetDeviceCount(&total_gpus) == cudaSuccess && total_gpus >= 1
+            && "no CUDA devices available");
+    }
     int argi = 2;
     const char* model = NULL;
     if (strcmp(mode, "eval") == 0 && argi < argc && argv[argi][0] &&
