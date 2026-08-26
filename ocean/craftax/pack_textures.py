@@ -1,27 +1,68 @@
 """Pack Craftax upstream 16x16 PNG assets into a single shared textures.bin.
 
-Consumed by both ocean/craftax (full) and ocean/craftax_classic. All files
-live in craftax's asset dir; the classic PNGs that overlap are byte-identical
-to the full ones.
+Consumed by ocean/craftax, ocean/craftax_classic, and ocean/craftax_clean.
+All files live in craftax's asset dir; the classic PNGs that overlap are
+byte-identical to the full ones.
 
 Layout: contiguous 16*16*4 RGBA tiles. Order must match the
-CRAFTAX_TEX_* / CC_TEX_* enums in the two env headers.
+CRAFTAX_TEX_* / CC_TEX_* / TEX_* enums in the env headers.
 
   [0..36]  block textures (37) -- BlockType; first 17 entries also valid for classic
   [37..41] player: down, up, left, right, sleep
   [42..46] items: none(blank), torch, ladder_down, ladder_up, ladder_down_blocked
   [47..49] mobs: zombie, skeleton, cow
   [50..53] arrows: down, up, left, right
+  [54..61] armour: iron then diamond, each helmet/chest/pants/boots
+  [62..65] pickaxes: wood, stone, iron, diamond
+  [66..69] swords: wood, stone, iron, diamond
+  [70]     bow
+  [71..76] potions: red, green, blue, pink, cyan, yellow
+  [77..79] HUD-only: sapling, torch_in_inventory, book
+  [80..87] melee types: zombie, gnome_warrior, orc_soldier, lizard, knight, troll, pigman, frost_troll
+  [88..90] passive types: cow, bat, snail
+  [91..98] ranged types: skeleton, gnome_archer, orc_mage, kobold, knight_archer, deep_thing, fire_elemental, ice_elemental
+  [99..102] projectiles: dagger, fireball, iceball, slimeball
 """
 
+import os
 from pathlib import Path
 from PIL import Image
 import numpy as np
 
-ASSETS = Path(__file__).resolve().parents[2] / (
-    ".venv/lib/python3.12/site-packages/craftax/craftax/assets"
-)
-OUT_BIN = Path(__file__).resolve().parents[2] / "resources" / "craftax" / "textures.bin"
+ROOT = Path(__file__).resolve().parents[2]
+OUT_BIN = ROOT / "resources" / "craftax" / "textures.bin"
+
+
+def find_assets() -> Path:
+    env = os.environ.get("CRAFTAX_ASSETS")
+    if env:
+        p = Path(env)
+        if (p / "iron_helmet.png").exists():
+            return p
+    try:
+        import craftax
+        pkg = Path(craftax.__file__).resolve().parent
+        for cand in (pkg / "craftax" / "assets", pkg / "assets"):
+            if (cand / "iron_helmet.png").exists():
+                return cand
+    except ImportError:
+        pass
+    candidates = [
+        ROOT / ".venv/lib/python3.12/site-packages/craftax/craftax/assets",
+        ROOT / ".venv/lib/python3.10/site-packages/craftax/craftax/assets",
+        Path.home() / ".cache/uv/archive-v0/A1lWMW1niJVdk7dF0fJmT/craftax/craftax/assets",
+        Path.home() / "github/multitask_preplay/.venv/lib/python3.10/site-packages/craftax/craftax/assets",
+    ]
+    for cand in candidates:
+        if (cand / "iron_helmet.png").exists():
+            return cand
+    raise FileNotFoundError(
+        "craftax assets not found (need iron_helmet.png). "
+        "Set CRAFTAX_ASSETS or install the craftax package."
+    )
+
+
+ASSETS = find_assets()
 
 TILE = 16
 
@@ -94,6 +135,85 @@ ARROW_FILES = [
     "arrow-right.png",
 ]
 
+# Official Craftax HUD icons (constants.py armour_textures[level, slot]).
+# Empty (level 0) is a blank tile drawn by the renderer, not packed.
+ARMOUR_FILES = [
+    "iron_helmet.png",
+    "iron_chestplate.png",
+    "iron_pants.png",
+    "iron_boots.png",
+    "diamond_helmet.png",
+    "diamond_chestplate.png",
+    "diamond_pants.png",
+    "diamond_boots.png",
+]
+
+# Official Craftax HUD tool icons (constants.py pickaxe/sword/bow textures).
+# Empty (level 0) is a blank slot drawn by the renderer, not packed.
+WEAPON_FILES = [
+    "wood_pickaxe.png",
+    "stone_pickaxe.png",
+    "iron_pickaxe.png",
+    "diamond_pickaxe.png",
+    "wood_sword.png",
+    "stone_sword.png",
+    "iron_sword.png",
+    "diamond_sword.png",
+    "bow.png",
+]
+
+# Official Craftax HUD potion icons (constants.py potion_textures).
+POTION_FILES = [
+    "potion_red.png",
+    "potion_green.png",
+    "potion_blue.png",
+    "potion_pink.png",
+    "potion_cyan.png",
+    "potion_yellow.png",
+]
+
+# Official Craftax HUD item icons that differ from the world tiles
+# (constants.py sapling_texture / torch_inv_texture / book_texture).
+HUD_ITEM_FILES = [
+    "sapling.png",
+    "torch_in_inventory.png",
+    "book.png",
+]
+
+# Official Craftax per-type mob sprites (constants.py load_mob_texture_set).
+# Indexed by type_id; 47-49 remain the 3 generic sprites for classic/full Craftax.
+MELEE_TYPE_FILES = [
+    "zombie.png",
+    "gnome_warrior.png",
+    "orc_soldier.png",
+    "lizard.png",
+    "knight.png",
+    "troll.png",
+    "pigman.png",
+    "frost_troll.png",
+]
+PASSIVE_TYPE_FILES = [
+    "cow.png",
+    "bat.png",
+    "snail.png",
+]
+RANGED_TYPE_FILES = [
+    "skeleton.png",
+    "gnome_archer.png",
+    "orc_mage.png",
+    "kobold.png",
+    "knight_archer.png",
+    "deep_thing.png",
+    "fire_elemental.png",
+    "ice_elemental.png",
+]
+PROJECTILE_TYPE_FILES = [
+    "dagger.png",
+    "fireball.png",
+    "iceball.png",
+    "slimeball.png",
+]
+
 
 def load_tile(name: str | None) -> np.ndarray:
     if name is None:
@@ -104,6 +224,7 @@ def load_tile(name: str | None) -> np.ndarray:
 
 
 def main() -> None:
+    print(f"craftax assets: {ASSETS}")
     tiles: list[np.ndarray] = []
     for f in BLOCK_FILES:
         tiles.append(load_tile(f))
@@ -125,7 +246,12 @@ def main() -> None:
         else:
             tiles.append(load_tile(f))
 
-    for f in MOB_FILES + ARROW_FILES:
+    for f in (
+        MOB_FILES + ARROW_FILES + ARMOUR_FILES + WEAPON_FILES
+        + POTION_FILES + HUD_ITEM_FILES
+        + MELEE_TYPE_FILES + PASSIVE_TYPE_FILES + RANGED_TYPE_FILES
+        + PROJECTILE_TYPE_FILES
+    ):
         tiles.append(load_tile(f))
 
     blob = np.stack(tiles, axis=0)  # (N, 16, 16, 4) uint8

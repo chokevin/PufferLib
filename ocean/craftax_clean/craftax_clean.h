@@ -66,6 +66,8 @@ void clean_prof_report(void) {
 #define NUM_ATNS 1
 #ifdef PUFFERCPU_EVAL_MAIN
 #define PUF_CRAFTAX_NET 1
+#endif
+#ifdef PUF_CRAFTAX_NET
 #include "../craftax/craftax_net.h"
 #endif
 #define MY_VEC_INIT
@@ -2788,30 +2790,140 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "n", log->n);
 }
 
-static Texture2D craftax_clean_textures[TEX_NUM];
-static bool craftax_clean_textures_loaded = false;
+static Texture2D textures[TEX_NUM];
+static int textures_loaded;
 
-static void craftax_clean_draw_tile(int tex_id, int dst_x, int dst_y,
-        float tint_alpha) {
+static void draw_tile(int tex_id, int x, int y, int px) {
     Rectangle src = {0, 0, TEX_TILE_PX, TEX_TILE_PX};
-    Rectangle dst = {dst_x, dst_y, TEX_DRAW_PX, TEX_DRAW_PX};
-    Color tint = {255, 255, 255, (unsigned char)(tint_alpha * 255.0f)};
-    DrawTexturePro(craftax_clean_textures[tex_id], src, dst, (Vector2){0, 0}, 0.0f, tint);
+    Rectangle dst = {(float)x, (float)y, (float)px, (float)px};
+    DrawTexturePro(textures[tex_id], src, dst, (Vector2){0, 0}, 0.0f, WHITE);
 }
 
-static void craftax_clean_draw_tile_tinted(int tex_id, int dst_x, int dst_y,
-        Color tint) {
-    Rectangle src = {0, 0, TEX_TILE_PX, TEX_TILE_PX};
-    Rectangle dst = {dst_x, dst_y, TEX_DRAW_PX, TEX_DRAW_PX};
-    DrawTexturePro(craftax_clean_textures[tex_id], src, dst, (Vector2){0, 0}, 0.0f, tint);
+static int projectile_tex(int ptype, int dr, int dc) {
+    if (ptype == PROJECTILE_DAGGER) {
+        return TEX_PROJ_DAGGER;
+    }
+    if (ptype == PROJECTILE_FIREBALL || ptype == PROJECTILE_FIREBALL2) {
+        return TEX_PROJ_FIREBALL;
+    }
+    if (ptype == PROJECTILE_ICEBALL || ptype == PROJECTILE_ICEBALL2) {
+        return TEX_PROJ_ICEBALL;
+    }
+    if (ptype == PROJECTILE_SLIMEBALL) {
+        return TEX_PROJ_SLIMEBALL;
+    }
+    if (dr < 0) {
+        return TEX_ARROW_UP;
+    }
+    if (dr > 0) {
+        return TEX_ARROW_DOWN;
+    }
+    if (dc < 0) {
+        return TEX_ARROW_LEFT;
+    }
+    return TEX_ARROW_RIGHT;
 }
 
-static void craftax_clean_draw_icon_count(int tex_id, int value, int x, int y) {
-    int icon_px = 20;
-    Rectangle src = {0, 0, TEX_TILE_PX, TEX_TILE_PX};
-    Rectangle dst = {x, y, icon_px, icon_px};
-    DrawTexturePro(craftax_clean_textures[tex_id], src, dst, (Vector2){0, 0}, 0.0f, WHITE);
-    DrawText(TextFormat("%d", value), x + icon_px + 3, y + 4, 14, RAYWHITE);
+static int mob_tex_base[] = {TEX_PASSIVE, TEX_MELEE, TEX_RANGED};
+
+static void draw_agent_obs(Craftax* env, int panel_x, int panel_y,
+        int panel_w, int panel_h) {
+    State* state = &env->state;
+    int pad = 10;
+    int px = (panel_w - pad * 2) / OBS_COLS;
+    int grid_x = panel_x + (panel_w - OBS_COLS * px) / 2;
+    int grid_y = panel_y + 36 + pad;
+    int level = clampi(state->player_level, 0, NUM_LEVELS - 1);
+    int pr = state->player_position[0];
+    int pc = state->player_position[1];
+    int rr = OBS_ROWS / 2;
+    int rc = OBS_COLS / 2;
+
+    DrawRectangle(panel_x, panel_y, panel_w, panel_h, (Color){8, 10, 14, 255});
+    DrawRectangleLines(panel_x, panel_y, panel_w, panel_h, (Color){0, 210, 220, 255});
+    DrawText("agent obs", panel_x + pad, panel_y + 8, 18, WHITE);
+    DrawText("9x11  light>12", panel_x + pad, panel_y + 28, 12,
+        (Color){140, 160, 166, 255});
+
+    for (int vr = 0; vr < OBS_ROWS; vr++) {
+        for (int vc = 0; vc < OBS_COLS; vc++) {
+            int wr = pr + (vr - rr);
+            int wc = pc + (vc - rc);
+            int dst_x = grid_x + vc * px;
+            int dst_y = grid_y + vr * px;
+            int lit = (unsigned)wr < MAP_SIZE && (unsigned)wc < MAP_SIZE
+                && state->light_map[level][wr][wc] > 12;
+            if (!lit) {
+                DrawRectangle(dst_x, dst_y, px, px, BLACK);
+                continue;
+            }
+            int block = state->map[level][wr][wc];
+            if (block < 0 || block >= NUM_BLOCK_TYPES) {
+                block = BLOCK_INVALID;
+            }
+            draw_tile(block, dst_x, dst_y, px);
+            int item = state->item_map[level][wr][wc];
+            if (item > ITEM_NONE) {
+                draw_tile(TEX_ITEM_BASE + item, dst_x, dst_y, px);
+            }
+            int mob_class;
+            int slot;
+            if (find_mob_at(state, level, wr, wc, &mob_class, &slot)) {
+                int type_id = mobs_for_class(state, level, mob_class)->type_id[slot];
+                draw_tile(mob_tex_base[mob_class] + type_id, dst_x, dst_y, px);
+            }
+        }
+    }
+
+    for (int from_player = 0; from_player < 2; from_player++) {
+        Mobs* projectiles = from_player
+            ? &state->player_projectiles[level] : &state->mob_projectiles[level];
+        int (*directions)[MAX_PLAYER_PROJECTILES][2] = from_player
+            ? state->player_projectile_directions : state->mob_projectile_directions;
+        for (int i = 0; i < MAX_PLAYER_PROJECTILES; i++) {
+            if (!projectiles->mask[i]) {
+                continue;
+            }
+            int row = projectiles->position[i][0];
+            int col = projectiles->position[i][1];
+            int vr = row - pr + rr;
+            int vc = col - pc + rc;
+            int lit = (unsigned)row < MAP_SIZE && (unsigned)col < MAP_SIZE
+                && state->light_map[level][row][col] > 12;
+            if (vr < 0 || vr >= OBS_ROWS || vc < 0 || vc >= OBS_COLS || !lit) {
+                continue;
+            }
+            int dr = directions[level][i][0];
+            int dc = directions[level][i][1];
+            draw_tile(projectile_tex(projectiles->type_id[i], dr, dc),
+                grid_x + vc * px, grid_y + vr * px, px);
+        }
+    }
+
+    int player_tex = TEX_PLAYER_DOWN;
+    if (state->is_sleeping) {
+        player_tex = TEX_PLAYER_SLEEP;
+    } else if (state->player_direction == ACTION_LEFT) {
+        player_tex = TEX_PLAYER_LEFT;
+    } else if (state->player_direction == ACTION_RIGHT) {
+        player_tex = TEX_PLAYER_RIGHT;
+    } else if (state->player_direction == ACTION_UP) {
+        player_tex = TEX_PLAYER_UP;
+    }
+    draw_tile(player_tex, grid_x + rc * px, grid_y + rr * px, px);
+}
+
+static void draw_icon_count(int tex_id, int value, int x, int y) {
+    draw_tile(tex_id, x, y, 20);
+    DrawText(TextFormat("%d", value), x + 23, y + 4, 14, RAYWHITE);
+}
+
+static void draw_inv_slot(int tex_id, int x, int y) {
+    DrawRectangle(x, y, 24, 24, (Color){32, 32, 32, 255});
+    DrawRectangleLines(x, y, 24, 24, (Color){80, 80, 80, 255});
+    if (tex_id >= 0) {
+        draw_tile(tex_id, x, y, 24);
+    }
 }
 
 static const char* craftax_clean_action_names[ATN_DIM] = {
@@ -2845,17 +2957,6 @@ static const char* craftax_clean_action_keys[ATN_DIM] = {
     ";",
 };
 
-static const Color craftax_clean_mob_tints[NUM_MOB_TYPES] = {
-    {255, 255, 255, 255},
-    {220, 235, 255, 255},
-    {235, 220, 255, 255},
-    {255, 225, 190, 255},
-    {210, 255, 210, 255},
-    {190, 230, 255, 255},
-    {255, 185, 145, 255},
-    {210, 210, 210, 255},
-};
-
 static const char* craftax_clean_ach_names[NUM_ACHIEVEMENTS] = {
     "Collect Wood", "Place Table", "Eat Cow", "Collect Sapling", "Collect Drink",
     "Make Wood Pickaxe", "Make Wood Sword", "Place Plant", "Defeat Zombie",
@@ -2877,51 +2978,12 @@ static const char* craftax_clean_ach_names[NUM_ACHIEVEMENTS] = {
     "Defeat Archer",
 };
 
-static void craftax_clean_draw_projectiles(State* state, bool from_player,
-        int level, int top_row, int left_col, int origin_x) {
-    Mobs* projectiles = from_player ? &state->player_projectiles[level] : &state->mob_projectiles[level];
-    int (*directions)[MAX_PLAYER_PROJECTILES][2] =
-        from_player ? state->player_projectile_directions : state->mob_projectile_directions;
-    for (int i = 0; i < MAX_PLAYER_PROJECTILES; i++) {
-        if (!projectiles->mask[i]) {
-            continue;
-        }
-        int row = projectiles->position[i][0];
-        int col = projectiles->position[i][1];
-        int vr = row - top_row;
-        int vc = col - left_col;
-        if (vr < 0 || vr >= RENDER_ROWS || vc < 0 || vc >= RENDER_COLS) {
-            continue;
-        }
-        int dr = directions[level][i][0];
-        int dc = directions[level][i][1];
-        int tex_id = TEX_ARROW_RIGHT;
-        if (dr < 0) {
-            tex_id = TEX_ARROW_UP;
-        } else if (dr > 0) {
-            tex_id = TEX_ARROW_DOWN;
-        } else if (dc < 0) {
-            tex_id = TEX_ARROW_LEFT;
-        }
-        int ptype = projectiles->type_id[i];
-        Color tint = WHITE;
-        if (ptype == PROJECTILE_FIREBALL || ptype == PROJECTILE_FIREBALL2) {
-            tint = (Color){255, 135, 55, 255};
-        } else if (ptype == PROJECTILE_ICEBALL || ptype == PROJECTILE_ICEBALL2) {
-            tint = (Color){115, 210, 255, 255};
-        } else if (ptype == PROJECTILE_SLIMEBALL) {
-            tint = (Color){120, 235, 95, 255};
-        }
-        craftax_clean_draw_tile_tinted(tex_id, origin_x + vc * TEX_DRAW_PX, vr * TEX_DRAW_PX, tint);
-    }
-}
-
 void puf_render(Craftax* env) {
     const int view_w = RENDER_COLS * TEX_DRAW_PX;
     const int view_h = RENDER_ROWS * TEX_DRAW_PX;
-    const int hud_h = 122;
+    const int hud_h = 142;
     const int origin_x = ACH_PANEL_W;
-    const int window_w = origin_x + view_w + ACTION_PANEL_W;
+    const int window_w = origin_x + view_w + OBS_PANEL_W + ACTION_PANEL_W;
 
     if (env->client == NULL) {
         env->client = (Client*)calloc(1, sizeof(Client));
@@ -2936,7 +2998,7 @@ void puf_render(Craftax* env) {
         SetTargetFPS(30);
         client->window_ready = true;
     }
-    if (!craftax_clean_textures_loaded) {
+    if (!textures_loaded) {
         const char* candidates[] = {
             "resources/craftax/textures.bin",
             "../resources/craftax/textures.bin",
@@ -2967,12 +3029,12 @@ void puf_render(Craftax* env) {
                 .mipmaps = 1,
                 .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
             };
-            craftax_clean_textures[i] = LoadTextureFromImage(img);
-            SetTextureFilter(craftax_clean_textures[i], TEXTURE_FILTER_POINT);
+            textures[i] = LoadTextureFromImage(img);
+            SetTextureFilter(textures[i], TEXTURE_FILTER_POINT);
         }
         free(buf);
         fclose(f);
-        craftax_clean_textures_loaded = true;
+        textures_loaded = 1;
     }
     if (IsKeyDown(KEY_ESCAPE)) {
         exit(0);
@@ -2996,42 +3058,54 @@ void puf_render(Craftax* env) {
             int dst_x = origin_x + vc * TEX_DRAW_PX;
             int dst_y = vr * TEX_DRAW_PX;
 
+            int in_map = wr >= 0 && wr < MAP_SIZE && wc >= 0 && wc < MAP_SIZE;
             int block = BLOCK_OUT_OF_BOUNDS;
-            if (wr >= 0 && wr < MAP_SIZE && wc >= 0 && wc < MAP_SIZE) {
+            if (in_map) {
                 block = env->state.map[level][wr][wc];
             }
             if (block < 0 || block >= NUM_BLOCK_TYPES) {
                 block = BLOCK_INVALID;
             }
-            craftax_clean_draw_tile(block, dst_x, dst_y, 1.0f);
-
-            if (wr >= 0 && wr < MAP_SIZE && wc >= 0 && wc < MAP_SIZE) {
-                int item = env->state.item_map[level][wr][wc];
-                if (item > ITEM_NONE && item < NUM_ITEM_TYPES) {
-                    craftax_clean_draw_tile(TEX_ITEM_BASE + item, dst_x, dst_y, 1.0f);
-                }
-                if (mob_at(&env->state, level, wr, wc)) {
-                    int mob_class;
-                    int slot;
-                    if (find_mob_at(&env->state, level, wr, wc, &mob_class, &slot)) {
-                        int tex_id = TEX_MOB_ZOMBIE;
-                        if (mob_class == MOB_PASSIVE) {
-                            tex_id = TEX_MOB_COW;
-                        } else if (mob_class == MOB_RANGED) {
-                            tex_id = TEX_MOB_SKELETON;
-                        }
-                        int type_id = mobs_for_class(&env->state, level, mob_class)->type_id[slot];
-                        craftax_clean_draw_tile_tinted(
-                            tex_id, dst_x, dst_y,
-                            craftax_clean_mob_tints[clampi(type_id, 0, NUM_MOB_TYPES - 1)]);
-                    }
-                }
+            draw_tile(block, dst_x, dst_y, TEX_DRAW_PX);
+            if (!in_map) {
+                continue;
+            }
+            int item = env->state.item_map[level][wr][wc];
+            if (item > ITEM_NONE) {
+                draw_tile(TEX_ITEM_BASE + item, dst_x, dst_y, TEX_DRAW_PX);
+            }
+            int mob_class;
+            int slot;
+            if (find_mob_at(&env->state, level, wr, wc, &mob_class, &slot)) {
+                int type_id = mobs_for_class(&env->state, level, mob_class)
+                    ->type_id[slot];
+                draw_tile(mob_tex_base[mob_class] + type_id, dst_x, dst_y, TEX_DRAW_PX);
             }
         }
     }
 
-    craftax_clean_draw_projectiles(&env->state, true, level, top_row, left_col, origin_x);
-    craftax_clean_draw_projectiles(&env->state, false, level, top_row, left_col, origin_x);
+    for (int from_player = 0; from_player < 2; from_player++) {
+        Mobs* projectiles = from_player
+            ? &env->state.player_projectiles[level]
+            : &env->state.mob_projectiles[level];
+        int (*directions)[MAX_PLAYER_PROJECTILES][2] = from_player
+            ? env->state.player_projectile_directions
+            : env->state.mob_projectile_directions;
+        for (int i = 0; i < MAX_PLAYER_PROJECTILES; i++) {
+            if (!projectiles->mask[i]) {
+                continue;
+            }
+            int vr = projectiles->position[i][0] - top_row;
+            int vc = projectiles->position[i][1] - left_col;
+            if (vr < 0 || vr >= RENDER_ROWS || vc < 0 || vc >= RENDER_COLS) {
+                continue;
+            }
+            int dr = directions[level][i][0];
+            int dc = directions[level][i][1];
+            draw_tile(projectile_tex(projectiles->type_id[i], dr, dc),
+                origin_x + vc * TEX_DRAW_PX, vr * TEX_DRAW_PX, TEX_DRAW_PX);
+        }
+    }
 
     int player_tex = TEX_PLAYER_DOWN;
     if (env->state.is_sleeping) {
@@ -3043,7 +3117,8 @@ void puf_render(Craftax* env) {
     } else if (env->state.player_direction == ACTION_UP) {
         player_tex = TEX_PLAYER_UP;
     }
-    craftax_clean_draw_tile(player_tex, origin_x + half_c * TEX_DRAW_PX, half_r * TEX_DRAW_PX, 1.0f);
+    draw_tile(player_tex, origin_x + half_c * TEX_DRAW_PX,
+        half_r * TEX_DRAW_PX, TEX_DRAW_PX);
 
     if (env->state.light_level < 1.0f) {
         unsigned char alpha = (unsigned char)((1.0f - env->state.light_level) * 140.0f);
@@ -3068,6 +3143,8 @@ void puf_render(Craftax* env) {
         }
         DrawText(TextFormat("%d", f), x + 4, 2, 10, reached ? BLACK : (Color){140, 140, 140, 255});
     }
+
+    draw_agent_obs(env, origin_x + view_w, 0, OBS_PANEL_W, view_h + hud_h);
 
     int hud_y = view_h;
     Inventory* inv = &env->state.inventory;
@@ -3131,55 +3208,55 @@ void puf_render(Craftax* env) {
     }
     int inv_y = hud_y + 62;
     int inv_x = origin_x + 4;
-    const int inv_step = 70;
-    craftax_clean_draw_icon_count(BLOCK_TREE, inv->wood, inv_x + inv_step * 0, inv_y);
-    craftax_clean_draw_icon_count(BLOCK_STONE, inv->stone, inv_x + inv_step * 1, inv_y);
-    craftax_clean_draw_icon_count(BLOCK_COAL, inv->coal, inv_x + inv_step * 2, inv_y);
-    craftax_clean_draw_icon_count(BLOCK_IRON, inv->iron, inv_x + inv_step * 3, inv_y);
-    craftax_clean_draw_icon_count(BLOCK_DIAMOND, inv->diamond, inv_x + inv_step * 4, inv_y);
-    craftax_clean_draw_icon_count(BLOCK_PLANT, inv->sapling, inv_x + inv_step * 5, inv_y);
-    craftax_clean_draw_icon_count(TEX_ITEM_BASE + ITEM_TORCH, inv->torches, inv_x + inv_step * 6, inv_y);
-    craftax_clean_draw_icon_count(BLOCK_RUBY, inv->ruby, inv_x + inv_step * 7, inv_y);
-    craftax_clean_draw_icon_count(BLOCK_SAPPHIRE, inv->sapphire, inv_x + inv_step * 8, inv_y);
-    craftax_clean_draw_icon_count(BLOCK_CHEST, inv->books, inv_x + inv_step * 9, inv_y);
+    int inv_ids[] = {
+        BLOCK_WOOD, BLOCK_STONE, BLOCK_COAL, BLOCK_IRON, BLOCK_DIAMOND,
+        TEX_SAPLING, TEX_TORCH_INV, BLOCK_RUBY, BLOCK_SAPPHIRE, TEX_BOOK,
+    };
+    int inv_counts[] = {
+        inv->wood, inv->stone, inv->coal, inv->iron, inv->diamond,
+        inv->sapling, inv->torches, inv->ruby, inv->sapphire, inv->books,
+    };
+    for (int i = 0; i < 10; i++) {
+        draw_icon_count(inv_ids[i], inv_counts[i], inv_x + 52 * i, inv_y);
+    }
+    int armour_x = inv_x + 52 * 10 + 8;
+    for (int slot = 0; slot < 4; slot++) {
+        int alvl = inv->armour[slot];
+        int tex = -1;
+        if (alvl > 0) {
+            tex = (alvl >= 2 ? TEX_ARMOUR_DIAMOND : TEX_ARMOUR_IRON) + slot;
+        }
+        draw_inv_slot(tex, armour_x + slot * 30, inv_y);
+    }
+    int weap_y = hud_y + 90;
+    int gear[] = {
+        inv->pickaxe > 0 ? TEX_PICKAXE_WOOD + inv->pickaxe - 1 : -1,
+        inv->sword > 0 ? TEX_SWORD_WOOD + inv->sword - 1 : -1,
+        inv->bow > 0 ? TEX_BOW : -1,
+        inv->arrows > 0 ? TEX_ARROW_UP : -1,
+    };
+    for (int i = 0; i < 4; i++) {
+        draw_inv_slot(gear[i], armour_x + 30 * i, weap_y);
+    }
+    DrawText(TextFormat("%d", inv->arrows), armour_x + 117, weap_y + 6, 14, RAYWHITE);
+    for (int p = 0; p < NUM_POTIONS; p++) {
+        draw_icon_count(TEX_POTION + p, inv->potions[p], inv_x + 52 * p, weap_y);
+    }
     DrawText(
         TextFormat(
-            "pick:%d sword:%d bow:%d arrows:%d armour:%d/%d/%d/%d",
-            inv->pickaxe,
-            inv->sword,
-            inv->bow,
-            inv->arrows,
-            inv->armour[0],
-            inv->armour[1],
-            inv->armour[2],
-            inv->armour[3]
-        ),
-        origin_x + 4,
-        hud_y + 86,
-        14,
-        (Color){190, 210, 230, 255}
-    );
-    DrawText(
-        TextFormat(
-            "potions:%d/%d/%d/%d/%d/%d  ach:%d/%d  ret:%.2f len:%d",
-            inv->potions[0],
-            inv->potions[1],
-            inv->potions[2],
-            inv->potions[3],
-            inv->potions[4],
-            inv->potions[5],
+            "ach:%d/%d  ret:%.2f len:%d",
             achievements,
             NUM_ACHIEVEMENTS,
             env->episode_return_accum,
             env->episode_length_accum
         ),
         origin_x + 4,
-        hud_y + 98,
+        hud_y + 118,
         14,
         (Color){200, 200, 140, 255}
     );
 
-    int panel_x = origin_x + view_w;
+    int panel_x = origin_x + view_w + OBS_PANEL_W;
     int panel_h = view_h + hud_h;
     int taken_action = env->agents[0].actions[0];
     DrawRectangle(panel_x, 0, ACTION_PANEL_W, panel_h, (Color){12, 18, 22, 255});

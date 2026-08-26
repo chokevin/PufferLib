@@ -453,11 +453,12 @@ static const DungeonConfig DUNGEON_LEVEL_CONFIGS[3] = {
 #define TEX_TILE_PX 16
 #define TEX_SCALE 3
 #define TEX_DRAW_PX (TEX_TILE_PX * TEX_SCALE)
-#define TEX_NUM (37 + 5 + 5 + 3 + 4)
+#define TEX_NUM (37 + 5 + 5 + 3 + 4 + 8 + 9 + 6 + 3 + 8 + 3 + 8 + 4)
 #define RENDER_ROWS 14
 #define RENDER_COLS 16
 #define ACTION_PANEL_W 280
 #define ACH_PANEL_W 196
+#define OBS_PANEL_W 280
 #define TEX_PLAYER_DOWN 37
 #define TEX_PLAYER_UP 38
 #define TEX_PLAYER_LEFT 39
@@ -471,3 +472,19 @@ static const DungeonConfig DUNGEON_LEVEL_CONFIGS[3] = {
 #define TEX_ARROW_UP 51
 #define TEX_ARROW_LEFT 52
 #define TEX_ARROW_RIGHT 53
+#define TEX_ARMOUR_IRON 54
+#define TEX_ARMOUR_DIAMOND 58
+#define TEX_PICKAXE_WOOD 62
+#define TEX_SWORD_WOOD 66
+#define TEX_BOW 70
+#define TEX_POTION 71
+#define TEX_SAPLING 77
+#define TEX_TORCH_INV 78
+#define TEX_BOOK 79
+#define TEX_MELEE 80
+#define TEX_PASSIVE 88
+#define TEX_RANGED 91
+#define TEX_PROJ_DAGGER 99
+#define TEX_PROJ_FIREBALL 100
+#define TEX_PROJ_ICEBALL 101
+#define TEX_PROJ_SLIMEBALL 102
