@@ -1,6 +1,7 @@
 #include "craftax_clean.h"
 
 static int key_to_action(void) {
+    // Makes it human playable
     if (IsKeyPressed(KEY_Q)) return ACTION_NOOP;
     if (IsKeyPressed(KEY_W) || IsKeyPressed(KEY_UP)) return ACTION_UP;
     if (IsKeyPressed(KEY_D) || IsKeyPressed(KEY_RIGHT)) return ACTION_RIGHT;
@@ -48,18 +49,19 @@ static int key_to_action(void) {
 }
 
 int main(void) {
-    printf("Observation shape: %d\n", OBS_SIZE);
 
     Craftax env;
     memset(&env, 0, sizeof(env));
     env.num_agents = 1;
     env.rng = 1;
     env.seed = 1;
+    env.use_action_mask = 1;
 
     env.agents[0].observations = (obs_t*)calloc(OBS_SIZE, sizeof(obs_t));
     env.agents[0].actions = (float*)calloc(1, sizeof(float));
     env.agents[0].rewards = (float*)calloc(1, sizeof(float));
     env.agents[0].terminals = (float*)calloc(1, sizeof(float));
+    env.agents[0].action_mask = (unsigned char*)calloc(ATN_DIM, sizeof(unsigned char));
     puf_reset(&env);
     env.agents[0].actions[0] = -1.0f;
 
@@ -85,5 +87,6 @@ int main(void) {
     free(env.agents[0].actions);
     free(env.agents[0].rewards);
     free(env.agents[0].terminals);
+    free(env.agents[0].action_mask);
     return 0;
 }

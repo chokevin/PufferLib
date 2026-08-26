@@ -2701,7 +2701,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->num_agents = 1;
     env->agents[0].policy = 0;
     env->agents[0].action_mask = NULL;  // trainer wires mask after puf_init
-    env->use_action_mask = 1;
+    env->use_action_mask = 0;
     uint64_t seed_offset = 0;
     for (int i = 0; i < kwargs->size; i++) {
         if (strcmp(kwargs->items[i].key, "seed_offset") == 0) {
