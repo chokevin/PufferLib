@@ -264,6 +264,14 @@ static const float ACHIEVEMENT_REWARD_MAP[NUM_ACHIEVEMENTS] = {
     0.5f, 0.5f, 0.5f,
 };
 
+static inline float max_achievement_return(void) {
+    float sum = 0.0f;
+    for (int i = 0; i < NUM_ACHIEVEMENTS; i++) {
+        sum += ACHIEVEMENT_REWARD_MAP[i];
+    }
+    return sum;
+}
+
 typedef enum {
     ACTION_NOOP = 0,
     ACTION_LEFT = 1,

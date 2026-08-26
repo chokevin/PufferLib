@@ -167,6 +167,7 @@ typedef struct {
 
 struct Log {
     float perf;
+    float achievement_rate;
     float score;
     float episode_return;
     float episode_length;
@@ -2653,13 +2654,16 @@ void puf_step(Craftax* env) {
 
     if (done) {
         int unlocked = 0;
+        float achievement_return = 0.0f;
         for (int i = 0; i < NUM_ACHIEVEMENTS; i++) {
             if (env->achievements[i]) {
                 unlocked++;
+                achievement_return += ACHIEVEMENT_REWARD_MAP[i];
                 env->log.achievements[i] += 1.0f;
             }
         }
-        env->log.perf += unlocked / (float)NUM_ACHIEVEMENTS;
+        env->log.achievement_rate += unlocked / (float)NUM_ACHIEVEMENTS;
+        env->log.perf += achievement_return / max_achievement_return();
         env->log.score += env->episode_return_accum;
         env->log.episode_return += env->episode_return_accum;
         env->log.episode_length += env->episode_length_accum;
@@ -2768,6 +2772,7 @@ void my_vec_close(Env* envs) {
 
 void puf_log(Log* log, Dict* out) {
     dict_set(out, "perf", log->perf);
+    dict_set(out, "achievement_rate", log->achievement_rate);
     dict_set(out, "score", log->score);
     dict_set(out, "episode_return", log->episode_return);
     dict_set(out, "episode_length", log->episode_length);
