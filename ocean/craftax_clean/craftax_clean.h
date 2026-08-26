@@ -924,6 +924,11 @@ int max_health(const State* state) {
     return 8 + state->player_strength;
 }
 
+int equipped_armour(const State* state) {
+    return state->inventory.armour[0] + state->inventory.armour[1]
+        + state->inventory.armour[2] + state->inventory.armour[3];
+}
+
 int max_food(const State* state) {
     return 7 + 2 * state->player_dexterity;
 }
@@ -1833,6 +1838,7 @@ void puf_step(Craftax* env) {
     int initial_achievements[NUM_ACHIEVEMENTS];
     memcpy(initial_achievements, state->achievements, sizeof(initial_achievements));
     float initial_health = state->player_health;
+    int initial_armour = equipped_armour(state);
 
     // Sleep and rest last one tick: the agent must emit the action again to continue.
     state->is_sleeping = (action == ACTION_SLEEP
@@ -2629,6 +2635,7 @@ void puf_step(Craftax* env) {
         reward += delta * ACHIEVEMENT_REWARD_MAP[i];
     }
     reward += (state->player_health - initial_health) * 0.1f;
+    reward += (equipped_armour(state) - initial_armour) * 0.1f;
 
     store_rng(state, rng_key(&step_rng));
     state->timestep += 1;
