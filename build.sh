@@ -159,6 +159,11 @@ elif [ "$ENV" = "trailer" ]; then
     OUTPUT_NAME="trailer/trailer"
     STANDALONE=1
     CLANG_WARN+=(-Wno-unused-function)
+elif [ "$ENV" = "architecture" ]; then
+    SRC_DIR="trailer"
+    OUTPUT_NAME="trailer/architecture"
+    STANDALONE=1
+    CLANG_WARN+=(-Wno-unused-function)
 elif [ "$ENV" = "impulse_wars" ]; then
     SRC_DIR="ocean/$ENV"
     if [ "$MODE" = "web" ]; then BOX2D_NAME='box2d-web'
