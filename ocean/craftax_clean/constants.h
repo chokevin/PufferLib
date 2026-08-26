@@ -447,6 +447,7 @@ static const DungeonConfig DUNGEON_LEVEL_CONFIGS[3] = {
 #define RENDER_ROWS 14
 #define RENDER_COLS 16
 #define ACTION_PANEL_W 280
+#define ACH_PANEL_W 196
 #define TEX_PLAYER_DOWN 37
 #define TEX_PLAYER_UP 38
 #define TEX_PLAYER_LEFT 39

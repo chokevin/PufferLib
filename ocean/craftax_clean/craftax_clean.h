@@ -64,6 +64,10 @@ void clean_prof_report(void) {
 
 #define ACT_SIZES {ATN_DIM}
 #define NUM_ATNS 1
+#ifdef PUFFERCPU_EVAL_MAIN
+#define PUF_CRAFTAX_NET 1
+#include "../craftax/craftax_net.h"
+#endif
 #define MY_VEC_INIT
 #define MY_VEC_CLOSE
 typedef Env Craftax;
@@ -2855,8 +2859,29 @@ static const Color craftax_clean_mob_tints[NUM_MOB_TYPES] = {
     {210, 210, 210, 255},
 };
 
+static const char* craftax_clean_ach_names[NUM_ACHIEVEMENTS] = {
+    "Collect Wood", "Place Table", "Eat Cow", "Collect Sapling", "Collect Drink",
+    "Make Wood Pickaxe", "Make Wood Sword", "Place Plant", "Defeat Zombie",
+    "Collect Stone", "Place Stone", "Eat Plant", "Defeat Skeleton",
+    "Make Stone Pickaxe", "Make Stone Sword", "Wake Up", "Place Furnace",
+    "Collect Coal", "Collect Iron", "Collect Diamond", "Make Iron Pickaxe",
+    "Make Iron Sword", "Make Arrow", "Make Torch", "Place Torch",
+    "Make Diamond Sword", "Make Iron Armour", "Make Diamond Armour",
+    "Enter Gnomish Mines", "Enter Dungeon", "Enter Sewers", "Enter Vault",
+    "Enter Troll Mines", "Enter Fire Realm", "Enter Ice Realm", "Enter Graveyard",
+    "Defeat Gnome Warrior", "Defeat Gnome Archer", "Defeat Orc Soldier",
+    "Defeat Orc Mage", "Defeat Lizard", "Defeat Kobold", "Defeat Troll",
+    "Defeat Deep Thing", "Defeat Pigman", "Defeat Fire Elemental",
+    "Defeat Frost Troll", "Defeat Ice Elemental", "Damage Necromancer",
+    "Defeat Necromancer", "Eat Bat", "Eat Snail", "Find Bow", "Fire Bow",
+    "Collect Sapphire", "Learn Fireball", "Cast Fireball", "Learn Iceball",
+    "Cast Iceball", "Collect Ruby", "Make Diamond Pickaxe", "Open Chest",
+    "Drink Potion", "Enchant Sword", "Enchant Armour", "Defeat Knight",
+    "Defeat Archer",
+};
+
 static void craftax_clean_draw_projectiles(State* state, bool from_player,
-        int level, int top_row, int left_col) {
+        int level, int top_row, int left_col, int origin_x) {
     Mobs* projectiles = from_player ? &state->player_projectiles[level] : &state->mob_projectiles[level];
     int (*directions)[MAX_PLAYER_PROJECTILES][2] =
         from_player ? state->player_projectile_directions : state->mob_projectile_directions;
@@ -2890,7 +2915,7 @@ static void craftax_clean_draw_projectiles(State* state, bool from_player,
         } else if (ptype == PROJECTILE_SLIMEBALL) {
             tint = (Color){120, 235, 95, 255};
         }
-        craftax_clean_draw_tile_tinted(tex_id, vc * TEX_DRAW_PX, vr * TEX_DRAW_PX, tint);
+        craftax_clean_draw_tile_tinted(tex_id, origin_x + vc * TEX_DRAW_PX, vr * TEX_DRAW_PX, tint);
     }
 }
 
@@ -2898,7 +2923,8 @@ void puf_render(Craftax* env) {
     const int view_w = RENDER_COLS * TEX_DRAW_PX;
     const int view_h = RENDER_ROWS * TEX_DRAW_PX;
     const int hud_h = 122;
-    const int window_w = view_w + ACTION_PANEL_W;
+    const int origin_x = ACH_PANEL_W;
+    const int window_w = origin_x + view_w + ACTION_PANEL_W;
 
     if (env->client == NULL) {
         env->client = (Client*)calloc(1, sizeof(Client));
@@ -2970,7 +2996,7 @@ void puf_render(Craftax* env) {
         for (int vc = 0; vc < RENDER_COLS; vc++) {
             int wr = top_row + vr;
             int wc = left_col + vc;
-            int dst_x = vc * TEX_DRAW_PX;
+            int dst_x = origin_x + vc * TEX_DRAW_PX;
             int dst_y = vr * TEX_DRAW_PX;
 
             int block = BLOCK_OUT_OF_BOUNDS;
@@ -3007,8 +3033,8 @@ void puf_render(Craftax* env) {
         }
     }
 
-    craftax_clean_draw_projectiles(&env->state, true, level, top_row, left_col);
-    craftax_clean_draw_projectiles(&env->state, false, level, top_row, left_col);
+    craftax_clean_draw_projectiles(&env->state, true, level, top_row, left_col, origin_x);
+    craftax_clean_draw_projectiles(&env->state, false, level, top_row, left_col, origin_x);
 
     int player_tex = TEX_PLAYER_DOWN;
     if (env->state.is_sleeping) {
@@ -3020,20 +3046,39 @@ void puf_render(Craftax* env) {
     } else if (env->state.player_direction == ACTION_UP) {
         player_tex = TEX_PLAYER_UP;
     }
-    craftax_clean_draw_tile(player_tex, half_c * TEX_DRAW_PX, half_r * TEX_DRAW_PX, 1.0f);
+    craftax_clean_draw_tile(player_tex, origin_x + half_c * TEX_DRAW_PX, half_r * TEX_DRAW_PX, 1.0f);
 
     if (env->state.light_level < 1.0f) {
         unsigned char alpha = (unsigned char)((1.0f - env->state.light_level) * 140.0f);
-        DrawRectangle(0, 0, view_w, view_h, (Color){0, 0, 40, alpha});
+        DrawRectangle(origin_x, 0, view_w, view_h, (Color){0, 0, 40, alpha});
+    }
+
+    int floor_bar_h = 16;
+    int cell_w = view_w / NUM_LEVELS;
+    DrawRectangle(origin_x, 0, view_w, floor_bar_h, (Color){18, 18, 18, 230});
+    for (int f = 0; f < NUM_LEVELS; f++) {
+        int x = origin_x + f * cell_w;
+        int w = (f == NUM_LEVELS - 1) ? (origin_x + view_w - x) : cell_w;
+        bool reached = f <= env->max_floor_accum;
+        bool here = f == env->state.player_level;
+        Color fill = reached ? (Color){255, 210, 40, 255} : (Color){45, 45, 45, 255};
+        if (here) {
+            fill = (Color){255, 235, 80, 255};
+        }
+        DrawRectangle(x + 1, 1, w - 2, floor_bar_h - 2, fill);
+        if (here) {
+            DrawRectangleLines(x + 1, 1, w - 2, floor_bar_h - 2, WHITE);
+        }
+        DrawText(TextFormat("%d", f), x + 4, 2, 10, reached ? BLACK : (Color){140, 140, 140, 255});
     }
 
     int hud_y = view_h;
     Inventory* inv = &env->state.inventory;
-    DrawRectangle(0, hud_y, view_w, hud_h, (Color){20, 20, 20, 255});
+    DrawRectangle(origin_x, hud_y, view_w, hud_h, (Color){20, 20, 20, 255});
 
     int health_max = max_health(&env->state);
     float health_frac = clampf(env->state.player_health / health_max, 0.0f, 1.0f);
-    int bar_x = 4;
+    int bar_x = origin_x + 4;
     int bar_y = hud_y + 4;
     int bar_w = view_w - 8;
     int bar_h = 18;
@@ -3062,7 +3107,7 @@ void puf_render(Craftax* env) {
             env->state.player_level,
             env->state.timestep
         ),
-        4,
+        origin_x + 4,
         hud_y + 26,
         14,
         WHITE
@@ -3078,7 +3123,7 @@ void puf_render(Craftax* env) {
             env->state.is_sleeping,
             env->state.is_resting
         ),
-        4,
+        origin_x + 4,
         hud_y + 44,
         14,
         (Color){200, 200, 200, 255}
@@ -3088,7 +3133,7 @@ void puf_render(Craftax* env) {
         achievements += env->state.achievements[i] ? 1 : 0;
     }
     int inv_y = hud_y + 62;
-    int inv_x = 4;
+    int inv_x = origin_x + 4;
     const int inv_step = 70;
     craftax_clean_draw_icon_count(BLOCK_TREE, inv->wood, inv_x + inv_step * 0, inv_y);
     craftax_clean_draw_icon_count(BLOCK_STONE, inv->stone, inv_x + inv_step * 1, inv_y);
@@ -3112,7 +3157,7 @@ void puf_render(Craftax* env) {
             inv->armour[2],
             inv->armour[3]
         ),
-        4,
+        origin_x + 4,
         hud_y + 86,
         14,
         (Color){190, 210, 230, 255}
@@ -3131,13 +3176,13 @@ void puf_render(Craftax* env) {
             env->episode_return_accum,
             env->episode_length_accum
         ),
-        4,
+        origin_x + 4,
         hud_y + 98,
         14,
         (Color){200, 200, 140, 255}
     );
 
-    int panel_x = view_w;
+    int panel_x = origin_x + view_w;
     int panel_h = view_h + hud_h;
     int taken_action = env->agents[0].actions[0];
     DrawRectangle(panel_x, 0, ACTION_PANEL_W, panel_h, (Color){12, 18, 22, 255});
@@ -3158,6 +3203,29 @@ void puf_render(Craftax* env) {
         DrawText(craftax_clean_action_keys[action], panel_x + 12, y, 10, text_color);
         DrawText(TextFormat("%02d %s", action, craftax_clean_action_names[action]),
             panel_x + 78, y, 10, text_color);
+    }
+
+    int ach_h = view_h + hud_h;
+    DrawRectangle(0, 0, ACH_PANEL_W, ach_h, WHITE);
+    DrawText("Achievements", 8, 6, 16, BLACK);
+    int ach_top = 26;
+    int ach_row = (ach_h - ach_top) / NUM_ACHIEVEMENTS;
+    if (ach_row < 10) {
+        ach_row = 10;
+    }
+    for (int i = 0; i < NUM_ACHIEVEMENTS; i++) {
+        int y = ach_top + i * ach_row;
+        bool done = env->state.achievements[i] != 0;
+        if (done) {
+            DrawRectangle(0, y, ACH_PANEL_W, ach_row, (Color){46, 180, 80, 255});
+        }
+        DrawText(
+            craftax_clean_ach_names[i],
+            6,
+            y + (ach_row > 10 ? 1 : 0),
+            10,
+            done ? WHITE : (Color){50, 50, 50, 255}
+        );
     }
 
     EndDrawing();
