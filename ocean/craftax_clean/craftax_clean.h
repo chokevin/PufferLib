@@ -1636,6 +1636,9 @@ void compute_action_mask(Craftax* env) {
     const Inventory* inv = &s->inventory;
     memset(m, 0, ATN_DIM);
     m[ACTION_NOOP] = 1;
+    if (s->is_sleeping || s->is_resting) {
+        return;
+    }
     m[ACTION_LEFT] = m[ACTION_RIGHT] = m[ACTION_UP] = m[ACTION_DOWN] = m[ACTION_DO] = 1;
     m[ACTION_SLEEP] = s->player_energy < max_energy(s);
     m[ACTION_REST] = s->player_health < max_health(s);
@@ -1843,11 +1846,9 @@ void puf_step(Craftax* env) {
     float initial_health = state->player_health;
     int initial_armour = equipped_armour(state);
 
-    // Sleep and rest last one tick: the agent must emit the action again to continue.
-    state->is_sleeping = (action == ACTION_SLEEP
-        && state->player_energy < max_energy(state));
-    state->is_resting = (action == ACTION_REST
-        && state->player_health < max_health(state));
+    if (state->is_sleeping || state->is_resting) {
+        action = ACTION_NOOP;
+    }
 
     CLEAN_ZONE(0);
     int level = state->player_level;
@@ -2525,6 +2526,23 @@ void puf_step(Craftax* env) {
         }
     }
 
+    bool start_sleep = action == ACTION_SLEEP && state->player_energy < max_energy(state);
+    state->is_sleeping = state->is_sleeping || start_sleep;
+
+    bool wake_from_sleep = state->is_sleeping && state->player_energy >= max_energy(state);
+    state->is_sleeping = state->is_sleeping && !wake_from_sleep;
+    state->achievements[ACH_WAKE_UP] = state->achievements[ACH_WAKE_UP] || wake_from_sleep;
+
+    bool start_rest = action == ACTION_REST && state->player_health < max_health(state);
+    state->is_resting = state->is_resting || start_rest;
+
+    bool wake_from_rest = state->is_resting && (
+        state->player_health >= max_health(state)
+        || state->player_food <= 0
+        || state->player_drink <= 0
+    );
+    state->is_resting = state->is_resting && !wake_from_rest;
+
     bool not_boss = !fighting_boss(state);
     float decay = 1.0f - 0.125f * (state->player_dexterity - 1);
 
@@ -2554,9 +2572,6 @@ void puf_step(Craftax* env) {
     } else if (state->player_fatigue < -10.0f) {
         state->player_fatigue = 0.0f;
         state->player_energy = clampi(state->player_energy + 1, 0, max_energy(state));
-    }
-    if (state->is_sleeping && state->player_energy >= max_energy(state)) {
-        state->achievements[ACH_WAKE_UP] = 1;
     }
 
     bool all_necessities = state->player_food > 0
