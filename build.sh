@@ -203,8 +203,10 @@ else
     echo "Error: environment '$ENV' not found" && exit 1
 fi
 
-# src/ocean.cu compiles only this env's custom net (PUFFER_NETHACK, PUFFER_NMMO3, …).
-EXTRA_CFLAGS+=(-DPUFFER_${ENV^^})
+# src/ocean.cu compiles only this env's custom net (PUFFER_NETHACK, PUFFER_NMMO3, ...).
+# Use POSIX case conversion so this also works with macOS's Bash 3.2.
+ENV_UPPER=$(printf '%s' "$ENV" | tr '[:lower:]' '[:upper:]')
+EXTRA_CFLAGS+=(-DPUFFER_${ENV_UPPER})
 
 case "$ENV" in
     osrs_*)

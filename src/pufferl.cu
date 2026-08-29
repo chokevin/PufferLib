@@ -65,6 +65,15 @@ int grid_size(int N) {
 // Exclusive env: -DENV_HEADER=ocean/<env>/<env>.h or .cu (--cu). Never both.
 #include ENV_HEADER
 
+// Environments with selector-dependent action heads may declare ENV_HEAD_USED
+// in ENV_HEADER. Keep compatibility with Kaggriculture's existing declaration.
+#if !defined(ENV_HEAD_USED) && defined(KG_HEAD_GATING_SELECTOR_VALUES)
+#define ENV_HEAD_USED(actions, head) kg_puffer5_head_used((actions), (head))
+#endif
+#ifdef ENV_HEAD_USED
+#define PUFFER_ENV_CONDITIONAL_HEADS
+#endif
+
 typedef struct {
     float* data;
     int64_t shape[PUF_MAX_DIMS];
@@ -637,6 +646,9 @@ __global__ void sample_logits(
     } else {
         int logits_offset = 0;
         int mask_base = idx * mask_stride;
+#ifdef PUFFER_ENV_CONDITIONAL_HEADS
+        float sampled_logprobs[NUM_ATNS];
+#endif
         for (int h = 0; h < num_atns; h++) {
             int A = act_sizes[h];
             float cache[PPO_MAX_HEAD_A];
@@ -692,11 +704,21 @@ __global__ void sample_logits(
                     total_log_prob += cache[sampled] - logsumexp;
                 }
             }
+#elif defined(PUFFER_ENV_CONDITIONAL_HEADS)
+            sampled_logprobs[h] = cache[sampled] - logsumexp;
 #else
             total_log_prob += cache[sampled] - logsumexp;
 #endif
             logits_offset += A;
         }
+#ifdef PUFFER_ENV_CONDITIONAL_HEADS
+        // Defer accounting until all selector heads have been sampled.
+        for (int h = 0; h < num_atns; h++) {
+            if (ENV_HEAD_USED(actions + idx * num_atns, h)) {
+                total_log_prob += sampled_logprobs[h];
+            }
+        }
+#endif
     }
 
     logprobs[idx] = from_float(total_log_prob);

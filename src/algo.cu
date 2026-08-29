@@ -1277,6 +1277,7 @@ constexpr int PPO_THREADS = 256;
 #ifndef ACT_SIZES
 #error "ENV_HEADER must #define ACT_SIZES { ... } (classes per head)"
 #endif
+
 // Exact max head width for this env build — discrete logit cache size.
 constexpr int ppo_max_head_classes() {
     constexpr int s[] = ACT_SIZES;
@@ -1450,6 +1451,10 @@ __global__ void cache_imp_and_v(
                     new_lp += cache[act] - lse;
                 }
             }
+#elif defined(PUFFER_ENV_CONDITIONAL_HEADS)
+            if (ENV_HEAD_USED(actions + idx * NUM_ATNS, h)) {
+                new_lp += cache[(int)actions[idx * NUM_ATNS + h]] - lse;
+            }
 #else
             new_lp += cache[(int)actions[idx * NUM_ATNS + h]] - lse;
 #endif
@@ -1555,6 +1560,14 @@ __global__ void ppo_loss_compute(
                 int A = a.act_sizes[h];
 #ifdef PUFFER_NETHACK
                 if (!nethack_head_used(verb, h)) {
+                    for (int j = 0; j < A; ++j) {
+                        a.grad_logits[at_base + logits_offset + j] = 0.0f;
+                    }
+                    logits_offset += A;
+                    continue;
+                }
+#elif defined(PUFFER_ENV_CONDITIONAL_HEADS)
+                if (!ENV_HEAD_USED(g.actions + nt * a.num_atns, h)) {
                     for (int j = 0; j < A; ++j) {
                         a.grad_logits[at_base + logits_offset + j] = 0.0f;
                     }
