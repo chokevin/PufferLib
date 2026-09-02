@@ -2090,16 +2090,20 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
             char key[64];
             snprintf(key, sizeof(key), "policy_action_seed_%d", b);
             DictItem* configured_seed = dict_find(&vec_kwargs, key);
-            uint64_t policy_seed = configured_seed
+            int explicit_seed = configured_seed
+                && configured_seed->value >= 0.0;
+            uint64_t policy_seed = explicit_seed
                 ? (uint64_t)configured_seed->value
                 : pufferl->seed;
-            assert((!configured_seed
-                    || (configured_seed->value >= 0.0
-                        && configured_seed->value == (double)policy_seed))
+            assert((!explicit_seed
+                    || configured_seed->value == (double)policy_seed)
                 && "policy action seed must be a nonnegative exact integer");
             rng_init<<<grid_size(count), BLOCK_SIZE>>>(
                 pufferl->rng_states[i] + off,
-                policy_seed + (uint64_t)hypers.rank, count);
+                policy_seed
+                    + (uint64_t)hypers.rank * (uint64_t)num_buffers
+                    + (uint64_t)i,
+                count);
         }
     }
 
