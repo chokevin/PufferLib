@@ -2098,10 +2098,12 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
             assert((!explicit_seed
                     || configured_seed->value == (double)policy_seed)
                 && "policy action seed must be a nonnegative exact integer");
+            uint64_t rank_stride = (uint64_t)num_buffers
+                + (uint64_t)explicit_seed;
             rng_init<<<grid_size(count), BLOCK_SIZE>>>(
                 pufferl->rng_states[i] + off,
                 policy_seed
-                    + (uint64_t)hypers.rank * (uint64_t)num_buffers
+                    + (uint64_t)hypers.rank * rank_stride
                     + (uint64_t)i,
                 count);
         }
@@ -3478,6 +3480,13 @@ static void run_train_preflight(Ini* ini) {
     int horizon = puf_ini_get(ini, "train", "horizon");
     int minibatch_size = puf_ini_get(ini, "train", "minibatch_size");
     int gpus = puf_ini_get(ini, "train", "gpus");
+    int base_seed = puf_ini_get(ini, "base", "seed");
+    double learner_seed_value = puf_ini_get(
+        ini, "vec", "policy_action_seed_0");
+    double opponent_seed_value = puf_ini_get(
+        ini, "vec", "policy_action_seed_1");
+    uint64_t learner_seed = (uint64_t)learner_seed_value;
+    uint64_t opponent_seed = (uint64_t)opponent_seed_value;
     const char* checkpoint = puf_ini_get_str(
         ini, "selfplay", "fixed_opponent_path");
     long checkpoint_bytes = puf_ini_get(
@@ -3497,6 +3506,33 @@ static void run_train_preflight(Ini* ini) {
         && "learner agents must be divisible by minibatch recurrent rows");
     assert(horizon % ADV_VEC_WIDTH == 0
         && "train horizon must align to ADV_VEC_WIDTH");
+    assert(learner_seed_value >= 0.0
+        && learner_seed_value == (double)learner_seed
+        && opponent_seed_value >= 0.0
+        && opponent_seed_value == (double)opponent_seed
+        && "fixed-opponent action seeds must be explicit exact integers");
+    assert(base_seed >= 0 && learner_seed == (uint64_t)base_seed
+        && "learner action seed must preserve the legacy default stream");
+    uint64_t rank_stride = (uint64_t)num_buffers + 1;
+    for (int learner_rank = 0; learner_rank < gpus; learner_rank++) {
+        for (int learner_buffer = 0; learner_buffer < num_buffers;
+                learner_buffer++) {
+            uint64_t learner_stream = learner_seed
+                + (uint64_t)learner_rank * rank_stride
+                + (uint64_t)learner_buffer;
+            for (int opponent_rank = 0; opponent_rank < gpus;
+                    opponent_rank++) {
+                for (int opponent_buffer = 0;
+                        opponent_buffer < num_buffers; opponent_buffer++) {
+                    uint64_t opponent_stream = opponent_seed
+                        + (uint64_t)opponent_rank * rank_stride
+                        + (uint64_t)opponent_buffer;
+                    assert(learner_stream != opponent_stream
+                        && "learner and opponent action streams collide");
+                }
+            }
+        }
+    }
     struct stat st;
     assert(stat(checkpoint, &st) == 0 && S_ISREG(st.st_mode)
         && "fixed-opponent checkpoint is missing");
@@ -3507,11 +3543,15 @@ static void run_train_preflight(Ini* ini) {
         "minibatch_size=%d minibatch_rows=%d adv_vec_width=%d "
         "observation_size=%d action_heads=%d checkpoint_bytes=%ld "
         "optimizer_policies=1 learner_policy=0 opponent_policy=1 "
-        "learner_seat=0 opponent_seat=1\n",
+        "learner_seat=0 opponent_seat=1 learner_action_seed=%llu "
+        "opponent_action_seed=%llu action_rank_stride=%llu "
+        "learner_matches_legacy_default=1 streams_disjoint=1\n",
         learner_agents, process_agents,
         process_agents - learner_agents, num_buffers, gpus, horizon,
         minibatch_size, minibatch_rows, ADV_VEC_WIDTH, OBS_SIZE, NUM_ATNS,
-        checkpoint_bytes);
+        checkpoint_bytes, (unsigned long long)learner_seed,
+        (unsigned long long)opponent_seed,
+        (unsigned long long)rank_stride);
 }
 
 #ifdef PUFFERLIB_BUILD_MAIN
