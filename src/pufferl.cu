@@ -3471,19 +3471,62 @@ TrainResult launch_train(Ini* ini) {
     return result;
 }
 
+static void run_train_preflight(Ini* ini) {
+    int process_agents = puf_ini_get(ini, "vec", "total_agents");
+    int num_buffers = puf_ini_get(ini, "vec", "num_buffers");
+    int horizon = puf_ini_get(ini, "train", "horizon");
+    int minibatch_size = puf_ini_get(ini, "train", "minibatch_size");
+    int gpus = puf_ini_get(ini, "train", "gpus");
+    const char* checkpoint = puf_ini_get_str(
+        ini, "selfplay", "fixed_opponent_path");
+    long checkpoint_bytes = puf_ini_get(
+        ini, "selfplay", "fixed_opponent_bytes");
+    assert(checkpoint && checkpoint[0] && strcmp(checkpoint, "None") != 0
+        && "train-preflight requires selfplay.fixed_opponent_path");
+    assert(process_agents > 0 && process_agents % 2 == 0
+        && "fixed opponent requires an even process-slot count");
+    int learner_agents = process_agents / 2;
+    assert(num_buffers > 0 && process_agents % num_buffers == 0
+        && learner_agents % num_buffers == 0
+        && "fixed-opponent agents must divide evenly across buffers");
+    assert(horizon > 0 && minibatch_size % horizon == 0
+        && "minibatch must contain whole recurrent sequences");
+    int minibatch_rows = minibatch_size / horizon;
+    assert(minibatch_rows > 0 && learner_agents % minibatch_rows == 0
+        && "learner agents must be divisible by minibatch recurrent rows");
+    assert(horizon % ADV_VEC_WIDTH == 0
+        && "train horizon must align to ADV_VEC_WIDTH");
+    struct stat st;
+    assert(stat(checkpoint, &st) == 0 && S_ISREG(st.st_mode)
+        && "fixed-opponent checkpoint is missing");
+    assert(checkpoint_bytes > 0 && (long)st.st_size == checkpoint_bytes
+        && "fixed-opponent checkpoint size differs");
+    printf("FIXED_OPPONENT_PREFLIGHT learner_agents=%d process_agents=%d "
+        "opponent_agents=%d num_buffers=%d gpus=%d horizon=%d "
+        "minibatch_size=%d minibatch_rows=%d adv_vec_width=%d "
+        "observation_size=%d action_heads=%d checkpoint_bytes=%ld "
+        "optimizer_policies=1 learner_policy=0 opponent_policy=1 "
+        "learner_seat=0 opponent_seat=1\n",
+        learner_agents, process_agents,
+        process_agents - learner_agents, num_buffers, gpus, horizon,
+        minibatch_size, minibatch_rows, ADV_VEC_WIDTH, OBS_SIZE, NUM_ATNS,
+        checkpoint_bytes);
+}
+
 #ifdef PUFFERLIB_BUILD_MAIN
 int main(int argc, char** argv) {
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
     if (argc < 2) {
         fprintf(stderr,
-            "usage: %s train|eval|match|sweep [latest|MODEL.bin] [--headless] [--section.key=value ...]\n",
+            "usage: %s train|train-preflight|eval|match|sweep [latest|MODEL.bin] [--headless] [--section.key=value ...]\n",
             argv[0]);
         exit(1);
     }
     const char* mode = argv[1];
     // Train forks DP workers; CUDA before that fork SIGSEGVs the children.
-    if (strcmp(mode, "train") != 0) {
+    if (strcmp(mode, "train") != 0
+            && strcmp(mode, "train-preflight") != 0) {
         int total_gpus = 0;
         assert(cudaGetDeviceCount(&total_gpus) == cudaSuccess && total_gpus >= 1
             && "no CUDA devices available");
@@ -3514,6 +3557,8 @@ int main(int argc, char** argv) {
 
     if (strcmp(mode, "train") == 0) {
         launch_train(&ini);
+    } else if (strcmp(mode, "train-preflight") == 0) {
+        run_train_preflight(&ini);
     } else if (strcmp(mode, "sweep") == 0) {
         run_sweep(&ini, argv[0]);
     } else if (strcmp(mode, "eval") == 0) {
@@ -3521,7 +3566,7 @@ int main(int argc, char** argv) {
     } else if (strcmp(mode, "match") == 0) {
         run_eval(&ini, &ctx, EVAL_MATCH, 1, render);
     } else {
-        assert(0 && "unknown mode (train|eval|match|sweep)");
+        assert(0 && "unknown mode (train|train-preflight|eval|match|sweep)");
     }
 
     puf_ini_free(&ini);
