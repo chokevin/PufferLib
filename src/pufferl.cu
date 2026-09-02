@@ -36,6 +36,7 @@
 
 // Project
 #include "ini.h"
+#include "live_metrics.h"
 
 // To investigate: 32f compute? Need to check bf16
 #ifdef PRECISION_FLOAT
@@ -1344,7 +1345,7 @@ static void env_close(VecEnv* vec) {
 #endif
 }
 
-void vec_log(VecEnv* vec, Dict* out, int clear) {
+void vec_log(VecEnv* vec, Dict* out, int clear, int empty_schema) {
     Log aggregate = {0};
     float* acc = (float*)&aggregate;
     env_log_sum(vec, &aggregate, clear);
@@ -1355,6 +1356,8 @@ void vec_log(VecEnv* vec, Dict* out, int clear) {
         for (int j = 0; j < LOG_NF; j++) {
             acc[j] /= n;
         }
+    }
+    if (n > 0.0f || empty_schema) {
         puf_log(&aggregate, &env_out);
     }
     dict_set(&env_out, "n", n);
@@ -2458,7 +2461,7 @@ void trainer_eval_log(PuffeRL* p, Dict* out) {
     p->last_log_time = wall_clock();
     p->last_log_step = p->global_step;
     log_util(p, out);
-    vec_log(p->vec, out, 0);
+    vec_log(p->vec, out, 0, 0);
 }
 
 // One dict copy per train log (+ optional final snapshot). Capacity fixed at
@@ -2906,7 +2909,7 @@ static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
     EvalResult result = {0};
     if (!render) {
         Dict wipe = {0};
-        vec_log(p->vec, &wipe, 1);
+        vec_log(p->vec, &wipe, 1, 0);
         dict_clear(&wipe);
     }
     double last_dash = 0;
@@ -3064,6 +3067,8 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
 
     char checkpoint_dir[2048];
     char log_dir[2048];
+    const char* metrics_dir = puf_ini_get_str(ini, "base", "metrics_dir");
+    int publish_metrics = metrics_dir && strcmp(metrics_dir, "None") != 0;
     snprintf(checkpoint_dir, sizeof(checkpoint_dir), "%s/%s/%s",
         puf_ini_get_str(ini, "base", "checkpoint_dir"),
         puf_ini_get_str(ini, "base", "env_name"), run_id);
@@ -3073,6 +3078,9 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     if (ctx->artifact_owner) {
         mkdir_p(checkpoint_dir);
         mkdir_p(log_dir);
+        if (publish_metrics) {
+            mkdir_p(metrics_dir);
+        }
     }
 
     PuffeRL* pufferl = create_pufferl(ini, ctx);
@@ -3198,8 +3206,9 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             }
         }
 
-        if (last_log.size && wall_clock()
-                < pufferl->last_log_time + 0.6 && epoch < train_epochs - 1) {
+        int log_due = !last_log.size || wall_clock()
+            >= pufferl->last_log_time + 0.6 || epoch == train_epochs - 1;
+        if (!log_due && !publish_metrics) {
             continue;
         }
 
@@ -3217,7 +3226,20 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         dict_set(&new_log, "uptime", now - pufferl->start_time);
         dict_set(&new_log, "epoch", (double)pufferl->epoch);
 
-        vec_log(pufferl->vec, &new_log, 1);
+        vec_log(pufferl->vec, &new_log, 1, use_fixed_opponent);
+        DictItem* completed_episodes = dict_find(&new_log, "env/n");
+        if (use_fixed_opponent && completed_episodes
+                && completed_episodes->value == 0 && last_log.size) {
+            for (int i = 0; i < last_log.size; i++) {
+                DictItem* item = &last_log.items[i];
+                if (strncmp(item->key, "env/", 4) != 0
+                        || strcmp(item->key, "env/n") == 0
+                        || item->str || item->values) {
+                    continue;
+                }
+                dict_set(&new_log, item->key, item->value);
+            }
+        }
 
         float losses_host[NUM_LOSSES];
         cudaMemcpy(losses_host, pufferl->losses, sizeof(losses_host),
@@ -3256,8 +3278,12 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         dict_copy(&last_log, &new_log);
         dict_clear(&new_log);
 
-        if (ctx->artifact_owner) {
+        if (ctx->artifact_owner && log_due) {
             puf_dashboard_print(ini, pufferl, &last_log, (int)pufferl->epoch);
+        }
+
+        if (ctx->artifact_owner && publish_metrics) {
+            puf_live_metrics_write(metrics_dir, (long)pufferl->epoch, &last_log);
         }
 
         // Wait until the objective appears; do not treat negative values as missing.
