@@ -3076,6 +3076,12 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     }
 
     PuffeRL* pufferl = create_pufferl(ini, ctx);
+    char primary_model_path[4096];
+    const char* primary_model = puf_checkpoint_path_key(
+        ini, "load_model_path", primary_model_path, sizeof(primary_model_path));
+    if (primary_model) {
+        pufferl_load_policy(pufferl, 0, primary_model);
+    }
     if (use_fixed_opponent) {
         assert(pufferl->num_policies == 2
             && "fixed opponent requires exactly two policies");
