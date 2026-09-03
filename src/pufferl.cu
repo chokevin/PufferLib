@@ -2487,7 +2487,14 @@ static void log_history_bin_mean(PufLogHistory* h, const char* key,
         int points, double* out) {
     assert(h->size > 0 && points >= 1);
     if (points == 1) {
-        out[0] = dict_get(&h->items[h->size - 1], key);
+        for (int i = h->size - 1; i >= 0; i--) {
+            DictItem* item = dict_find(&h->items[i], key);
+            if (item) {
+                out[0] = item->value;
+                return;
+            }
+        }
+        out[0] = 0;
         return;
     }
     double final_steps = dict_get(&h->items[h->size - 1], "agent_steps");
@@ -2495,11 +2502,16 @@ static void log_history_bin_mean(PufLogHistory* h, const char* key,
     int bin_n = 0;
     double bin_sum = 0;
     double fallback = dict_get(&h->items[0], key);
+    double latest = fallback;
     double next_bin = final_steps / (points - 1);
     for (int i = 0; i < h->size; i++) {
         Dict* log = &h->items[i];
-        bin_sum += dict_get(log, key);
-        bin_n++;
+        DictItem* item = dict_find(log, key);
+        if (item) {
+            bin_sum += item->value;
+            bin_n++;
+            latest = item->value;
+        }
         double steps = dict_get(log, "agent_steps");
         if (steps < next_bin || out_idx >= points - 1) {
             continue;
@@ -2510,7 +2522,7 @@ static void log_history_bin_mean(PufLogHistory* h, const char* key,
         bin_sum = 0;
         next_bin += final_steps / (points - 1);
     }
-    out[points - 1] = dict_get(&h->items[h->size - 1], key);
+    out[points - 1] = latest;
     while (out_idx < points - 1) {
         out[out_idx++] = fallback;
     }
@@ -2885,6 +2897,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
                 job->run);
             protein_sweep_observe(protein, job->sample, NAN, max_cost, 1);
             assert(++failed_workers <= 1000 && "too many failed sweep workers");
+            completed++;
             continue;
         }
         // points[]: learning-curve downsample, or 1 final score (e.g. selfplay).
