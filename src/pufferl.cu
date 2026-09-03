@@ -62,6 +62,11 @@ int grid_size(int N) {
     return (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 }
 
+int large_grid_size(int64_t N) {
+    int64_t blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    return (int)(blocks < 65535 ? blocks : 65535);
+}
+
 // Exclusive env: -DENV_HEADER=ocean/<env>/<env>.h or .cu (--cu). Never both.
 #include ENV_HEADER
 
@@ -1392,30 +1397,30 @@ static Float slice_rows(Float p, int off, int n) {
 // Two types: actions are float32 (large discrete IDs); everything else is Prec.
 __global__ void transpose_102(precision_t* dst, const precision_t* src,
         int A, int B, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = A * B * C;
-    if (idx >= total) {
-        return;
+    int64_t total = (int64_t)A * B * C;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+    for (int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+            idx < total; idx += stride) {
+        int64_t a = idx / ((int64_t)B * C);
+        int64_t rem = idx % ((int64_t)B * C);
+        int64_t b = rem / C;
+        int64_t c = rem % C;
+        dst[(b * A + a) * C + c] = src[idx];
     }
-    int a = idx / (B * C);
-    int rem = idx % (B * C);
-    int b = rem / C;
-    int c = rem % C;
-    dst[b * A * C + a * C + c] = src[idx];
 }
 
 #if !defined(PRECISION_FLOAT)
 __global__ void transpose_102(float* dst, const float* src, int A, int B, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = A * B * C;
-    if (idx >= total) {
-        return;
+    int64_t total = (int64_t)A * B * C;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+    for (int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+            idx < total; idx += stride) {
+        int64_t a = idx / ((int64_t)B * C);
+        int64_t rem = idx % ((int64_t)B * C);
+        int64_t b = rem / C;
+        int64_t c = rem % C;
+        dst[(b * A + a) * C + c] = src[idx];
     }
-    int a = idx / (B * C);
-    int rem = idx % (B * C);
-    int b = rem / C;
-    int c = rem % C;
-    dst[b * A * C + a * C + c] = src[idx];
 }
 #endif
 
@@ -1425,40 +1430,40 @@ __global__ void transpose_policy0_102(precision_t* dst,
         const precision_t* src, int T, int B, int num_buffers,
         int train_per_buffer, int C) {
     int train_B = num_buffers * train_per_buffer;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = T * train_B * C;
-    if (idx >= total) {
-        return;
-    }
-    int train_b = idx / (T * C);
-    int rem = idx % (T * C);
-    int t = rem / C;
-    int c = rem % C;
     int agents_per_buffer = B / num_buffers;
-    int buf = train_b / train_per_buffer;
-    int local = train_b % train_per_buffer;
-    int source_b = buf * agents_per_buffer + local;
-    dst[idx] = src[(t * B + source_b) * C + c];
+    int64_t total = (int64_t)T * train_B * C;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+    for (int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+            idx < total; idx += stride) {
+        int64_t train_b = idx / ((int64_t)T * C);
+        int64_t rem = idx % ((int64_t)T * C);
+        int64_t t = rem / C;
+        int64_t c = rem % C;
+        int64_t buf = train_b / train_per_buffer;
+        int64_t local = train_b % train_per_buffer;
+        int64_t source_b = buf * agents_per_buffer + local;
+        dst[idx] = src[(t * B + source_b) * C + c];
+    }
 }
 
 #if !defined(PRECISION_FLOAT)
 __global__ void transpose_policy0_102(float* dst, const float* src,
         int T, int B, int num_buffers, int train_per_buffer, int C) {
     int train_B = num_buffers * train_per_buffer;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = T * train_B * C;
-    if (idx >= total) {
-        return;
-    }
-    int train_b = idx / (T * C);
-    int rem = idx % (T * C);
-    int t = rem / C;
-    int c = rem % C;
     int agents_per_buffer = B / num_buffers;
-    int buf = train_b / train_per_buffer;
-    int local = train_b % train_per_buffer;
-    int source_b = buf * agents_per_buffer + local;
-    dst[idx] = src[(t * B + source_b) * C + c];
+    int64_t total = (int64_t)T * train_B * C;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+    for (int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+            idx < total; idx += stride) {
+        int64_t train_b = idx / ((int64_t)T * C);
+        int64_t rem = idx % ((int64_t)T * C);
+        int64_t t = rem / C;
+        int64_t c = rem % C;
+        int64_t buf = train_b / train_per_buffer;
+        int64_t local = train_b % train_per_buffer;
+        int64_t source_b = buf * agents_per_buffer + local;
+        dst[idx] = src[(t * B + source_b) * C + c];
+    }
 }
 #endif
 
@@ -1498,27 +1503,36 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
     int obs_size = (int)src.observations.shape[2];
     int num_atns = (int)src.actions.shape[2];
     int mask_c = src.action_mask.shape[2];
-    transpose_policy0_102<<<grid_size(T * train_B * obs_size), BLOCK_SIZE, 0, stream>>>(
+    transpose_policy0_102<<<large_grid_size(
+            (int64_t)T * train_B * obs_size), BLOCK_SIZE, 0, stream>>>(
         rollouts->observations.data, src.observations.data, T, B,
         hypers->num_buffers, train_per_buffer, obs_size);
-    transpose_policy0_102<<<grid_size(T * train_B * num_atns), BLOCK_SIZE, 0, stream>>>(
+    transpose_policy0_102<<<large_grid_size(
+            (int64_t)T * train_B * num_atns), BLOCK_SIZE, 0, stream>>>(
         rollouts->actions.data, src.actions.data, T, B,
         hypers->num_buffers, train_per_buffer, num_atns);
-    transpose_policy0_102<<<grid_size(T * train_B), BLOCK_SIZE, 0, stream>>>(
+    transpose_policy0_102<<<large_grid_size(
+            (int64_t)T * train_B), BLOCK_SIZE, 0, stream>>>(
         rollouts->logprobs.data, src.logprobs.data, T, B,
         hypers->num_buffers, train_per_buffer, 1);
-    transpose_policy0_102<<<grid_size(T * train_B), BLOCK_SIZE, 0, stream>>>(
+    transpose_policy0_102<<<large_grid_size(
+            (int64_t)T * train_B), BLOCK_SIZE, 0, stream>>>(
         rollouts->rewards.data, src.rewards.data, T, B,
         hypers->num_buffers, train_per_buffer, 1);
-    transpose_policy0_102<<<grid_size(T * train_B), BLOCK_SIZE, 0, stream>>>(
+    transpose_policy0_102<<<large_grid_size(
+            (int64_t)T * train_B), BLOCK_SIZE, 0, stream>>>(
         rollouts->terminals.data, src.terminals.data, T, B,
         hypers->num_buffers, train_per_buffer, 1);
-    transpose_policy0_102<<<grid_size(T * train_B), BLOCK_SIZE, 0, stream>>>(
+    transpose_policy0_102<<<large_grid_size(
+            (int64_t)T * train_B), BLOCK_SIZE, 0, stream>>>(
         rollouts->values.data, src.values.data, T, B,
         hypers->num_buffers, train_per_buffer, 1);
-    transpose_policy0_102<<<grid_size(T * train_B * mask_c), BLOCK_SIZE, 0, stream>>>(
+    transpose_policy0_102<<<large_grid_size(
+            (int64_t)T * train_B * mask_c), BLOCK_SIZE, 0, stream>>>(
         rollouts->action_mask.data, src.action_mask.data, T, B,
         hypers->num_buffers, train_per_buffer, mask_c);
+    assert(cudaPeekAtLastError() == cudaSuccess
+        && "rollout-to-train transpose launch failed");
 
     clamp_precision_kernel<<<grid_size(
         numel(rollouts->rewards.shape)), BLOCK_SIZE, 0, stream>>>(
