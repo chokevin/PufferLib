@@ -37,3 +37,15 @@ def test_failed_sweep_workers_count_toward_run_limit():
     ]
 
     assert "completed++;" in failure
+
+
+def test_train_result_uses_latest_nonempty_objective_row():
+    source = (ROOT / "src" / "pufferl.cu").read_text()
+    result = source[
+        source.index("// TrainResult curve:") : source.index(
+            "int points = use_selfplay"
+        )
+    ]
+
+    assert "else if (log_history.size > 0)" in result
+    assert "log_history_bin_mean(&log_history, target_key, 1, &latest_score);" in result

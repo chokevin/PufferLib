@@ -3284,7 +3284,13 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     result.cost = dict_get(&last_log, "uptime");
     result.steps = dict_get(&last_log, "agent_steps");
     DictItem* target = dict_find(&last_log, target_key);
-    result.score = target ? (float)target->value : 0;
+    if (target) {
+        result.score = (float)target->value;
+    } else if (log_history.size > 0) {
+        double latest_score = 0;
+        log_history_bin_mean(&log_history, target_key, 1, &latest_score);
+        result.score = (float)latest_score;
+    }
 
     int points = use_selfplay ? 1 : puf_ini_get(ini, "sweep", "downsample");
     assert(points >= 1 && points <= TRAIN_RESULT_MAX_POINTS
