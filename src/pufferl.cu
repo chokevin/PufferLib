@@ -2949,7 +2949,7 @@ static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
         }
         result.score = match ? dict_get(&el, "env/policy_0_score")
             : dict_get(&el, "env/score");
-        result.perf = dict_get(&el, "env/perf");
+        result.perf = dash_num(&el, "env/perf", 0.0);
         if (match) {
             result.draw = dict_get(&el, "env/draw_rate");
         }
