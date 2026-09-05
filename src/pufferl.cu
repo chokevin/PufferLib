@@ -320,6 +320,7 @@ typedef struct {
     float ent_coef;
     float min_ent_coef_ratio;
     bool anneal_ent_coef;
+    bool clip_rewards;
     float gamma;
     float gae_lambda;
     bool vtrace;
@@ -1535,9 +1536,11 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
     assert(cudaPeekAtLastError() == cudaSuccess
         && "rollout-to-train transpose launch failed");
 
-    clamp_precision_kernel<<<grid_size(
-        numel(rollouts->rewards.shape)), BLOCK_SIZE, 0, stream>>>(
-        rollouts->rewards.data, -1.0f, 1.0f, numel(rollouts->rewards.shape));
+    if (hypers->clip_rewards) {
+        clamp_precision_kernel<<<grid_size(
+            numel(rollouts->rewards.shape)), BLOCK_SIZE, 0, stream>>>(
+            rollouts->rewards.data, -1.0f, 1.0f, numel(rollouts->rewards.shape));
+    }
 
     if (hypers->reset_every_horizon || src.initial_states.data == NULL) {
         cudaMemsetAsync(pufferl->train_state.data, 0,
@@ -1865,6 +1868,18 @@ static void master_weights_setup(Float* mw, Prec* param,
     }
 }
 
+static bool puf_read_clip_rewards(Ini* ini) {
+    Dict* train = puf_ini_section(ini, "train", 0);
+    double value = dict_get(train, "clip_rewards");
+    DictItem* item = dict_find(train, "clip_rewards");
+    if ((item->str && !puf_ini_parse_val(item->str, &value))
+            || item->len != 0 || (value != 0.0 && value != 1.0)) {
+        fprintf(stderr, "[train] clip_rewards must be 0 or 1 (false or true)\n");
+        exit(1);
+    }
+    return value == 1.0;
+}
+
 PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     Hypers hypers = {
         .horizon = puf_ini_get(ini, "train", "horizon"),
@@ -1886,6 +1901,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .ent_coef = puf_ini_get(ini, "train", "ent_coef"),
         .min_ent_coef_ratio = puf_ini_get(ini, "train", "min_ent_coef_ratio"),
         .anneal_ent_coef = puf_ini_get(ini, "train", "anneal_ent_coef") != 0,
+        .clip_rewards = puf_read_clip_rewards(ini),
         .gamma = puf_ini_get(ini, "train", "gamma"),
         .gae_lambda = puf_ini_get(ini, "train", "gae_lambda"),
         .vtrace = puf_ini_get(ini, "train", "vtrace") != 0,
