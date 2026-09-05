@@ -1811,6 +1811,35 @@ void pufferl_load_policy(PuffeRL* pufferl, int i, const char* path) {
     cudaDeviceSynchronize();
 }
 
+void pufferl_load_initial_policy(PuffeRL* pufferl, Ini* ini) {
+    char path_buf[4096];
+    const char* path = puf_checkpoint_path_key(
+        ini, "load_model_path", path_buf, sizeof(path_buf));
+    if (!path) {
+        return;
+    }
+
+    Policy* primary = &pufferl->policies[0];
+    int64_t params = numel(primary->master_weights.shape);
+    struct stat st;
+    assert(stat(path, &st) == 0 && S_ISREG(st.st_mode)
+        && "initial model checkpoint is missing");
+    assert((int64_t)st.st_size == params * (int64_t)sizeof(float)
+        && "initial model checkpoint size differs");
+    pufferl_load_policy(pufferl, 0, path);
+    if (pufferl->hypers.async) {
+        puf_copy(
+            &pufferl->actor_param, &primary->param, pufferl->default_stream);
+        cudaStreamSynchronize(pufferl->default_stream);
+    }
+    printf(
+        "NATIVE_INITIAL_MODEL_LOADED rank=%d world_size=%d path=%s "
+        "bytes=%lld params=%lld async_actor_synced=%d\n",
+        pufferl->hypers.rank, pufferl->hypers.world_size, path,
+        (long long)st.st_size, (long long)params, pufferl->hypers.async);
+    fflush(stdout);
+}
+
 // fp32 master weights: alias param buffer in float mode; separate fp32 copy in bf16.
 // cast_now: copy param→master now (primary after init). Frozen policies load later.
 static void master_weights_setup(Float* mw, Prec* param,
@@ -3103,6 +3132,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     }
 
     PuffeRL* pufferl = create_pufferl(ini, ctx);
+    pufferl_load_initial_policy(pufferl, ini);
     if (use_fixed_opponent) {
         assert(pufferl->num_policies == 2
             && "fixed opponent requires exactly two policies");
