@@ -1832,12 +1832,12 @@ void pufferl_load_initial_policy(PuffeRL* pufferl, Ini* ini) {
             &pufferl->actor_param, &primary->param, pufferl->default_stream);
         cudaStreamSynchronize(pufferl->default_stream);
     }
-    printf(
+    fprintf(stderr,
         "NATIVE_INITIAL_MODEL_LOADED rank=%d world_size=%d path=%s "
         "bytes=%lld params=%lld async_actor_synced=%d\n",
         pufferl->hypers.rank, pufferl->hypers.world_size, path,
         (long long)st.st_size, (long long)params, pufferl->hypers.async);
-    fflush(stdout);
+    fflush(stderr);
 }
 
 // fp32 master weights: alias param buffer in float mode; separate fp32 copy in bf16.
