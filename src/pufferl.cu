@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdint>
 #include <errno.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1832,12 +1833,20 @@ void pufferl_load_initial_policy(PuffeRL* pufferl, Ini* ini) {
             &pufferl->actor_param, &primary->param, pufferl->default_stream);
         cudaStreamSynchronize(pufferl->default_stream);
     }
-    fprintf(stderr,
+    // One pipe-sized write keeps concurrent ranks' receipts intact.
+    char receipt[PIPE_BUF];
+    int receipt_length = snprintf(receipt, sizeof(receipt),
         "NATIVE_INITIAL_MODEL_LOADED rank=%d world_size=%d path=%s "
         "bytes=%lld params=%lld async_actor_synced=%d\n",
         pufferl->hypers.rank, pufferl->hypers.world_size, path,
         (long long)st.st_size, (long long)params, pufferl->hypers.async);
-    fflush(stderr);
+    assert(receipt_length > 0 && receipt_length < (int)sizeof(receipt)
+        && "initial model receipt exceeds atomic write limit");
+    ssize_t written;
+    do {
+        written = write(STDERR_FILENO, receipt, (size_t)receipt_length);
+    } while (written < 0 && errno == EINTR);
+    assert(written == receipt_length && "initial model receipt write failed");
 }
 
 // fp32 master weights: alias param buffer in float mode; separate fp32 copy in bf16.
